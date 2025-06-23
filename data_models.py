@@ -51,9 +51,11 @@ class GroundDuty:
 class BusInfo:
     """Represents ground transportation. Columns from bus.csv."""
     def __init__(self, id, depaAirport, arriAirport, td, ta):
-        self.id = id,
+        self.id = id  # 移除多余的逗号
         self.depaAirport = depaAirport
         self.arriAirport = arriAirport
+        self.td = datetime.strptime(td, '%Y/%m/%d %H:%M')  # 添加缺失的属性
+        self.ta = datetime.strptime(ta, '%Y/%m/%d %H:%M')   # 添加缺失的属性
         self.startTime = datetime.strptime(td, '%Y/%m/%d %H:%M')
         self.endTime = datetime.strptime(ta, '%Y/%m/%d %H:%M')
         self.cost = 0
@@ -129,10 +131,28 @@ class Node:
 
 class Label:
     """Label for resource-constrained shortest path algorithm."""
-    def __init__(self, cost, path, current_node):
+    def __init__(self, cost, path, current_node, duty_start_time=None, 
+                 duty_flight_time=0.0, duty_flight_count=0, duty_task_count=0,
+                 total_flight_hours=0.0, total_positioning=0, 
+                 total_away_overnights=0, total_calendar_days=None, 
+                 has_flown_in_duty=False, used_task_ids=None, tie_breaker=0):
         self.cost = cost
         self.path = path
         self.current_node = current_node
+        self.node = current_node  # 添加这行，保持向后兼容
+        
+        # 添加额外属性
+        self.duty_start_time = duty_start_time
+        self.duty_flight_time = duty_flight_time
+        self.duty_flight_count = duty_flight_count
+        self.duty_task_count = duty_task_count
+        self.total_flight_hours = total_flight_hours
+        self.total_positioning = total_positioning
+        self.total_away_overnights = total_away_overnights
+        self.total_calendar_days = total_calendar_days if total_calendar_days is not None else set()
+        self.has_flown_in_duty = has_flown_in_duty
+        self.used_task_ids = used_task_ids if used_task_ids is not None else set()
+        self.tie_breaker = tie_breaker
 
     def __lt__(self, other):
         return self.cost < other.cost

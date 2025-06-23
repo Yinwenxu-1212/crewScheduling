@@ -93,7 +93,8 @@ def find_positioning_tasks(from_airport, to_airport, earliest_start, all_bus, al
 def solve_subproblem_for_crew(
     crew: Crew, all_flights: List[Flight], all_bus_info: List[BusInfo],
     all_crew_ground_duties: List[GroundDuty], dual_prices: Dict[str, float],
-    layover_stations: Dict[str, dict], crew_leg_match_dict: Dict[str, List[str]]
+    layover_stations: Dict[str, dict], crew_leg_match_dict: Dict[str, List[str]],
+    crew_sigma_dual: float  # 添加第8个参数
 ) -> List[Roster]:
     
     global write_header, csv_writer, csv_file
