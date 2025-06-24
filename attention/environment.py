@@ -3,226 +3,178 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import collections
+import random
 
-from . import config
-from .utils import RuleChecker, calculate_final_score, DataHandler
+import config
+from utils import RuleChecker, DataHandler, identify_duties_and_cycles, calculate_final_score
 
 class CrewRosteringEnv:
-    """
-    机组排班问题的强化学习环境。
-    智能体（Agent）将轮流为每个机长选择下一个要执行的任务。
-    遵循类似Gymnasium的接口设计。
-    """
     def __init__(self, data_handler: DataHandler):
         self.dh = data_handler
         self.rule_checker = RuleChecker(self.dh)
-        
         self.crews = self.dh.data['crews'].to_dict('records')
         self.unified_tasks_df = self.dh.data['unified_tasks']
         self.planning_start_dt = pd.to_datetime(config.PLANNING_START_DATE)
-        self.planning_end_dt = pd.to_datetime(config.PLANNING_END_DATE)
 
     def reset(self):
-        """
-        开始一个新回合，重置所有状态，并返回第一个观测。
-        返回:
-        - observation (dict): 初始观测。
-        - info (dict): 附加信息，这里是有效的动作列表。
-        """
-        # 每个机长的排班计划
         self.roster_plan = collections.defaultdict(list)
-        # 记录每个机组的动态状态
-        self.crew_states = {crew['crewId']: self._get_initial_crew_state(crew) for crew in self.crews}
-        # 未分配的任务ID集合
-        self.unassigned_task_ids = set(self.unified_tasks_df[self.unified_tasks_df['type'] == 'flight']['taskId'])
-        
-        # 将固有占位任务预先加入排班表
+        self.crew_states = {c['crewId']: self._get_initial_crew_state(c) for c in self.crews}
+        self.unassigned_flight_ids = set(self.dh.data['flights']['id'])
         for crew in self.crews:
-            crew_id = crew['crewId']
-            ground_duties = self.dh.crew_ground_duties.get(crew_id, [])
-            if ground_duties:
-                self.roster_plan[crew_id].extend(ground_duties)
-                # 更新状态
-                last_duty = max(ground_duties, key=lambda x: x['endTime'])
-                self.crew_states[crew_id]['last_task_end_time'] = last_duty['endTime']
-                self.crew_states[crew_id]['last_location'] = last_duty['airport']
-
-        # 当前轮到哪个机长做决策
-        self.current_crew_idx = 0
+            ground_duties = self.dh.crew_ground_duties.get(crew['crewId'], [])
+            if ground_duties: self.roster_plan[crew['crewId']].extend(ground_duties)
         self.total_steps = 0
-        
-        observation, valid_actions = self._get_observation()
-        info = {'valid_actions': valid_actions}
-        
+        self.decision_priority_queue = self._build_priority_queue()
+        observation, info = self._get_observation()
         return observation, info
 
     def _get_initial_crew_state(self, crew):
-        """获取机长的初始状态。"""
-        return {
-            'last_task_end_time': self.planning_start_dt,
-            'last_location': crew['stayStation'],
-            'total_flight_duty_time': 0,
-            # 在此可以添加更多需要追踪的状态，如飞行周期相关状态
-        }
+        last_task = max(self.dh.crew_ground_duties.get(crew['crewId'], []), key=lambda x: x['endTime'], default=None)
+        return {'last_task_end_time': last_task['endTime'] if last_task else self.planning_start_dt, 'last_location': last_task['airport'] if last_task else crew['stayStation']}
+
+    def _build_priority_queue(self):
+        priorities = []
+        unassigned_departures = self.dh.data['flights'][self.dh.data['flights']['id'].isin(self.unassigned_flight_ids)].groupby('depaAirport')['id'].count()
+        for i, crew in enumerate(self.crews):
+            crew_state = self.crew_states[crew['crewId']]
+            score = unassigned_departures.get(crew_state['last_location'], 0)
+            score -= (crew_state['last_task_end_time'] - self.planning_start_dt).total_seconds() / (3600 * 24)
+            priorities.append((score, i))
+        priorities.sort(key=lambda x: x[0], reverse=True)
+        return collections.deque([idx for score, idx in priorities])
 
     def _get_observation(self):
-        """
-        核心函数：为当前机长构建观测，包括状态和有效动作。
-        """
-        if self.current_crew_idx >= len(self.crews):
-            # 这种情况理论上不应该发生，除非所有机组都已处理完毕
-            return None, []
-
+        if not self.decision_priority_queue: return None, {'valid_actions': []}
+        self.current_crew_idx = self.decision_priority_queue[0]
         crew_info = self.crews[self.current_crew_idx]
-        crew_id = crew_info['crewId']
-        crew_state = self.crew_states[crew_id]
-        current_roster = sorted(self.roster_plan[crew_id], key=lambda x: x.get('startTime', self.planning_start_dt))
-
-        # --- 1. 构建状态向量 (State Vector) ---
-        state_vector = self._build_state_vector(crew_state)
-        
-        # --- 2. 筛选有效候选动作 (Action Masking) ---
-        valid_actions = self._get_valid_actions(crew_info, crew_state, current_roster)
-        
-        # --- 3. 构建动作特征向量和掩码 ---
+        crew_state = self.crew_states[crew_info['crewId']]
+        state_vector = self._build_state_vector(crew_state, crew_info)
+        valid_actions, relaxed_actions = self._get_valid_actions(crew_info, crew_state)
+        actions_to_consider = valid_actions if valid_actions else relaxed_actions
         action_features = np.zeros((config.MAX_CANDIDATE_ACTIONS, config.ACTION_DIM))
         action_mask = np.zeros(config.MAX_CANDIDATE_ACTIONS, dtype=np.uint8)
-
-        for i, action in enumerate(valid_actions):
+        for i, action in enumerate(actions_to_consider):
             action_mask[i] = 1
-            action_features[i, :] = self._task_to_feature_vector(action, crew_state)
-            
-        observation = {
-            'state': state_vector,
-            'action_features': action_features,
-            'action_mask': action_mask
-        }
-        return observation, valid_actions
+            action_features[i, :] = self._task_to_feature_vector(action, crew_state, crew_info)
+        observation = {'state': state_vector, 'action_features': action_features, 'action_mask': action_mask}
+        info = {'valid_actions': actions_to_consider}
+        return observation, info
         
-    def _build_state_vector(self, crew_state):
-        """特征工程: 构建状态向量"""
-        state_vector = np.zeros(config.STATE_DIM)
-        time_since_start = (crew_state['last_task_end_time'] - self.planning_start_dt).total_seconds() / (3600 * 24 * 7)
-        time_of_day = crew_state['last_task_end_time'].hour / 24.0
-        day_of_week = crew_state['last_task_end_time'].weekday() / 7.0
-        
-        state_vector[0] = time_since_start
-        state_vector[1] = time_of_day
-        state_vector[2] = day_of_week
-        state_vector[3] = crew_state['total_flight_duty_time'] / 60.0
-        # 可以在此添加更多状态特征，如机场的one-hot编码等
-        return state_vector
-
-    def _get_valid_actions(self, crew_info, crew_state, current_roster):
-        """根据硬约束筛选有效动作。"""
-        valid_actions = []
-        crew_id = crew_info['crewId']
-        
-        # 预筛选
-        potential_tasks_df = self.unified_tasks_df[
-            (self.unified_tasks_df['taskId'].isin(self.unassigned_task_ids)) &
-            (self.unified_tasks_df['startTime'] > crew_state['last_task_end_time'] + timedelta(hours=1)) &
-            (self.unified_tasks_df['depaAirport'] == crew_state['last_location'])
-        ].sort_values('startTime').head(config.MAX_CANDIDATE_ACTIONS * 2)
-
-        for _, task_series in potential_tasks_df.iterrows():
-            task_dict = task_series.to_dict()
-            
-            # 使用增量规则检查器（这里是简化的逻辑，需要你根据utils.py完善）
-            # Rule 10: Qualification
-            if task_dict['type'] == 'flight' and task_dict['taskId'] not in self.dh.crew_leg_map.get(crew_id, set()):
-                continue
-            
-            # Rule 11: No Overlap with existing roster (including ground duties)
-            is_overlap = False
-            for existing_task in current_roster:
-                if not (task_dict['endTime'] <= existing_task.get('startTime', self.planning_end_dt) or \
-                        task_dict['startTime'] >= existing_task.get('endTime', self.planning_start_dt)):
-                    is_overlap = True
-                    break
-            if is_overlap:
-                continue
-            
-            # ... 在此添加更多增量检查 ...
-            
-            valid_actions.append(task_dict)
-            if len(valid_actions) >= config.MAX_CANDIDATE_ACTIONS:
-                break
-        return valid_actions
-
-    def _task_to_feature_vector(self, task, crew_state):
-        """特征工程: 将任务转换为特征向量"""
-        vec = np.zeros(config.ACTION_DIM)
-        vec[0] = (task['startTime'] - crew_state['last_task_end_time']).total_seconds() / 3600 # Connection time
-        vec[1] = task.get('flyTime', 0) / 60.0 # Fly time
-        vec[2] = 1 if task['type'] == 'flight' else 0
-        vec[3] = 1 if 'positioning' in task.get('type', '') else 0
-        # ... 可以在此添加更多动作特征
+    def _build_state_vector(self, crew_state, crew_info):
+        vec = np.zeros(config.STATE_DIM)
+        now = crew_state['last_task_end_time']
+        vec[0] = (now - self.planning_start_dt).total_seconds() / (3600*24*7)
+        vec[1], vec[2] = now.hour / 24.0, now.weekday() / 7.0
+        vec[3] = 1 if crew_state['last_location'] == crew_info['base'] else 0
+        total_flights = len(self.dh.data['flights'])
+        vec[4] = len(self.unassigned_flight_ids) / total_flights if total_flights > 0 else 0
         return vec
 
-    def step(self, action_idx, valid_actions):
-        """
-        执行一步动作，即为当前机长选择一个任务。
-        返回:
-        - observation (dict): 下一个观测。
-        - reward (float): 该动作获得的奖励。
-        - terminated (bool): 回合是否因为正常结束而终止。
-        - truncated (bool): 回合是否因为达到步数上限而终止。
-        - info (dict): 附加信息。
-        """
+    def _get_valid_actions(self, crew_info, crew_state):
+        last_loc, last_time = crew_state['last_location'], crew_state['last_task_end_time']
+        potential_tasks_df = self.unified_tasks_df[(self.unified_tasks_df['startTime'] > last_time) & (self.unified_tasks_df['depaAirport'] == last_loc)].copy()
+        all_actions, current_roster = [], self.roster_plan[crew_info['crewId']]
+        for _, task_series in potential_tasks_df.iterrows():
+            task_id = task_series['taskId']
+            if task_series['type'] == 'flight':
+                if task_id in self.unassigned_flight_ids and task_id in self.dh.crew_leg_map.get(crew_info['crewId'], set()):
+                    all_actions.append({**task_series.to_dict(), 'type': 'flight'})
+                all_actions.append({**task_series.to_dict(), 'type': 'positioning_flight'})
+            else: all_actions.append(task_series.to_dict())
+        valid_actions, relaxed_actions = [], []
+        for action in all_actions:
+            is_valid, violated_rules = self._is_incrementally_valid(current_roster, action, crew_info, crew_state)
+            if is_valid: valid_actions.append(action)
+            elif any('minor' in r for r in violated_rules):
+                action['violation_penalty'] = len(violated_rules)
+                relaxed_actions.append(action)
+        
+        valid_actions.sort(key=lambda x: x.get('flyTime',0), reverse=True)
+        relaxed_actions.sort(key=lambda x: (-x.get('violation_penalty', 0), x.get('flyTime',0)), reverse=True)
+        if valid_actions: return valid_actions[:config.MAX_CANDIDATE_ACTIONS], []
+        return [], relaxed_actions[:config.MAX_CANDIDATE_ACTIONS]
+
+    def _is_incrementally_valid(self, roster, new_task, crew_info, crew_state):
+        violated_rules = set()
+        if new_task.get('type') == 'flight' and new_task['taskId'] not in self.dh.crew_leg_map.get(crew_info['crewId'], set()): return False, {'hard_violation_qualification'}
+        for task in roster:
+            if not (new_task['endTime'] <= task.get('startTime', config.PLANNING_END_DATE) or new_task['startTime'] >= task.get('endTime', config.PLANNING_START_DATE)): return False, {'hard_violation_overlap'}
+        temp_roster = sorted(roster + [new_task], key=lambda x: x['startTime'])
+        ground_duties = self.dh.crew_ground_duties.get(crew_info['crewId'], [])
+        temp_duties, _ = identify_duties_and_cycles(temp_roster, ground_duties)
+        if temp_duties:
+            last_duty = temp_duties[-1]
+            flight_duty_tasks = [t for t in last_duty if t.get('type') in ['flight', 'positioning_flight', 'positioning_bus']]
+            if flight_duty_tasks:
+                if sum(t.get('flyTime', 0) for t in flight_duty_tasks) / 60.0 > 8: violated_rules.add('minor_violation_fly_time')
+                duty_start = flight_duty_tasks[0]['startTime']
+                flight_tasks_in_duty = [t for t in flight_duty_tasks if 'flight' in t.get('type','')]
+                if flight_tasks_in_duty:
+                    duty_end = flight_tasks_in_duty[-1]['endTime']
+                    if (duty_end - duty_start) > timedelta(hours=12): violated_rules.add('minor_violation_duty_duration')
+        return len(violated_rules) == 0, violated_rules
+    
+    def _task_to_feature_vector(self, task, crew_state, crew_info):
+        vec = np.zeros(config.ACTION_DIM)
+        vec[0] = (task['startTime'] - crew_state['last_task_end_time']).total_seconds() / 3600
+        vec[1] = task.get('flyTime', 0) / 60.0
+        vec[2] = 1 if task.get('type') == 'flight' else 0
+        vec[3] = 1 if 'positioning' in task.get('type', '') else 0
+        vec[4] = 1 if task.get('arriAirport') == crew_info['base'] else 0
+        vec[5] = -task.get('violation_penalty', 0)
+        next_location = task.get('arriAirport')
+        unassigned_departures_next = self.dh.data['flights'][(self.dh.data['flights']['id'].isin(self.unassigned_flight_ids)) & (self.dh.data['flights']['depaAirport'] == next_location)].shape[0]
+        vec[6] = unassigned_departures_next / 10.0
+        return vec
+
+    def step(self, action_idx):
         reward = 0
+        if not self.decision_priority_queue: return None, 0, True, False, {'valid_actions': []}
+        
+        self.current_crew_idx = self.decision_priority_queue.popleft()
         crew_info = self.crews[self.current_crew_idx]
         crew_id = crew_info['crewId']
-
-        # 如果没有有效动作，或者智能体选择“不安排”(action_idx 超出范围)
-        if action_idx >= len(valid_actions):
-            reward -= 0.1  # 小的负奖励，鼓励模型尽可能安排任务
+        
+        _, info = self._get_observation()
+        actions_to_consider = info['valid_actions']
+        
+        if action_idx < 0 or action_idx >= len(actions_to_consider):
+            penalty_multiplier = 1 + len(actions_to_consider) / 10.0
+            reward -= 1.0 * penalty_multiplier
         else:
-            task = valid_actions[action_idx]
-            
-            # 更新排班和状态
+            task = actions_to_consider[action_idx]
             self.roster_plan[crew_id].append(task)
-            if task['type'] == 'flight':
-                 self.unassigned_task_ids.remove(task['taskId'])
-            
+            task_type = task.get('type', '')
+            if task_type == 'flight':
+                if task['taskId'] in self.unassigned_flight_ids: self.unassigned_flight_ids.remove(task['taskId'])
             self.crew_states[crew_id]['last_task_end_time'] = task['endTime']
             self.crew_states[crew_id]['last_location'] = task['arriAirport']
-            # TODO: 更新更复杂的累计状态，如值勤时间
-            
-            # 计算即时奖励
             reward += self._calculate_immediate_reward(task, crew_info)
+            reward -= task.get('violation_penalty', 0) * config.PENALTY_RULE_VIOLATION * 0.2
 
-        # 切换到下一个机长进行决策 (轮询)
-        self.current_crew_idx = (self.current_crew_idx + 1) % len(self.crews)
         self.total_steps += 1
         
-        # 检查回合是否结束
-        terminated = not self.unassigned_task_ids
-        truncated = self.total_steps >= (len(self.crews) * config.MAX_STEPS_PER_CREW)
-        done = terminated or truncated
+        if self.total_steps % len(self.crews) == 0: self.decision_priority_queue = self._build_priority_queue()
         
-        if done:
-            final_score = calculate_final_score(self.roster_plan, self.dh)
-            reward += final_score
-            observation, next_valid_actions = None, []
+        terminated = not self.unassigned_flight_ids
+        truncated = not self.decision_priority_queue or self.total_steps >= (len(self.crews) * config.MAX_STEPS_PER_CREW * 1.5)
+        
+        if terminated or truncated:
+            reward += calculate_final_score(self.roster_plan, self.dh)
+            observation, info = None, {'valid_actions': []}
         else:
-            observation, next_valid_actions = self._get_observation()
-            
-        info = {'valid_actions': next_valid_actions, 'is_success': terminated}
+            observation, info = self._get_observation()
         
         return observation, reward, terminated, truncated, info
 
     def _calculate_immediate_reward(self, task, crew_info):
-        """奖励塑造: 设计即时奖励来引导模型学习"""
         reward = 0
-        if task.get('type') == 'flight':
-            reward += (task.get('flyTime', 0) / 60.0) * 0.5  # 飞行时间奖励
-        elif 'positioning' in task.get('type'):
-            reward += config.PENALTY_POSITIONING * 0.5  # 置位惩罚
-            
-        # 惩罚外站过夜（简化判断）
-        if task['arriAirport'] != crew_info['base']:
-            if task['endTime'].hour >= 20:
-                reward += config.PENALTY_OVERNIGHT_STAY * 0.1
-        
+        task_type = task.get('type', '')
+        if task_type == 'flight':
+            reward += config.IMMEDIATE_COVERAGE_REWARD
+            reward += (task.get('flyTime', 0) / 60.0) * 0.5
+        elif 'positioning' in task_type:
+            reward += config.PENALTY_POSITIONING
+        if task.get('arriAirport') == crew_info['base']:
+            reward += 0.5
         return reward

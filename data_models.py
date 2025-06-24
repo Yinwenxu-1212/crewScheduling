@@ -135,7 +135,8 @@ class Label:
                  duty_flight_time=0.0, duty_flight_count=0, duty_task_count=0,
                  total_flight_hours=0.0, total_positioning=0, 
                  total_away_overnights=0, total_calendar_days=None, 
-                 has_flown_in_duty=False, used_task_ids=None, tie_breaker=0):
+                 has_flown_in_duty=False, used_task_ids=None, tie_breaker=0,
+                 current_cycle_start=None, current_cycle_days=0, last_base_return=None):
         self.cost = cost
         self.path = path
         self.current_node = current_node
@@ -153,6 +154,10 @@ class Label:
         self.has_flown_in_duty = has_flown_in_duty
         self.used_task_ids = used_task_ids if used_task_ids is not None else set()
         self.tie_breaker = tie_breaker
+        # 飞行周期管理字段
+        self.current_cycle_start = current_cycle_start  # 当前飞行周期开始日期
+        self.current_cycle_days = current_cycle_days    # 当前飞行周期已持续天数
+        self.last_base_return = last_base_return        # 最后一次返回基地的日期
 
     def __lt__(self, other):
         return self.cost < other.cost

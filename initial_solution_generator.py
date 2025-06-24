@@ -63,7 +63,7 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
     if crew.current_time and task_start_time < crew.current_time:
         return False
     
-    # [新增] groundDuty期间不能插入其他任务
+    # groundDuty期间不能插入其他任务
     if crew.is_on_ground_duty and crew.current_ground_duty_end_time:
         if not (task_end_time <= crew.current_ground_duty_end_time or task_start_time >= crew.current_ground_duty_end_time):
             return False
@@ -71,7 +71,7 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
 
     # 2. 地点衔接规则 (Rule 2.1, 2.2)
     if crew.last_activity_end_location != task_origin:
-        # [新增] groundDuty 要求人必须提前在场，不能用大巴衔接
+        # groundDuty 要求人必须提前在场，不能用大巴衔接
         if task_type == "ground_duty" and crew.last_activity_end_location != task.airport:
             return False
         if not crew.schedule and crew.stayStation != task_origin: # 第一个任务且不在历史停留地

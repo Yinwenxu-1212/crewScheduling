@@ -47,16 +47,9 @@ class MasterProblem:
     def add_roster_column(self, roster: Roster):
         flight_ids_in_roster = {task.id for task in roster.duties if isinstance(task, Flight)}
         
-        constrs = []
-        coeffs = []
-        
-        # 创建roster决策变量（使用正确的成本）
-        # 确保roster.cost是正数
-        roster_cost = abs(roster.cost) if roster.cost < 0 else roster.cost
-        
         var = self.model.addVar(
             vtype=GRB.BINARY, 
-            obj=roster_cost,  # roster的正数成本
+            obj=roster.cost,  # 使用原始成本（可能为负）
             name=f"roster_{len(self.rosters)}"
         )
         
@@ -94,60 +87,102 @@ class MasterProblem:
             name=f"crew_{roster.crew_id}"
         )
         
-        # 重新设置完整的目标函数（可选）
+        # 重新设置完整的目标函数
         self.model.setObjective(
             gp.quicksum(var * roster.cost for roster, var in self.roster_vars.items()) +
             gp.quicksum(self.uncovered_vars.values()) * self.UNCOVERED_FLIGHT_PENALTY,
             sense=GRB.MINIMIZE
         )
 
-    def solve_lp(self) -> tuple[dict, dict]:
-            """
-            求解主问题的线性松弛版本，并返回两种对偶价格。
-            返回: (pi_duals, sigma_duals)
-            """
-            self.model.update()
-            lp_model = self.model.relax()
-            lp_model.setParam('Presolve', 0)
-            # 在调试时可以设为1，平时设为0让输出更整洁
-            lp_model.setParam('LogToConsole', 0) 
-            lp_model.optimize()
-
-            if lp_model.status == GRB.OPTIMAL:
-                print(f"LP松弛最优解目标函数值: {lp_model.ObjVal}")
-                pi_duals = {}
-                sigma_duals = {}
-                
-                # 遍历所有约束，根据名称区分并提取对偶价格
-                for constr in lp_model.getConstrs():
-                    name = constr.ConstrName
-                    if name.startswith("cover_"):
-                        flight_id = name.split('_')[1]
-                        pi_duals[flight_id] = constr.Pi
-                    # --- 【新增】提取机长约束的对偶价格 ---
-                    elif name.startswith("crew_"):
-                        crew_id = name.split('_')[1]
-                        sigma_duals[crew_id] = constr.Pi
-                
-                # 确保每个机长都有一个对偶价格，即使它没有约束（通常为0）
-                for crew in self.crews:
-                    if crew.crewId not in sigma_duals:
-                        sigma_duals[crew.crewId] = 0.0
-
-                return pi_duals, sigma_duals
+    def solve_lp(self) -> tuple[dict, dict, float]:
+        """
+        求解主问题的线性松弛版本，并返回两种对偶价格和目标函数值。
+        返回: (pi_duals, sigma_duals, obj_val)
+        """
+        self.model.update()
+        lp_model = self.model.relax()
+        lp_model.setParam('Presolve', 0)
+        lp_model.setParam('LogToConsole', 0)
+        lp_model.optimize()
+    
+        if lp_model.status == GRB.OPTIMAL:
+            obj_val = lp_model.ObjVal
+            print(f"LP松弛最优解目标函数值: {obj_val}")
+            pi_duals = {}
+            sigma_duals = {}
             
-            print("主问题LP求解失败，无法获取对偶价格。")
-            return None, None
+            # 遍历所有约束，根据名称区分并提取对偶价格
+            for constr in lp_model.getConstrs():
+                name = constr.ConstrName
+                if name.startswith("cover_"):
+                    flight_id = name.split('_')[1]
+                    pi_duals[flight_id] = constr.Pi
+                # --- 【新增】提取机长约束的对偶价格 ---
+                elif name.startswith("crew_"):
+                    crew_id = name.split('_')[1]
+                    sigma_duals[crew_id] = constr.Pi
+            
+            # 确保每个机长都有一个对偶价格，即使它没有约束（通常为0）
+            for crew in self.crews:
+                if crew.crewId not in sigma_duals:
+                    sigma_duals[crew.crewId] = 0.0
+    
+            return pi_duals, sigma_duals, obj_val
+        
 
     def solve_bip(self):
         print("正在求解最终的BIP模型...")
         self.model.optimize()
         return self.model
 
-    def get_selected_rosters(self) -> List[Roster]:
+    def get_selected_rosters(self):
+        """获取被选中的排班方案"""
+        import csv
+        from datetime import datetime
+        
         selected = []
-        if self.model.SolCount > 0:
-            for roster, var in self.roster_vars.items():
-                if var.X > 0.5:
+        print("=== 调试：排班方案变量值 ===")
+        print(f"总共有 {len(self.roster_vars)} 个排班方案变量")
+        print(f"目标函数值: {self.model.ObjVal:.2f}")
+        
+        # 创建CSV文件记录所有方案的详细信息
+        csv_filename = f"debug/debug_rosters_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['方案编号', '变量值', '成本', '机组ID', '是否选中', '任务详情']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for i, (roster, var) in enumerate(self.roster_vars.items()):
+                var_value = var.X
+                is_selected = var_value > 0.5
+                
+                # 如果被选中，添加到selected列表
+                if is_selected:
                     selected.append(roster)
+                
+                # 构建任务详情字符串
+                task_details = []
+                for duty in roster.duties:
+                    if hasattr(duty, 'flightNo'):
+                        task_details.append(f"Flight:{duty.flightNo}")
+                    elif hasattr(duty, 'task'):
+                        task_details.append(f"Ground:{duty.task}")
+                    else:
+                        task_details.append(f"Other:{type(duty).__name__}")
+                
+                task_details_str = "; ".join(task_details)
+                
+                # 写入CSV
+                writer.writerow({
+                    '方案编号': i + 1,
+                    '变量值': f"{var_value:.6f}",
+                    '成本': f"{roster.cost:.2f}",
+                    '机组ID': roster.crew_id,
+                    '是否选中': '是' if is_selected else '否',
+                    '任务详情': task_details_str
+                })
+        
+        print(f"总共选中了 {len(selected)} 个排班方案")
+        print(f"详细信息已保存到: {csv_filename}")
         return selected

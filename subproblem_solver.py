@@ -26,8 +26,9 @@ PENALTY_PER_AWAY_OVERNIGHT = 0.5
 PENALTY_PER_POSITIONING = 0.5
 
 # --- 规则常数 ---
-MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT = timedelta(hours=3)
-MIN_CONNECTION_TIME_BUS = timedelta(hours=2)
+MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT = timedelta(minutes=30)  # 飞机尾号相同时的最小衔接时间
+MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT = timedelta(hours=3)  # 飞机尾号不同时的最小衔接时间
+MIN_CONNECTION_TIME_BUS = timedelta(hours=2)  # 大巴置位最小衔接时间
 MAX_DUTY_DAY_HOURS = 12.0
 MIN_REST_HOURS = 12.0
 MAX_FLIGHTS_IN_DUTY = 4
@@ -42,7 +43,8 @@ class Label:
                  total_flight_hours: float, total_positioning: int,
                  total_away_overnights: int, total_calendar_days: Set[date],
                  has_flown_in_duty: bool,used_task_ids: Optional[Set[str]],
-                 tie_breaker: int):
+                 tie_breaker: int, current_cycle_start: Optional[date] = None,
+                 current_cycle_days: int = 0, last_base_return: Optional[date] = None):
         self.cost, self.path, self.node = cost, path, node
         self.duty_start_time, self.duty_flight_time = duty_start_time, duty_flight_time
         self.duty_flight_count, self.duty_task_count = duty_flight_count, duty_task_count
@@ -51,6 +53,10 @@ class Label:
         self.has_flown_in_duty = has_flown_in_duty 
         self.used_task_ids = used_task_ids if used_task_ids is not None else set()
         self.tie_breaker = tie_breaker
+        # 飞行周期管理字段
+        self.current_cycle_start = current_cycle_start
+        self.current_cycle_days = current_cycle_days
+        self.last_base_return = last_base_return
 
     def __lt__(self, other):
         if abs(self.cost - other.cost) > 1e-6: return self.cost < other.cost
@@ -127,7 +133,9 @@ def solve_subproblem_for_crew(
                         total_flight_hours=0, total_positioning=0, total_away_overnights=0,
                         total_calendar_days=set(), has_flown_in_duty=False,
                         used_task_ids=set(),  
-                        tie_breaker=next(tie_breaker))
+                        tie_breaker=next(tie_breaker),
+                        current_cycle_start=None, current_cycle_days=0,
+                        last_base_return=start_node.time.date())
 
     pq = [initial_label]
     visited: Dict[str, List[Label]] = {}
@@ -171,8 +179,11 @@ def solve_subproblem_for_crew(
                                 total_away_overnights=current_label.total_away_overnights + 1,
                                 total_calendar_days=current_label.total_calendar_days,
                                 has_flown_in_duty=False, 
-                                used_task_ids=current_label.used_task_ids,  # ✅ 加上这一行
-                                tie_breaker=next(tie_breaker))
+                                used_task_ids=current_label.used_task_ids,
+                                tie_breaker=next(tie_breaker),
+                                current_cycle_start=current_label.current_cycle_start,
+                                current_cycle_days=current_label.current_cycle_days,
+                                last_base_return=current_label.last_base_return)
                 heapq.heappush(pq, new_label)
                 parent_map[new_label.tie_breaker] = (current_label.tie_breaker, None)
 
@@ -235,7 +246,10 @@ def solve_subproblem_for_crew(
                         total_calendar_days=new_days,
                         has_flown_in_duty=current_label.has_flown_in_duty or is_flight,
                         used_task_ids=current_label.used_task_ids.union({task.id}),
-                        tie_breaker=next(tie_breaker)
+                        tie_breaker=next(tie_breaker),
+                        current_cycle_start=current_label.current_cycle_start,
+                        current_cycle_days=current_label.current_cycle_days,
+                        last_base_return=current_label.last_base_return
                     ))
                 continue
 
@@ -246,7 +260,21 @@ def solve_subproblem_for_crew(
                     continue
             
             last_task = current_label.path[-1] if current_label.path and isinstance(current_label.path[-1], Flight) else None
-            min_connect_time = MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT if is_flight and last_task and task.aircraftNo != last_task.aircraftNo else MIN_CONNECTION_TIME_BUS if not is_flight else timedelta(hours=0)
+            
+            # 根据任务类型和飞机尾号确定最小连接时间
+            if is_flight:
+                if last_task and hasattr(last_task, 'aircraftNo'):
+                    if task.aircraftNo == last_task.aircraftNo:
+                        min_connect_time = MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT
+                    else:
+                        min_connect_time = MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT
+                else:
+                    min_connect_time = MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT
+            elif isinstance(task, GroundDuty) and task.type == 'bus':
+                min_connect_time = MIN_CONNECTION_TIME_BUS
+            else:
+                min_connect_time = timedelta(hours=0)
+            
             if (task_start_time - current_label.node.time) < min_connect_time: continue
             
             if is_conflicting(task_start_time, task_end_time, task_dep_station, conflicting_ground_duties): continue
@@ -309,9 +337,12 @@ def solve_subproblem_for_crew(
                               total_flight_hours=new_total_flight_hours, total_positioning=new_total_positioning,
                               total_away_overnights=current_label.total_away_overnights,
                               total_calendar_days=current_label.total_calendar_days.union(new_cal_days),
-                              has_flown_in_duty=new_has_flown_in_duty, # <--- 传入新状态
+                              has_flown_in_duty=new_has_flown_in_duty,
                               used_task_ids=current_label.used_task_ids.union({task.id}),
-                              tie_breaker=next(tie_breaker))
+                              tie_breaker=next(tie_breaker),
+                              current_cycle_start=current_label.current_cycle_start,
+                              current_cycle_days=current_label.current_cycle_days,
+                              last_base_return=current_label.last_base_return)
             heapq.heappush(pq, new_label)
             parent_map[new_label.tie_breaker] = (current_label.tie_breaker, features)
 
