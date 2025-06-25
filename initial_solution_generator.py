@@ -2,8 +2,10 @@
 
 from datetime import datetime, timedelta
 from typing import List, Dict
+import os
 from data_models import Flight, Crew, BusInfo, GroundDuty, Roster
 from scoring_system import ScoringSystem
+from results_writer import write_results_to_csv
 
 # FDP (Flight Duty Period) Rules - Centralized Configuration
 FDP_RULES = {
@@ -40,7 +42,7 @@ MAX_TOTAL_FLIGHT_DUTY_TIME = timedelta(hours=60) # 计划期内总飞行值勤�
 
 # 辅助函数：检查任务是否可以分配给机组 (现在也处理其他类型任务)
 def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_stations_set, start_date): # task可以是Flight, BusInfo, GroundDuty
-    # 0. 置位规则检查 (大巴任务)
+ # 0. 置位规则检查 (大巴任务)
     if task_type == 'bus':
         # 大巴只能在FDP的开始（第一个任务）或结束（最后一个任务）时进行
         # 'pre_flight' 意味着FDP已开始但尚未有飞行任务
@@ -53,8 +55,8 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
     if task_type == "flight" and (crew.crewId, task.id) not in crew_leg_matches_set:
         return False # 机组与航班不匹配
 
-    task_start_time = task.std if task_type == "flight" else (task.startTime if task_type == "bus" else task.startTime)
-    task_end_time = task.sta if task_type == "flight" else (task.endTime if task_type == "bus" else task.endTime)
+    task_start_time = task.std if task_type == "flight" else (task.td if task_type == "bus" else task.startTime)
+    task_end_time = task.sta if task_type == "flight" else (task.ta if task_type == "bus" else task.endTime)
     task_origin = task.depaAirport if task_type == "flight" else (task.depaAirport if task_type == "bus" else task.airport)
     task_destination = task.arriAirport if task_type == "flight" else (task.arriAirport if task_type == "bus" else task.airport)
     flight_duration = timedelta(minutes=task.flyTime) if task_type == "flight" else timedelta(0)
@@ -62,18 +64,9 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
     # 1. 检查时间顺序：任务开始时间必须晚于或等于机组当前可用时间
     if crew.current_time and task_start_time < crew.current_time:
         return False
-    
-    # groundDuty期间不能插入其他任务
-    if crew.is_on_ground_duty and crew.current_ground_duty_end_time:
-        if not (task_end_time <= crew.current_ground_duty_end_time or task_start_time >= crew.current_ground_duty_end_time):
-            return False
-
 
     # 2. 地点衔接规则 (Rule 2.1, 2.2)
     if crew.last_activity_end_location != task_origin:
-        # groundDuty 要求人必须提前在场，不能用大巴衔接
-        if task_type == "ground_duty" and crew.last_activity_end_location != task.airport:
-            return False
         if not crew.schedule and crew.stayStation != task_origin: # 第一个任务且不在历史停留地
             # 允许通过大巴或置位航班从基地出发 (Rule 2.2.1, 2.2.2)
             # 简化：如果任务是飞行或地面，且机组在基地，但任务不在基地，则不允许（除非有大巴/置位）
@@ -126,28 +119,65 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
             crew.consecutive_duty_days = 1 
         
         if crew.consecutive_duty_days > MAX_CONSECUTIVE_DUTY_DAYS_AWAY:
-            return False
+            return False # 连续执勤超限
 
+    # 临时计算当前任务加入后FDP的状态
+    temp_fdp_flight_tasks = crew.fdp_flight_tasks_count
+    temp_fdp_total_tasks = crew.fdp_total_tasks_count
+    temp_fdp_flight_time = crew.fdp_flight_time
+    # temp_fdp_duty_time = crew.fdp_duty_time # 将在下面重新计算
+    temp_fdp_start_for_duty_calc = crew.fdp_start_time
+    temp_fdp_tasks_details_for_calc = list(crew.fdp_tasks_details) # 创建副本进行计算
+
+    if is_new_fdp:
+        temp_fdp_flight_tasks = 0
+        temp_fdp_total_tasks = 0
+        temp_fdp_flight_time = timedelta(0)
+        temp_fdp_start_for_duty_calc = task_start_time
+        temp_fdp_tasks_details_for_calc = []
+
+    # 将当前任务加入临时FDP列表以计算执勤时间
+    temp_fdp_tasks_details_for_calc.append({'type': task_type, 'std': task_start_time, 'sta': task_end_time, 'id': task.id if hasattr(task,'id') else None})
+
+    if task_type == "flight":
+        temp_fdp_flight_tasks += 1
+    # GroundDuty 和 Bus 也计入总任务数 (Rule 3.1.1)
+    temp_fdp_total_tasks += 1
+    temp_fdp_flight_time += flight_duration
+
+    # 计算值勤时间 (Rule 3.1.3: FDP中首任务的计划离港时刻(STD)与该FDP中最后一个飞行任务的计划到港时刻(STA)之间的时间)
+    last_flight_sta_in_temp_fdp = None
+    for t_detail in reversed(temp_fdp_tasks_details_for_calc):
+        if t_detail['type'] == 'flight':
+            last_flight_sta_in_temp_fdp = t_detail['sta']
+            break
+    
+    temp_fdp_duty_time = timedelta(0)
+    if temp_fdp_start_for_duty_calc and last_flight_sta_in_temp_fdp: # FDP中有飞行任务
+        temp_fdp_duty_time = last_flight_sta_in_temp_fdp - temp_fdp_start_for_duty_calc
+    elif temp_fdp_start_for_duty_calc and temp_fdp_tasks_details_for_calc: # FDP中无飞行任务，但有其他任务
+        # 规则未明确定义此种情况的FDP duty time，通常FDP围绕飞行任务展开
+        # 简化：如果FDP完全由非飞行任务组成，则其执勤时间为首任务到末任务的时间
+        temp_fdp_duty_time = temp_fdp_tasks_details_for_calc[-1]['sta'] - temp_fdp_start_for_duty_calc
+        
     # 4. FDP内任务数量限制 (Rule 3.1.1)
-    temp_fdp_flight_tasks_count = crew.fdp_flight_tasks_count + (1 if task_type == "flight" else 0)
-    temp_fdp_total_tasks_count = crew.fdp_total_tasks_count + 1
-    if temp_fdp_flight_tasks_count > MAX_DAILY_FLIGHT_TASKS or temp_fdp_total_tasks_count > MAX_DAILY_TOTAL_TASKS:
+    if temp_fdp_flight_tasks > MAX_DAILY_FLIGHT_TASKS:
+        return False
+    if temp_fdp_total_tasks > MAX_DAILY_TOTAL_TASKS: # 包括飞行、地面、大巴
         return False
 
     # 5. FDP内累计飞行时间限制 (Rule 3.1.2)
-    temp_fdp_flight_time = crew.fdp_flight_time + flight_duration
     if temp_fdp_flight_time > MAX_DAILY_FLIGHT_TIME:
         return False
 
     # 6. FDP内累计值勤时间限制 (Rule 3.1.3)
-    if is_new_fdp:
-        temp_fdp_start_time = task_start_time
-    else:
-        temp_fdp_start_time = crew.fdp_start_time
-    
-    temp_fdp_duty_time = task_end_time - temp_fdp_start_time
     if temp_fdp_duty_time > MAX_DAILY_DUTY_TIME:
         return False
+
+    # 7. 过夜站限制 (Rule 3.2.3) - FDP结束和下一个FDP开始必须在基地或指定过夜站
+    # 这个检查在assign_task_greedy中，当一个FDP实际结束时（即下一个任务开启新FDP或无任务可接）进行
+    # 此处仅预判：如果当前任务是FDP的最后一个（之后是长休），且目的地不合规
+    # 简化：暂时不在此处做严格预判，依赖assign_task_greedy中的逻辑
 
     # 8. FDP 内空飞结构检查 (规则 3.1.4)
     # 如果当前任务是飞行任务，而FDP状态是 'post_flight'，则不允许，因为飞行任务已经结束
@@ -168,12 +198,23 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
         
         if temp_cycle_days_count > MAX_FLIGHT_CYCLE_DAYS:
             # 如果超期，需要检查是否在基地结束上个周期并有足够休息
+            # This check is complex: requires knowing if the *previous* cycle ended at base with 2 days rest.
+            # Simplified: if it's a new FDP and adding it makes cycle days > MAX, AND the crew is not starting this FDP at base after a long rest, it's a violation.
+            # A more robust check would be in assign_task_greedy when a cycle actually completes or resets.
+            # For now, if it looks like it will exceed, and the previous FDP didn't end at base with a cycle-ending rest, deny.
             if not (crew.last_activity_end_location == crew.base and \
                       crew.last_rest_end_time and \
                       (task_start_time - crew.last_fdp_end_time_for_cycle_check if crew.last_fdp_end_time_for_cycle_check else timedelta(0)) >= MIN_REST_DAYS_AT_BASE_FOR_CYCLE_RESET):
                 return False # 飞行周期可能超限
     
+    # 9. 计划期内总飞行值勤时间限制 (Rule 3.5)
+    # 应该累加的是FDP的实际值勤时间。此检查在assign_task_greedy中进行更新和检查。
+    # 预估： (crew.total_flight_duty_time_in_period + temp_fdp_duty_time) > MAX_TOTAL_FLIGHT_DUTY_TIME
+    # 这里的temp_fdp_duty_time是当前FDP如果加入此任务后的预估值勤时间，但total_flight_duty_time_in_period是已完成FDP的累积
+    # 简化：暂时不在此处做严格预估，依赖assign_task_greedy
+
     return True
+
 
 # 辅助函数：分配任务并更新机组状态
 def assign_task_greedy(crew, task, task_type, start_date): # task可以是Flight, BusInfo, GroundDuty. Added start_date
@@ -364,17 +405,28 @@ def generate_initial_rosters_with_heuristic(
             # 如果提供了layover_stations，使用评分系统计算成本
             if layover_stations is not None:
                 scoring_system = ScoringSystem(flights, crews, layover_stations)
-                roster_cost = scoring_system.calculate_roster_score(roster, crew)
-                roster.cost = roster_cost
+                # 使用calculate_roster_cost_with_dual_prices方法，传入空的对偶价格
+                cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
+                    roster, crew, {}, 0.0
+                )
+                roster.cost = cost_details['total_cost']
             else:
                 # 回退到简单的成本计算
                 roster_cost = sum(getattr(task, 'cost', 0) for task in crew.schedule)
                 roster.cost = roster_cost
-            
             initial_rosters.append(roster)
 
     print(f"启发式算法成功生成 {len(initial_rosters)} 个初始排班方案。")
     unassigned_flight_ids = {uid for uid in unassigned_task_ids if not (isinstance(uid, tuple) and (uid[0] == 'bus' or uid[0] == 'gd'))}
     print(f"仍有 {len(unassigned_task_ids)} 个任务未被分配。")
     print(f"其中未分配的航班数量: {len(unassigned_flight_ids)}")
+    
+    # 输出初始解到CSV文件
+    output_dir = "output"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    output_path = os.path.join(output_dir, "initial_solution.csv")
+    write_results_to_csv(initial_rosters, output_path)
+    
     return initial_rosters

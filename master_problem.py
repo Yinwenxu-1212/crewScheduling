@@ -3,6 +3,7 @@
 import gurobipy as gp
 from gurobipy import GRB
 from typing import List
+from datetime import timedelta
 from data_models import Flight, Roster, Crew
 
 class MasterProblem:
@@ -15,11 +16,11 @@ class MasterProblem:
         self.uncovered_vars = {}  # 辅助变量
         self.flight_constraints = {}
         self.crew_constraints = {}
-        self.UNCOVERED_FLIGHT_PENALTY = 5  # 高惩罚确保尽量覆盖
+        self.UNCOVERED_FLIGHT_PENALTY = 5  # 题目规定的未覆盖航班惩罚
         self._setup_model()
     
     def _setup_model(self):
-        # 1. 航班覆盖约束（初始时允许未覆盖，但不强制）
+        # 1. 航班覆盖约束（初始时强制所有航班为未覆盖状态）
         for flight in self.flights:
             uncovered_var = self.model.addVar(
                 vtype=GRB.BINARY, 
@@ -27,9 +28,10 @@ class MasterProblem:
                 name=f"uncovered_{flight.id}"
             )
             self.uncovered_vars[flight.id] = uncovered_var
-            # 修改：初始约束允许未覆盖，但不强制未覆盖
+            # 修正：初始约束强制所有航班为未覆盖状态
+            # 这个约束会在add_roster_column中被正确的覆盖约束替换
             self.flight_constraints[flight.id] = self.model.addConstr(
-                uncovered_var <= 1, name=f"cover_{flight.id}"
+                uncovered_var == 1, name=f"cover_{flight.id}"
             )
         
         # 2. 机组唯一性约束（初始为合理的约束）
@@ -87,16 +89,18 @@ class MasterProblem:
             name=f"crew_{roster.crew_id}"
         )
         
-        # 重新设置完整的目标函数
+        # 设置目标函数
         self.model.setObjective(
             gp.quicksum(var * roster.cost for roster, var in self.roster_vars.items()) +
             gp.quicksum(self.uncovered_vars.values()) * self.UNCOVERED_FLIGHT_PENALTY,
             sense=GRB.MINIMIZE
         )
 
-    def solve_lp(self) -> tuple[dict, dict, float]:
+    def solve_lp(self, verbose=False) -> tuple[dict, dict, float]:
         """
         求解主问题的线性松弛版本，并返回两种对偶价格和目标函数值。
+        参数:
+            verbose: 是否输出详细的调试信息
         返回: (pi_duals, sigma_duals, obj_val)
         """
         self.model.update()
@@ -107,20 +111,112 @@ class MasterProblem:
     
         if lp_model.status == GRB.OPTIMAL:
             obj_val = lp_model.ObjVal
-            print(f"LP松弛最优解目标函数值: {obj_val}")
+            if verbose:
+                print(f"LP松弛最优解目标函数值: {obj_val}")
+            
+            if verbose:
+                # 计算并输出目标函数各个部分的值
+                roster_cost_total = 0
+                for roster, var_name in self.roster_vars.items():
+                    # 在LP松弛模型中获取变量
+                    lp_var = lp_model.getVarByName(var_name.VarName)
+                    if lp_var is not None:
+                        roster_cost_total += lp_var.X * roster.cost
+                
+                flight_time_total = 0
+                for roster, var_name in self.roster_vars.items():
+                    roster_flight_time = sum(duty.flyTime / 60.0 for duty in roster.duties if hasattr(duty, 'flyTime'))
+                    lp_var = lp_model.getVarByName(var_name.VarName)
+                    if lp_var is not None:
+                        flight_time_total += lp_var.X * roster_flight_time
+                
+                duty_days_total = 0
+                for roster, var_name in self.roster_vars.items():
+                    duty_dates = set()
+                    for duty in roster.duties:
+                        if hasattr(duty, 'std') and hasattr(duty, 'sta'):
+                            start_date = duty.std.date()
+                            end_date = duty.sta.date()
+                            current_date = start_date
+                            while current_date <= end_date:
+                                duty_dates.add(current_date)
+                                current_date += timedelta(days=1)
+                        elif hasattr(duty, 'startTime') and hasattr(duty, 'endTime'):
+                            start_date = duty.startTime.date()
+                            end_date = duty.endTime.date()
+                            current_date = start_date
+                            while current_date <= end_date:
+                                duty_dates.add(current_date)
+                                current_date += timedelta(days=1)
+                    duty_days = len(duty_dates)
+                    lp_var = lp_model.getVarByName(var_name.VarName)
+                    if lp_var is not None:
+                        duty_days_total += lp_var.X * duty_days
+                
+                uncovered_penalty_total = 0
+                for flight_id, var_name in self.uncovered_vars.items():
+                    lp_var = lp_model.getVarByName(var_name.VarName)
+                    if lp_var is not None:
+                        uncovered_penalty_total += lp_var.X * self.UNCOVERED_FLIGHT_PENALTY
+                
+                print("\n目标函数各部分的值:")
+                print(f"1. roster.cost总和: {roster_cost_total}")
+                print(f"   - 总飞行时间: {flight_time_total} 小时")
+                print(f"   - 总值勤日数: {duty_days_total} 天")
+                if duty_days_total > 0:
+                    print(f"   - 平均每日飞行小时数: {flight_time_total/duty_days_total:.2f} 小时/天")
+                print(f"3. 未覆盖航班惩罚: {uncovered_penalty_total}")
+                
+                # 详细输出未覆盖航班信息
+                print(f"   - 未覆盖航班变量总数: {len(self.uncovered_vars)}")
+                uncovered_count = 0
+                for flight_id, var_name in self.uncovered_vars.items():
+                    lp_var = lp_model.getVarByName(var_name.VarName)
+                    if lp_var is not None and lp_var.X > 0.001:  # 大于0.001认为是未覆盖
+                        uncovered_count += 1
+
+                print(f"   - 实际未覆盖航班数: {uncovered_count}")
+                
+                print(f"4. 目标函数总值: {obj_val}")
+            
             pi_duals = {}
             sigma_duals = {}
             
             # 遍历所有约束，根据名称区分并提取对偶价格
+            if verbose:
+                print("\n=== 对偶价格调试信息 ===")
+            constraint_count = 0
             for constr in lp_model.getConstrs():
                 name = constr.ConstrName
+                dual_value = constr.Pi
+                constraint_count += 1
+                
+                if verbose and constraint_count <= 10:  # 只打印前10个约束的调试信息
+                    print(f"约束 {name}: 对偶价格 = {dual_value:.6f}")
+                
                 if name.startswith("cover_"):
                     flight_id = name.split('_')[1]
-                    pi_duals[flight_id] = constr.Pi
-                # --- 【新增】提取机长约束的对偶价格 ---
+                    pi_duals[flight_id] = dual_value
+                # --- 提取机长约束的对偶价格 ---
                 elif name.startswith("crew_"):
                     crew_id = name.split('_')[1]
-                    sigma_duals[crew_id] = constr.Pi
+                    sigma_duals[crew_id] = dual_value
+            
+            if verbose:
+                print(f"总约束数: {constraint_count}")
+                print(f"航班对偶价格数量: {len(pi_duals)}")
+                print(f"机组对偶价格数量: {len(sigma_duals)}")
+                
+                # 打印一些样本对偶价格
+                if pi_duals:
+                    sample_flight_ids = list(pi_duals.keys())[:3]
+                    for fid in sample_flight_ids:
+                        print(f"航班 {fid} 对偶价格: {pi_duals[fid]:.6f}")
+                
+                if sigma_duals:
+                    sample_crew_ids = list(sigma_duals.keys())[:3]
+                    for cid in sample_crew_ids:
+                        print(f"机组 {cid} 对偶价格: {sigma_duals[cid]:.6f}")
             
             # 确保每个机长都有一个对偶价格，即使它没有约束（通常为0）
             for crew in self.crews:
@@ -168,6 +264,10 @@ class MasterProblem:
                         task_details.append(f"Flight:{duty.flightNo}")
                     elif hasattr(duty, 'task'):
                         task_details.append(f"Ground:{duty.task}")
+                    elif type(duty).__name__ == 'BusInfo':
+                        task_details.append(f"Bus:{duty.id}")
+                    elif type(duty).__name__ == 'GroundDuty':
+                        task_details.append(f"Ground:{duty.id}")
                     else:
                         task_details.append(f"Other:{type(duty).__name__}")
                 

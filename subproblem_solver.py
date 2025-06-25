@@ -135,7 +135,8 @@ def solve_subproblem_for_crew(
                         used_task_ids=set(),  
                         tie_breaker=next(tie_breaker),
                         current_cycle_start=None, current_cycle_days=0,
-                        last_base_return=start_node.time.date())
+                        last_base_return=start_node.time.date(),
+                        duty_days_count=0)
 
     pq = [initial_label]
     visited: Dict[str, List[Label]] = {}
@@ -231,6 +232,9 @@ def solve_subproblem_for_crew(
                     if is_flight:
                         new_cost += REWARD_PER_FLIGHT_HOUR * (task.flyTime / 60.0)
                         new_cost -= dual_prices.get(task.id, 0)
+                    
+                    # 计算值勤日数量
+                    new_duty_days_count = current_label.duty_days_count + (1 if current_label.duty_start_time is None else 0)
 
                     heapq.heappush(pq, Label(
                         cost=new_cost,
@@ -249,7 +253,8 @@ def solve_subproblem_for_crew(
                         tie_breaker=next(tie_breaker),
                         current_cycle_start=current_label.current_cycle_start,
                         current_cycle_days=current_label.current_cycle_days,
-                        last_base_return=current_label.last_base_return
+                        last_base_return=current_label.last_base_return,
+                        duty_days_count=new_duty_days_count
                     ))
                 continue
 
@@ -279,12 +284,29 @@ def solve_subproblem_for_crew(
             
             if is_conflicting(task_start_time, task_end_time, task_dep_station, conflicting_ground_duties): continue
 
+            # 检查是否需要开始新值勤日
+            new_duty_days_count = current_label.duty_days_count
+            is_new_duty = False
+            
             if current_label.duty_start_time is None:
+                # 第一个任务，开始第一个值勤日
                 new_duty_start_time, new_duty_flight_time, new_duty_flight_count, new_duty_task_count = task_start_time, 0, 0, 0
                 new_has_flown_in_duty = is_flight
+                new_duty_days_count = 1
+                is_new_duty = True
             else:
-                new_duty_start_time, new_duty_flight_time, new_duty_flight_count, new_duty_task_count = current_label.duty_start_time, current_label.duty_flight_time, current_label.duty_flight_count, current_label.duty_task_count
-                new_has_flown_in_duty = current_label.has_flown_in_duty or is_flight
+                # 检查是否需要休息（结束当前值勤日）
+                rest_time = task_start_time - current_label.node.time
+                if rest_time >= timedelta(hours=MIN_REST_HOURS):
+                    # 足够的休息时间，结束当前值勤日，开始新值勤日
+                    new_duty_start_time, new_duty_flight_time, new_duty_flight_count, new_duty_task_count = task_start_time, 0, 0, 0
+                    new_has_flown_in_duty = is_flight
+                    new_duty_days_count = current_label.duty_days_count + 1
+                    is_new_duty = True
+                else:
+                    # 继续当前值勤日
+                    new_duty_start_time, new_duty_flight_time, new_duty_flight_count, new_duty_task_count = current_label.duty_start_time, current_label.duty_flight_time, current_label.duty_flight_count, current_label.duty_task_count
+                    new_has_flown_in_duty = current_label.has_flown_in_duty or is_flight
 
             if (task_end_time - new_duty_start_time).total_seconds() / 3600 > MAX_DUTY_DAY_HOURS: continue
             if (new_duty_task_count + 1) > MAX_TASKS_IN_DUTY: continue
@@ -342,9 +364,39 @@ def solve_subproblem_for_crew(
                               tie_breaker=next(tie_breaker),
                               current_cycle_start=current_label.current_cycle_start,
                               current_cycle_days=current_label.current_cycle_days,
-                              last_base_return=current_label.last_base_return)
+                              last_base_return=current_label.last_base_return,
+                              duty_days_count=new_duty_days_count)
             heapq.heappush(pq, new_label)
             parent_map[new_label.tie_breaker] = (current_label.tie_breaker, features)
+            
+            # 如果任务结束后在基地且满足条件，创建一个值勤日结束的标签
+            if (next_node.airport == crew.base and 
+                new_duty_start_time is not None and 
+                len(new_path) >= 2):  # 至少有一些任务
+                
+                # 创建值勤日结束标签（duty_start_time=None表示值勤日结束）
+                duty_end_label = Label(
+                    cost=new_cost,  # 相同成本
+                    path=new_path,
+                    node=next_node,
+                    duty_start_time=None,  # 明确标记值勤日结束
+                    duty_flight_time=0.0,  # 重置值勤计数器
+                    duty_flight_count=0,
+                    duty_task_count=0,
+                    total_flight_hours=new_total_flight_hours,
+                    total_positioning=new_total_positioning,
+                    total_away_overnights=current_label.total_away_overnights,
+                    total_calendar_days=current_label.total_calendar_days.union(new_cal_days),
+                    has_flown_in_duty=False,  # 重置值勤内飞行标记
+                    used_task_ids=current_label.used_task_ids.union({task.id}),
+                    tie_breaker=next(tie_breaker),
+                    current_cycle_start=current_label.current_cycle_start,
+                    current_cycle_days=current_label.current_cycle_days,
+                    last_base_return=next_node.time.date(),  # 更新最后回基地时间
+                    duty_days_count=new_duty_days_count
+                )
+                heapq.heappush(pq, duty_end_label)
+                parent_map[duty_end_label.tie_breaker] = (current_label.tie_breaker, features)
 
             if next_node.airport == crew.base and new_cost < -1e-6:
                 print(f"      [子问题发现!] 机组 {crew.crewId}: 找到负成本方案! Reduced Cost: {new_cost:.2f}")

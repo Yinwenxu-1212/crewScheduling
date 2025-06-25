@@ -2,6 +2,7 @@
 
 import time
 import csv
+import os
 from datetime import datetime
 from data_loader import load_all_data
 from master_problem import MasterProblem
@@ -28,6 +29,22 @@ def main():
     TIME_LIMIT_SECONDS = 1 * 3600 + 55 * 60 
     data_path = 'data/'
     MAX_ITERATIONS = 5
+    
+    # 设置日志文件
+    debug_dir = "debug"
+    if not os.path.exists(debug_dir):
+        os.makedirs(debug_dir)
+    
+    log_file_path = os.path.join(debug_dir, f"roster_cost_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = open(log_file_path, 'w', encoding='utf-8')
+    log_file.write(f"=== Roster成本调试日志 ===\n")
+    log_file.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    log_file.flush()
+    
+    def log_debug(message: str):
+        """写入调试信息到日志文件"""
+        log_file.write(f"{message}\n")
+        log_file.flush()
 
     # --- 2. 数据加载与预处理 ---
     print("正在加载所有数据...")
@@ -68,6 +85,8 @@ def main():
     # --- 4. 列生成循环 ---
     print("\n开始列生成过程...")
     previous_obj_val = float('inf')  # 初始化上一轮目标函数值
+    no_improvement_rounds = 0  # 连续无改进轮数计数
+    convergence_count = 0  # 目标函数改善微小的连续轮数
     
     # 在列生成循环外部初始化全局方案记录
     global_roster_signatures = set()
@@ -81,9 +100,10 @@ def main():
     for i in range(MAX_ITERATIONS):  # 改为大写的MAX_ITERATIONS
         iteration_start_time = time.time()
         print(f"\n=== 列生成第 {i+1} 轮 ===")
+        log_debug(f"\n=== 列生成第 {i+1} 轮开始 ===\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # 求解主问题LP松弛
-        pi_duals, sigma_duals, current_obj = master_problem.solve_lp()
+        # 求解主问题LP松弛（不输出详细调试信息）
+        pi_duals, sigma_duals, current_obj = master_problem.solve_lp(verbose=False)
         
         if pi_duals is None:
             print("主问题求解失败，退出列生成。")
@@ -111,7 +131,7 @@ def main():
             new_rosters = solve_subproblem_for_crew_with_attention(
                 crew, flights, bus_info, crew_specific_gds, 
                 pi_duals, layover_stations, crew_leg_match_dict,
-                crew_sigma_dual 
+                crew_sigma_dual, iteration_round=i
             )
             
             if new_rosters:
@@ -126,23 +146,25 @@ def main():
                     reduced_cost = cost_details['reduced_cost']
                     status = "[有价值]" if reduced_cost < -1e-6 else "[无价值]"
                     
-                    # print(f"\n  Roster {idx+1} {status}:")
-                    # print(f"    总成本 (total_cost): {cost_details['total_cost']:.6f}")
-                    # print(f"    Reduced Cost: {reduced_cost:.6f}")
-                    # print(f"    成本分解:")
-                    # print(f"      - 飞行奖励 (flight_reward): {cost_details['flight_reward']:.6f}")
-                    # print(f"      - 对偶价格收益 (dual_price_total): {cost_details['dual_price_total']:.6f}")
-                    # print(f"      - 置位惩罚 (positioning_penalty): {cost_details['positioning_penalty']:.6f}")
-                    # print(f"      - 外站过夜惩罚 (overnight_penalty): {cost_details['overnight_penalty']:.6f}")
-                    # print(f"      - 其他成本 (other_costs): {cost_details['other_costs']:.6f}")
-                    # print(f"      - 机组对偶系数 (crew_sigma_dual): {cost_details['crew_sigma_dual']:.6f}")
-                    # print(f"    统计信息:")
-                    # print(f"      - 航班数量: {cost_details['flight_count']}")
-                    # print(f"      - 总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
-                    # print(f"      - 值勤天数: {cost_details['duty_days']}")
-                    # print(f"      - 日均飞行时间: {cost_details['avg_daily_flight_hours']:.2f}小时")
-                    # print(f"      - 置位次数: {cost_details['positioning_count']}")
-                    # print(f"      - 外站过夜次数: {cost_details['overnight_count']}")
+                    # 只输出有价值的roster详细信息到日志文件
+                    if reduced_cost < -1e-6:
+                        log_debug(f"\n机组 {crew.crewId} - Roster {idx+1} {status}:")
+                        log_debug(f"  总成本 (total_cost): {cost_details['total_cost']:.6f}")
+                        log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
+                        log_debug(f"  成本分解:")
+                        log_debug(f"    - 飞行奖励 (flight_reward): {cost_details['flight_reward']:.6f}")
+                        log_debug(f"    - 对偶价格收益 (dual_price_total): {cost_details['dual_price_total']:.6f}")
+                        log_debug(f"    - 置位惩罚 (positioning_penalty): {cost_details['positioning_penalty']:.6f}")
+                        log_debug(f"    - 外站过夜惩罚 (overnight_penalty): {cost_details['overnight_penalty']:.6f}")
+                        log_debug(f"    - 其他成本 (other_costs): {cost_details['other_costs']:.6f}")
+                        log_debug(f"    - 机组对偶系数 (crew_sigma_dual): {cost_details['crew_sigma_dual']:.6f}")
+                        log_debug(f"  统计信息:")
+                        log_debug(f"    - 航班数量: {cost_details['flight_count']}")
+                        log_debug(f"    - 总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                        log_debug(f"    - 值勤天数: {cost_details['duty_days']}")
+                        log_debug(f"    - 日均飞行时间: {cost_details['avg_daily_flight_hours']:.2f}小时")
+                        log_debug(f"    - 置位次数: {cost_details['positioning_count']}")
+                        log_debug(f"    - 外站过夜次数: {cost_details['overnight_count']}")
                     
                     if reduced_cost < -1e-6:
                         master_problem.add_roster_column(r)
@@ -158,8 +180,8 @@ def main():
         print(f"\n=== 第 {i+1} 轮列生成结果 ===")
         print(f"本轮新增有价值roster数量: {new_rosters_found_count}")
         
-        # 求解当前主问题获取最优解
-        pi_duals, sigma_duals, current_obj_val = master_problem.solve_lp()
+        # 求解当前主问题获取最优解（输出详细调试信息）
+        pi_duals, sigma_duals, current_obj_val = master_problem.solve_lp(verbose=True)
         if current_obj_val is not None:  # 求解成功
             print(f"当前主问题最优目标函数值: {current_obj_val:.6f}")
             
@@ -167,15 +189,34 @@ def main():
             if i > 0:
                 improvement = previous_obj_val - current_obj_val
                 print(f"相比上轮的改善: {improvement:.6f}")
-                if improvement < 1e-6:
-                    print("目标函数值改善微小，可能接近最优解")
+                
+                # 基于目标函数改善判断收敛
+                if improvement < 1e-4:  # 改善小于阈值
+                    convergence_count += 1
+                    print(f"目标函数改善微小，连续{convergence_count}轮")
+                else:
+                    convergence_count = 0
             
             previous_obj_val = current_obj_val
         else:
             print("当前主问题求解失败")
         
-        if new_rosters_found_count == 0 and i > 0:
-            print("\n未找到更多有价值的排班方案，列生成结束。")
+        # 基本收敛条件
+        if new_rosters_found_count == 0:
+            no_improvement_rounds += 1
+            print(f"本轮未找到有价值roster，连续{no_improvement_rounds}轮无改进")
+        else:
+            no_improvement_rounds = 0
+        
+        # 简单收敛判断
+        if no_improvement_rounds >= 3 and i > 0:
+            print(f"\n连续3轮未找到有价值的排班方案，列生成结束。")
+            break
+        elif convergence_count >= 3 and i > 1:
+            print(f"\n目标函数连续3轮改善微小，列生成收敛。")
+            break
+        elif i >= MAX_ITERATIONS - 1:
+            print("\n达到最大迭代次数，列生成结束。")
             break
 
     # --- 5. 计算初始解质量 ---
@@ -194,7 +235,7 @@ def main():
     initial_total_cost = initial_cost + uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
     
     # 输出与列生成一致的成本信息
-    print(f"=== 初始解成本分析（与列生成一致） ===")
+    print(f"=== 初始解成本分析 ===")
     print(f"总航班数: {len(flights)}")
     print(f"覆盖航班数: {len(covered_flights)}")
     print(f"未覆盖航班数: {uncovered_flights_count}")
@@ -214,14 +255,6 @@ def main():
     print(f"负成本Roster数量: {len(negative_costs)}")
     if negative_costs:
         print(f"负成本原因: 飞时奖励({-sum(roster_costs)/1000:.2f}小时*1000) > 各种惩罚")
-    
-    # 可选：显示详细的评分系统结果（仅供参考）
-    scoring_system = ScoringSystem(flights, crews, layover_stations)
-    score_details = scoring_system.calculate_total_score(initial_rosters)
-    print(f"\n=== 详细评分系统结果（仅供参考） ===")
-    print(f"值勤日日均飞时: {score_details['avg_daily_fly_time']:.2f} 小时")
-    print(f"飞时得分: {score_details['fly_time_score']:.2f}")
-    print(f"总得分: {score_details['total_score']:.2f}")
     
     # --- 6. 求解最终整数规划问题 ---
     print("\n列生成结束，正在求解最终的整数规划问题...")
@@ -264,7 +297,8 @@ def main():
             # 比较解的质量
             if final_cost <= initial_total_cost:
                 print(f"最终解优于初始解 (改善: {initial_total_cost - final_cost:.2f})")
-                output_file = "output/rosterResult.csv"
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                output_file = f"output/rosterResult_{timestamp}.csv"
                 write_results_to_csv(selected_rosters, output_file)
                 print(f"最终结果已写入文件: {output_file}")
                 final_solution_found = True
@@ -278,10 +312,16 @@ def main():
     # --- 7. 回退到初始解 ---
     if not final_solution_found:
         print("\n使用初始解作为最终输出...")
-        output_file = "output/rosterResult.csv"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"output/rosterResult_{timestamp}.csv"
         write_results_to_csv(initial_rosters, output_file)
         print(f"初始解已写入文件: {output_file}")
         print(f"初始解统计: 成本 {initial_cost:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
+    
+    # 关闭日志文件
+    log_debug(f"\n=== 程序结束 ===\n结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_file.close()
+    print(f"\n调试日志已保存到: {log_file_path}")
 
 
 if __name__ == '__main__':

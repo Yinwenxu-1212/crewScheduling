@@ -31,9 +31,19 @@ from data_models import Label
 class AttentionGuidedSubproblemSolver:
     """使用注意力模型指导的子问题求解器"""
     
-    def __init__(self, model_path: str = "models/best_model.pth"):
+    def __init__(self, model_path: str = "models/best_model.pth", debug=False):
         """初始化求解器并加载预训练的注意力模型"""
+        self.debug = debug
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 增加搜索参数
+        self.max_iterations = 100000  # 进一步增加最大迭代次数
+        self.beam_width = 10  # 保持beam search的宽度
+        
+        # 约束参数
+        self.MAX_DUTY_DAY_HOURS = 12.0
+        self.MAX_FLIGHT_TIME_IN_DUTY_HOURS = 8.0
+        self.MIN_REST_HOURS = 12.0
         
         # 初始化调试日志文件
         debug_dir = "debug"
@@ -58,9 +68,54 @@ class AttentionGuidedSubproblemSolver:
             hidden_dim=config.HIDDEN_DIM
         ).to(self.device)
         
-        if os.path.exists(model_path):
+        if model_path and os.path.exists(model_path):
             checkpoint = torch.load(model_path, map_location=self.device)
-            # 直接加载state_dict，因为文件中保存的就是state_dict
+            
+            # 适配动作特征权重维度
+            if 'actor_action_encoder.0.weight' in checkpoint:
+                old_weight = checkpoint['actor_action_encoder.0.weight']  # [256, old_dim]
+                if old_weight.shape[1] != config.ACTION_DIM:
+                    if old_weight.shape[1] > config.ACTION_DIM:
+                        # 截取前N维，保留最重要的特征
+                        checkpoint['actor_action_encoder.0.weight'] = old_weight[:, :config.ACTION_DIM]
+                        if self.debug_log:
+                            self.debug_log.write(f"动作特征维度适配: {old_weight.shape[1]} -> {config.ACTION_DIM}\n")
+                    else:
+                        # 如果旧维度小于新维度，用零填充
+                        new_weight = torch.zeros(old_weight.shape[0], config.ACTION_DIM)
+                        new_weight[:, :old_weight.shape[1]] = old_weight
+                        checkpoint['actor_action_encoder.0.weight'] = new_weight
+                        if self.debug_log:
+                            self.debug_log.write(f"动作特征维度扩展: {old_weight.shape[1]} -> {config.ACTION_DIM}\n")
+            
+            # 适配状态特征权重维度
+            if 'actor_state_encoder.0.weight' in checkpoint:
+                old_weight = checkpoint['actor_state_encoder.0.weight']  # [256, old_dim]
+                if old_weight.shape[1] != config.STATE_DIM:
+                    if old_weight.shape[1] > config.STATE_DIM:
+                        # 截取前N维
+                        checkpoint['actor_state_encoder.0.weight'] = old_weight[:, :config.STATE_DIM]
+                        if self.debug_log:
+                            self.debug_log.write(f"状态特征维度适配: {old_weight.shape[1]} -> {config.STATE_DIM}\n")
+                    else:
+                        # 用零填充
+                        new_weight = torch.zeros(old_weight.shape[0], config.STATE_DIM)
+                        new_weight[:, :old_weight.shape[1]] = old_weight
+                        checkpoint['actor_state_encoder.0.weight'] = new_weight
+                        if self.debug_log:
+                            self.debug_log.write(f"状态特征维度扩展: {old_weight.shape[1]} -> {config.STATE_DIM}\n")
+            
+            # 同样处理critic网络的状态编码器
+            if 'critic.0.weight' in checkpoint:
+                old_weight = checkpoint['critic.0.weight']  # [256, old_dim]
+                if old_weight.shape[1] != config.STATE_DIM:
+                    if old_weight.shape[1] > config.STATE_DIM:
+                        checkpoint['critic.0.weight'] = old_weight[:, :config.STATE_DIM]
+                    else:
+                        new_weight = torch.zeros(old_weight.shape[0], config.STATE_DIM)
+                        new_weight[:, :old_weight.shape[1]] = old_weight
+                        checkpoint['critic.0.weight'] = new_weight
+            
             self.model.load_state_dict(checkpoint)
             self.model.eval()
             if self.debug_log:
@@ -68,7 +123,6 @@ class AttentionGuidedSubproblemSolver:
         else:
             if self.debug_log:
                 self.debug_log.write(f"警告：未找到预训练模型 {model_path}，使用随机初始化的模型\n")
-            print(f"警告：未找到预训练模型 {model_path}，使用随机初始化的模型")
         
         # 注意力引导的参数
         self.max_candidates_per_expansion = 15  # 每次扩展最多考虑的候选任务数
@@ -84,6 +138,8 @@ class AttentionGuidedSubproblemSolver:
         if hasattr(self, 'debug_log') and self.debug_log:
             self.debug_log.write(f"{message}\n")
             self.debug_log.flush()  # 立即刷新到文件
+        if self.debug:
+            print(message)
     
     def _extract_state_features(self, label: Label, crew: Crew) -> np.ndarray:
         """从当前标签状态提取状态特征向量"""
@@ -149,18 +205,18 @@ class AttentionGuidedSubproblemSolver:
         elif task['type'] == 'ground_duty':
             features[6] = 1  # 占位任务特征
         
-        # 机场特征
-        features[6] = hash(task['depaAirport']) % 1000
-        features[7] = hash(task['arriAirport']) % 1000
+        # 机场特征 - 修正索引
+        features[7] = hash(task['depaAirport']) % 1000   # 原来是features[6]
+        features[8] = hash(task['arriAirport']) % 1000   # 原来是features[7]
         
-        # 时间特征
-        features[8] = task['startTime'].weekday()
-        features[9] = task['startTime'].hour
-        features[10] = task['endTime'].hour
+        # 时间特征 - 相应调整索引
+        features[9] = task['startTime'].weekday()        # 原来是features[8]
+        features[10] = task['startTime'].hour            # 原来是features[9]
+        features[11] = task['endTime'].hour              # 原来是features[10]
         
         # 任务持续时间
         duration = (task['endTime'] - task['startTime']).total_seconds() / 3600
-        features[11] = min(duration, 24)
+        features[12] = min(duration, 24)                 # 原来是features[11]
         
         return features
     
@@ -194,6 +250,11 @@ class AttentionGuidedSubproblemSolver:
             scored_candidates = [(float(action_probs[i]), i) for i in range(len(candidates))]
             scored_candidates.sort(reverse=True, key=lambda x: x[0])
             
+            if self.debug:
+                print("=== Attention 模型评分 ===")
+                for score, idx in scored_candidates[:5]:
+                    print(f"Score: {score:.4f}, TaskID: {candidates[idx]['taskId']}, Type: {candidates[idx]['type']}")
+
             return scored_candidates
             
         except Exception as e:
@@ -205,7 +266,7 @@ class AttentionGuidedSubproblemSolver:
                                       buses: List[BusInfo], ground_duties: List[GroundDuty],
                                       dual_prices: Dict[str, float], 
                                       planning_start_dt: datetime, planning_end_dt: datetime,
-                                      layover_airports: Set[str], crew_sigma_dual: float) -> List[Roster]:
+                                      layover_airports: Set[str], crew_sigma_dual: float, iteration_round: int = 0) -> List[Roster]:
         """使用注意力模型指导的子问题求解"""
         
         # 初始化
@@ -227,7 +288,8 @@ class AttentionGuidedSubproblemSolver:
             has_flown_in_duty=False, used_task_ids=set(),
             tie_breaker=next(tie_breaker),
             current_cycle_start=None, current_cycle_days=0,
-            last_base_return=planning_start_dt.date()
+            last_base_return=planning_start_dt.date(),
+            duty_days_count=0  # 初始值勤日数量为0
         )
         
         heapq.heappush(labels, (0.0, initial_label))
@@ -280,12 +342,19 @@ class AttentionGuidedSubproblemSolver:
         
         # 主循环
         iteration_count = 0
-        # 增加搜索参数
-        max_iterations = 80000  # 增加最大迭代次数
-        max_rosters_per_crew = 30  # 增加每个机组的方案数量
+        # 动态调整搜索参数，基于迭代轮次增加多样性
+        max_iterations = 100000  # 最大迭代次数
         
-        # 在attention模型初始化时增加候选数量
-        self.max_candidates_per_expansion = 15  # 增加候选数量
+        # 根据迭代轮次调整搜索参数
+        if iteration_round == 0:
+            max_valuable_rosters = min(len(all_tasks), 50)
+            self.max_candidates_per_expansion = 8  # 第一轮较少候选
+        else:
+            max_valuable_rosters = min(len(all_tasks), 60)  # 后续轮次允许更多方案
+            self.max_candidates_per_expansion = 12  # 后续轮次更多候选
+        
+        # 添加随机种子扰动，确保每轮生成不同结果
+        random.seed(42 + iteration_round * 17 + hash(crew.crewId) % 1000)
         
         # 添加已找到方案的记录
         found_roster_signatures = set()
@@ -294,13 +363,18 @@ class AttentionGuidedSubproblemSolver:
         total_candidates_found = 0
         total_labels_processed = 0
         
-        self._log_debug(f"\n=== 机组 {crew.crewId} 子问题求解开始 ===")
-        self._log_debug(f"初始状态: 队列={len(labels)}, 任务={len(all_tasks)}")
+        # 添加路径多样性跟踪
+        path_signatures = set()  # 记录已探索的路径特征
+        diversity_threshold = max(5, iteration_round * 2)  # 多样性阈值
         
-        # 修改while循环条件，添加早停机制
+        self._log_debug(f"\n=== 机组 {crew.crewId} 子问题求解开始 (第{iteration_round+1}轮) ===")
+        self._log_debug(f"初始状态: 队列={len(labels)}, 任务={len(all_tasks)}")
+        self._log_debug(f"多样性设置: 候选数={self.max_candidates_per_expansion}, 阈值={diversity_threshold}")
+        
+        # 基本循环条件
         while (labels and 
                iteration_count < max_iterations and 
-               len(found_rosters) < max_rosters_per_crew):
+               len(found_rosters) < max_valuable_rosters):
             iteration_count += 1
             total_labels_processed += 1
             
@@ -324,19 +398,36 @@ class AttentionGuidedSubproblemSolver:
                 continue
             visited.add(state_key)
             
+            # 路径多样性检查
+            if iteration_round > 0 and len(current_label.path) >= 2:
+                # 创建路径特征：前几个任务的组合
+                path_feature = tuple(sorted([
+                    task['taskId'] for task in current_label.path[:min(3, len(current_label.path))]
+                ]))
+                
+                if path_feature in path_signatures and len(path_signatures) > diversity_threshold:
+                    # 如果路径特征重复且已有足够多样性，跳过
+                    continue
+                path_signatures.add(path_feature)
+            
             # 检查是否到达规划结束时间或找到完整方案
-            # 改进终止条件：确保值勤日完整性和合理的任务数量
-            min_tasks_required = 6  # 提高最小任务数量要求
+            # 改进终止条件：允许更长的roster，提高覆盖率
+            min_tasks_required = 3  # 进一步降低最小任务数量要求
+            min_flight_tasks = 1   # 至少包含1个航班任务
+            
+            # 统计航班任务数量
+            flight_tasks_count = sum(1 for task in current_label.path if task['type'] == 'flight')
             
             # 检查是否可以终止：时间结束或返回基地且满足条件
             can_terminate = False
             if current_label.node.time >= planning_end_dt:
                 can_terminate = True
             elif (current_label.node.airport == crew.base and 
-                  len(current_label.path) >= min_tasks_required):
-                # 额外检查：确保当前不在值勤日中间
+                  len(current_label.path) >= min_tasks_required and
+                  flight_tasks_count >= min_flight_tasks):
+                # 放宽休息时间要求，允许更灵活的终止
                 if (current_label.duty_start_time is None or 
-                    current_label.node.time - current_label.duty_start_time >= timedelta(hours=MIN_REST_HOURS)):
+                    current_label.node.time - current_label.duty_start_time >= timedelta(hours=4)):
                     can_terminate = True
             
             if can_terminate:
@@ -379,23 +470,21 @@ class AttentionGuidedSubproblemSolver:
                             temp_roster, crew, dual_prices, crew_sigma_dual
                         )
                         
-                        # 添加详细的调试输出
-                         # print(f"\n=== 机组 {crew.crewId} Roster调试信息 ===")
-                         # print(f"任务路径: {[task['taskId'] for task in current_label.path]}")
-                         # print(f"标签成本 (label cost): {current_label.cost:.6f}")
-                         # print(f"完整成本计算结果:")
-                         # print(f"  - 总成本 (total_cost): {cost_details['total_cost']:.6f}")
-                         # print(f"  - Reduced Cost: {cost_details['reduced_cost']:.6f}")
-                         # print(f"  - 飞行奖励: {cost_details['flight_reward']:.6f}")
-                         # print(f"  - 对偶价格收益: {cost_details['dual_price_total']:.6f}")
-                         # print(f"  - 机组对偶系数: {cost_details['crew_sigma_dual']:.6f}")
-                         # print(f"  - 置位惩罚: {cost_details['positioning_penalty']:.6f}")
-                         # print(f"  - 外站过夜惩罚: {cost_details['overnight_penalty']:.6f}")
-                         # print(f"  - 其他成本: {cost_details['other_costs']:.6f}")
+                        # 简单质量检查
+                        reduced_cost = cost_details['reduced_cost']
                         
-                        # 使用计算出的成本创建最终roster
-                        roster = Roster(crew.crewId, roster_tasks, cost_details['total_cost'])
-                        found_rosters.append(roster)
+                        if reduced_cost < -1e-6:  # 基础有价值条件
+                            # 使用计算出的成本创建最终roster
+                            roster = Roster(crew.crewId, roster_tasks, cost_details['total_cost'])
+                            found_rosters.append(roster)
+                            
+                            # 记录有价值roster的详细信息
+                            self._log_debug(f"\n找到有价值Roster #{len(found_rosters)}:")
+                            self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
+                            self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
+                            self._log_debug(f"  航班数量: {cost_details['flight_count']}")
+                            self._log_debug(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                            self._log_debug(f"  值勤天数: {cost_details['duty_days']}")
             
             # 获取候选任务
             candidates = self._get_valid_candidates(
@@ -414,18 +503,53 @@ class AttentionGuidedSubproblemSolver:
             # 使用注意力模型对候选任务进行评分和排序
             scored_candidates = self._score_candidates_with_attention(candidates, current_label, crew)
             
-            # 确定性选择：直接取前N个最高分的候选
-            top_candidates = scored_candidates[:self.max_candidates_per_expansion]
+            # 引入多样性的候选选择策略
+            if iteration_round == 0:
+                # 第一轮：选择评分最高的候选（贪婪策略）
+                top_candidates = scored_candidates[:self.max_candidates_per_expansion]
+            else:
+                 # 后续轮次：使用概率采样增加多样性
+                
+                # 计算温度参数，随着轮次增加而增大（增加随机性）
+                temperature = 0.5 + 0.3 * min(iteration_round, 10) / 10
+                
+                # 将评分转换为概率分布
+                scores = np.array([score for score, _ in scored_candidates])
+                if len(scores) > 0 and np.std(scores) > 1e-8:
+                    # 使用softmax with temperature
+                    exp_scores = np.exp(scores / temperature)
+                    probs = exp_scores / np.sum(exp_scores)
+                    
+                    # 概率采样选择候选
+                    num_to_select = min(self.max_candidates_per_expansion, len(candidates))
+                    selected_indices = np.random.choice(
+                        len(scored_candidates), 
+                        size=num_to_select, 
+                        replace=False, 
+                        p=probs
+                    )
+                    top_candidates = [scored_candidates[i] for i in selected_indices]
+                else:
+                    # 如果评分差异很小，随机选择
+                    random.shuffle(scored_candidates)
+                    top_candidates = scored_candidates[:self.max_candidates_per_expansion]
             
             # 扩展标签
             for score, candidate_idx in top_candidates:
                 task = candidates[candidate_idx]
-                new_label = self._create_new_label(current_label, task, crew, tie_breaker)
+                new_labels = self._create_new_label(current_label, task, crew, tie_breaker)
                 
-                if new_label:
-                    heapq.heappush(labels, (new_label.cost, new_label))
+                if new_labels:
+                    # 处理返回的标签列表（可能包含继续值勤和结束值勤的标签）
+                    if isinstance(new_labels, list):
+                        for label in new_labels:
+                            heapq.heappush(labels, (label.cost, label))
+                    else:
+                        # 向后兼容，如果返回单个标签
+                        heapq.heappush(labels, (new_labels.cost, new_labels))
         
         self._log_debug(f"=== 机组 {crew.crewId} 求解完成 ===\n迭代: {iteration_count}, 方案: {len(found_rosters)}, 平均候选: {total_candidates_found/max(1, total_labels_processed):.1f}")
+        self._log_debug(f"多样性统计: 探索了{len(path_signatures)}种不同路径特征")
         
         return found_rosters
     
@@ -511,25 +635,25 @@ class AttentionGuidedSubproblemSolver:
             filter_stats['valid_candidates'] += 1
         
         # 输出过滤统计（仅在前几次调用时）
-        if len(candidates) == 0 and current_label.node.time.hour < 12:  # 只在早期时间输出
-            self._log_debug(f"      候选任务过滤统计 - 位置: {current_airport}, 时间: {current_time}")
-            self._log_debug(f"        总任务数: {filter_stats['total_tasks']}")
-            self._log_debug(f"        已使用: {filter_stats['already_used']}")
-            self._log_debug(f"        时间约束过滤: {filter_stats['time_constraint']}")
-            self._log_debug(f"        地点约束过滤: {filter_stats['location_constraint']}")
-            self._log_debug(f"        连接时间过滤: {filter_stats['connection_time']}")
-            self._log_debug(f"        值勤约束过滤: {filter_stats['duty_constraint']}")
-            self._log_debug(f"        过夜约束过滤: {filter_stats['overnight_constraint']}")
-            self._log_debug(f"        有效候选: {filter_stats['valid_candidates']}")
+        # if len(candidates) == 0 and current_label.node.time.hour < 12:  # 只在早期时间输出
+        #     self._log_debug(f"      候选任务过滤统计 - 位置: {current_airport}, 时间: {current_time}")
+        #     self._log_debug(f"        总任务数: {filter_stats['total_tasks']}")
+        #     self._log_debug(f"        已使用: {filter_stats['already_used']}")
+        #     self._log_debug(f"        时间约束过滤: {filter_stats['time_constraint']}")
+        #     self._log_debug(f"        地点约束过滤: {filter_stats['location_constraint']}")
+        #     self._log_debug(f"        连接时间过滤: {filter_stats['connection_time']}")
+        #     self._log_debug(f"        值勤约束过滤: {filter_stats['duty_constraint']}")
+        #     self._log_debug(f"        过夜约束过滤: {filter_stats['overnight_constraint']}")
+        #     self._log_debug(f"        有效候选: {filter_stats['valid_candidates']}")
         
         return candidates
     
     def _check_duty_constraints(self, current_label: Label, task: Dict, crew: Crew = None) -> bool:
         """检查值勤时间相关约束"""
-        # 检查总飞行时间约束（规则9：总飞行值勤时间限制）
+        # 检查总飞行时间约束（规则9：总飞行值勤时间限制，增加5小时容错）
         if task['type'] == 'flight':
             potential_total_flight_hours = current_label.total_flight_hours + task.get('flyTime', 0) / 60.0
-            if potential_total_flight_hours > MAX_TOTAL_FLIGHT_HOURS:
+            if potential_total_flight_hours > MAX_TOTAL_FLIGHT_HOURS + 5:
                 return False
         
         # 检查飞行周期约束（规则11：飞行周期限制）
@@ -551,56 +675,37 @@ class AttentionGuidedSubproblemSolver:
             if current_label.current_cycle_start is None and days_since_base < 2:  # MIN_CYCLE_REST_DAYS
                 return False
         
+        # 检查值四修二工作模式约束（新增）
+        if not self._check_work_rest_pattern_constraint(current_label, task, crew):
+            return False
+        
         if current_label.duty_start_time is None:
             return True  # 新值勤日，无约束
         
-        # 检查值勤时间是否超限
+        # 检查值勤时间是否超限（增加1小时容错）
         potential_duty_end = task['endTime']
         duty_duration = (potential_duty_end - current_label.duty_start_time).total_seconds() / 3600
-        if duty_duration > MAX_DUTY_DAY_HOURS:
+        if duty_duration > MAX_DUTY_DAY_HOURS + 1:
             return False
         
-        # 检查任务数量限制
-        if current_label.duty_task_count >= MAX_TASKS_IN_DUTY:
+        # 检查任务数量限制（增加2个任务容错）
+        if current_label.duty_task_count >= MAX_TASKS_IN_DUTY + 2:
             return False
         
-        # 检查航班数量限制
-        if task['type'] == 'flight' and current_label.duty_flight_count >= MAX_FLIGHTS_IN_DUTY:
+        # 检查航班数量限制（增加1个航班容错）
+        if task['type'] == 'flight' and current_label.duty_flight_count >= MAX_FLIGHTS_IN_DUTY + 1:
             return False
         
-        # 检查值勤内飞行时间限制
+        # 检查值勤内飞行时间限制（增加1小时容错）
         if task['type'] == 'flight':
             potential_duty_flight_time = current_label.duty_flight_time + task.get('flyTime', 0) / 60.0
-            if potential_duty_flight_time > MAX_FLIGHT_TIME_IN_DUTY_HOURS:
+            if potential_duty_flight_time > MAX_FLIGHT_TIME_IN_DUTY_HOURS + 1:
                 return False
         
         return True
     
-    def _calculate_roster_reward(self, roster_tasks):
-        """
-        计算roster的正确奖励，基于值勤日日均飞时
-        """
-        total_flight_hours = 0.0
-        duty_calendar_days = set()
-        
-        for task in roster_tasks:
-            if task['type'] == 'flight':
-                total_flight_hours += task.get('flyTime', 0) / 60.0
-                
-                # 计算值勤日历日
-                start_date = task['startTime'].date()
-                end_date = task['endTime'].date()
-                for day in range((end_date - start_date).days + 1):
-                    duty_calendar_days.add(start_date + timedelta(days=day))
-        
-        total_duty_days = len(duty_calendar_days)
-        if total_duty_days > 0:
-            avg_daily_fly_time = total_flight_hours / total_duty_days
-            return -(avg_daily_fly_time * 1000)  # 负值表示奖励
-        return 0.0
-
     def _create_new_label(self, current_label: Label, task: Dict, 
-                     crew: Crew, tie_breaker) -> Optional[Label]:
+                     crew: Crew, tie_breaker) -> Optional[List[Label]]:
         """基于当前标签和新任务创建新标签"""
         try:
             # 计算新的节点
@@ -623,27 +728,45 @@ class AttentionGuidedSubproblemSolver:
                 # print(f"  占位任务 {task['taskId']}: 无额外成本")
                 pass
             
-            # 检查是否需要开始新值勤日
+            # 检查是否需要结束当前值勤日或开始新值勤日
             new_duty_start_time = current_label.duty_start_time
+            new_duty_days_count = current_label.duty_days_count
+            is_new_duty = False
+            duty_ended = False
+            
             if current_label.duty_start_time is None:
+                # 第一个任务，开始第一个值勤日
                 new_duty_start_time = task['startTime']
+                new_duty_days_count = 1
+                is_new_duty = True
             else:
                 # 检查是否需要休息（结束当前值勤日）
                 rest_time = task['startTime'] - current_label.node.time
                 if rest_time >= timedelta(hours=MIN_REST_HOURS):
-                    new_duty_start_time = task['startTime']
+                    # 足够的休息时间，明确结束当前值勤日
+                    duty_ended = True
+                    new_duty_start_time = task['startTime']  # 开始新值勤日
+                    new_duty_days_count = current_label.duty_days_count + 1
+                    is_new_duty = True
                     # 检查外站过夜
                     if current_label.node.airport != crew.base:
                         overnight_days = (task['startTime'].date() - current_label.node.time.date()).days
                         if overnight_days > 0:
                             cost_delta += PENALTY_PER_AWAY_OVERNIGHT * overnight_days
+                elif (current_label.node.airport == crew.base and 
+                      rest_time >= timedelta(hours=2)):  # 在基地的短暂休息也可以结束值勤日
+                    # 在基地的休息，可以选择结束值勤日
+                    duty_ended = True
+                    new_duty_start_time = task['startTime']  # 开始新值勤日
+                    new_duty_days_count = current_label.duty_days_count + 1
+                    is_new_duty = True
             
             # 更新值勤相关计数器
             new_duty_flight_time = current_label.duty_flight_time
             new_duty_flight_count = current_label.duty_flight_count
             new_duty_task_count = current_label.duty_task_count
             
-            if new_duty_start_time == task['startTime']:  # 新值勤日
+            if is_new_duty:  # 新值勤日，重置计数器
                 new_duty_flight_time = 0.0
                 new_duty_flight_count = 0
                 new_duty_task_count = 0
@@ -665,6 +788,10 @@ class AttentionGuidedSubproblemSolver:
             new_calendar_days = current_label.total_calendar_days.copy()
             task_date = task['startTime'].date()
             new_calendar_days.add(task_date)
+            
+            # 双重检查：确保任务未被使用（防止重复）
+            if task['taskId'] in current_label.used_task_ids:
+                return None  # 任务已被使用，不创建新标签
             
             # 更新已使用任务ID
             new_used_task_ids = current_label.used_task_ids.copy()
@@ -692,10 +819,6 @@ class AttentionGuidedSubproblemSolver:
                     cycle_duration = (task_date - new_cycle_start).days + 1
                     new_cycle_days = cycle_duration
             
-            # 双重检查：确保任务未被使用（防止重复）
-            if task['taskId'] in current_label.used_task_ids:
-                return None  # 任务已被使用，不创建新标签
-            
             # 创建新标签
             new_label = Label(
                 cost=current_label.cost + cost_delta,
@@ -714,10 +837,41 @@ class AttentionGuidedSubproblemSolver:
                 tie_breaker=next(tie_breaker),
                 current_cycle_start=new_cycle_start,
                 current_cycle_days=new_cycle_days,
-                last_base_return=new_last_base_return
+                last_base_return=new_last_base_return,
+                duty_days_count=new_duty_days_count  # 传递值勤日数量
             )
             
-            return new_label
+            # 如果任务结束后在基地且满足条件，创建一个值勤日结束的标签
+            if (new_node.airport == crew.base and 
+                new_duty_start_time is not None and 
+                len(current_label.path) >= 2):  # 至少有一些任务
+                
+                # 创建值勤日结束标签（duty_start_time=None表示值勤日结束）
+                duty_end_label = Label(
+                    cost=new_label.cost,  # 相同成本
+                    path=new_label.path,
+                    current_node=new_node,
+                    duty_start_time=None,  # 明确标记值勤日结束
+                    duty_flight_time=0.0,  # 重置值勤计数器
+                    duty_flight_count=0,
+                    duty_task_count=0,
+                    total_flight_hours=new_total_flight_hours,
+                    total_positioning=new_total_positioning,
+                    total_away_overnights=new_label.total_away_overnights,
+                    total_calendar_days=new_calendar_days,
+                    has_flown_in_duty=False,  # 重置值勤内飞行标记
+                    used_task_ids=new_used_task_ids,
+                    tie_breaker=next(tie_breaker),
+                    current_cycle_start=new_cycle_start,
+                    current_cycle_days=new_cycle_days,
+                    last_base_return=new_node.time.date(),  # 更新最后回基地时间
+                    duty_days_count=new_duty_days_count
+                )
+                
+                # 返回两个标签：继续值勤的和结束值勤的
+                return [new_label, duty_end_label]
+            
+            return [new_label]
             
         except Exception as e:
             print(f"Error creating new label: {e}")
@@ -727,7 +881,7 @@ def solve_subproblem_for_crew_with_attention(
     crew: Crew, all_flights: List[Flight], all_bus_info: List[BusInfo],
     crew_ground_duties: List[GroundDuty], dual_prices: Dict[str, float],
     layover_stations: Dict[str, dict], crew_leg_match_dict: Dict[str, List[str]],
-    crew_sigma_dual: float
+    crew_sigma_dual: float, iteration_round: int = 0
 ) -> List[Roster]:
     """使用注意力模型指导的子问题求解包装函数"""
     # layover_stations 已经是机场代码的集合，直接使用
@@ -744,8 +898,35 @@ def solve_subproblem_for_crew_with_attention(
     solver = AttentionGuidedSubproblemSolver(model_path)
     return solver.solve_subproblem_with_attention(
         crew, all_flights, all_bus_info, crew_ground_duties, dual_prices, 
-        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual
+        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual, iteration_round
     )
+
+# 在AttentionGuidedSubproblemSolver类中添加值四修二约束检查方法
+class AttentionGuidedSubproblemSolverExtension:
+    def _check_work_rest_pattern_constraint(self, current_label: Label, task: dict, crew: Crew) -> bool:
+        """
+        检查值四修二工作模式约束
+        规则：连续工作不超过4天，工作4天后必须休息2天
+        """
+        if not hasattr(current_label, 'duty_days_count'):
+            return True  # 如果没有值勤日计数，跳过检查
+        
+        task_date = task['startTime'].date()
+        
+        # 简化检查：如果当前已经连续工作了4天，且新任务不是休息，则违规
+        if (current_label.duty_days_count >= 4 and 
+            task['type'] in ['flight'] and  # 实际工作任务
+            current_label.node.time.date() != task_date):  # 不是同一天的任务
+            
+            # 检查是否有足够的休息时间（简化为检查时间间隔）
+            time_gap = task['startTime'] - current_label.node.time
+            if time_gap.total_seconds() < 48 * 3600:  # 少于48小时休息
+                return False
+        
+        return True
+
+# 将方法添加到AttentionGuidedSubproblemSolver类
+AttentionGuidedSubproblemSolver._check_work_rest_pattern_constraint = AttentionGuidedSubproblemSolverExtension._check_work_rest_pattern_constraint
 
 
 

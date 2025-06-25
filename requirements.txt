@@ -1,0 +1,24 @@
+# Core optimization libraries
+gurobipy>=9.0.0
+
+# Machine learning and deep learning
+torch>=1.8.0
+torchvision>=0.9.0
+numpy>=1.19.0
+
+# Data processing
+pandas>=1.2.0
+
+# Standard libraries (usually included with Python)
+# datetime - built-in
+# typing - built-in
+# csv - built-in
+# os - built-in
+# time - built-in
+# math - built-in
+
+# Optional: For enhanced functionality
+# matplotlib>=3.3.0  # For plotting and visualization
+# seaborn>=0.11.0    # For statistical visualization
+# jupyter>=1.0.0     # For notebook development
+# scikit-learn>=0.24.0  # For additional ML utilities
