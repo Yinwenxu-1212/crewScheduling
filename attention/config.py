@@ -20,8 +20,6 @@ LEARNING_RATE = 3e-5
 PPO_EPSILON = 0.2
 PPO_EPOCHS = 5
 ENTROPY_COEF = 0.01  # 熵系数，用于鼓励探索
-STATE_DIM = 24              # 状态向量维度 (需要仔细设计)
-# ACTION_DIM 在下面的模型架构参数中定义
 
 # --- 新增：Epsilon-Greedy 探索参数 ---
 EPSILON_START = 0.3  # 初始探索率 (30%的概率随机选择)
@@ -29,8 +27,8 @@ EPSILON_END = 0.01   # 最终探索率 (1%的概率随机选择)
 EPSILON_DECAY_EPISODES = 5000 # 经过多少个episodes衰减到最终值
 
 # --- 模型架构参数 ---
-STATE_DIM = 32
-ACTION_DIM = 13             # 动作特征维度，修正索引后需要13维 (索引0-12)
+STATE_DIM = 14              # 状态特征维度，与_extract_state_features保持一致 (索引0-13)
+ACTION_DIM = 13             # 动作特征维度，与_extract_task_features保持一致 (索引0-12)
 HIDDEN_DIM = 256
 
 # --- 训练参数 ---
@@ -43,5 +41,5 @@ DATA_PATH = "data/"
 MODEL_SAVE_PATH = "models/"
 
 # --- 时间设定 ---
-PLANNING_START_DATE = "2025-05-29 00:00:00"
-PLANNING_END_DATE = "2025-06-05 00:00:00"
+PLANNING_START_DATE = "2025-04-29 00:00:00"
+PLANNING_END_DATE = "2025-05-07 23:59:59"

@@ -4,6 +4,7 @@ import time
 import csv
 import os
 from datetime import datetime
+from coverage_validator import CoverageValidator, print_coverage_summary
 from data_loader import load_all_data
 from master_problem import MasterProblem
 from results_writer import write_results_to_csv
@@ -28,7 +29,7 @@ def main():
     start_time = time.time()
     TIME_LIMIT_SECONDS = 1 * 3600 + 55 * 60 
     data_path = 'data/'
-    MAX_ITERATIONS = 5
+    MAX_ITERATIONS = 5  # 增加列生成迭代次数以提高解的质量
     
     # 设置日志文件
     debug_dir = "debug"
@@ -103,7 +104,7 @@ def main():
         log_debug(f"\n=== 列生成第 {i+1} 轮开始 ===\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # 求解主问题LP松弛（不输出详细调试信息）
-        pi_duals, sigma_duals, current_obj = master_problem.solve_lp(verbose=False)
+        pi_duals, sigma_duals, current_obj = master_problem.solve_lp(verbose=False, use_multiple_starts=True, num_starts=3)
         
         if pi_duals is None:
             print("主问题求解失败，退出列生成。")
@@ -111,12 +112,12 @@ def main():
         
         # 跟踪目标函数变化
         if i > 0:
-            obj_change = current_obj - previous_obj
+            obj_change = current_obj - previous_obj_val
             if obj_change > 1e-6:
                 print(f"警告：目标函数增加了 {obj_change:.6f}，违反了列生成的单调性！")
             else:
                 print(f"目标函数变化：{obj_change:.6f}")
-        previous_obj = current_obj
+        # 注意：previous_obj_val 将在后面的详细求解后更新
         
         print("为所有机组人员求解子问题...")
         new_rosters_found_count = 0
@@ -128,48 +129,52 @@ def main():
             crew_specific_gds = [gd for gd in ground_duties if gd.crewId == crew.crewId]
             crew_sigma_dual = sigma_duals.get(crew.crewId, 0.0)
             
+            # 获取当前的lambda值
+            current_lambda = master_problem.get_current_lambda()
             new_rosters = solve_subproblem_for_crew_with_attention(
                 crew, flights, bus_info, crew_specific_gds, 
                 pi_duals, layover_stations, crew_leg_match_dict,
-                crew_sigma_dual, iteration_round=i
+                crew_sigma_dual, iteration_round=i, external_log_func=log_debug, lambda_k=current_lambda
             )
             
             if new_rosters:
                 valuable_count = 0
                 # print(f"\n=== 机组 {crew.crewId} 的Roster详细分析 ===")
                 for idx, r in enumerate(new_rosters):
+                    # 获取当前的lambda值
+                    current_lambda = master_problem.get_current_lambda()
+                    # 调试：检查对偶价格数值
+                    if idx == 0:  # 只对第一个roster进行调试
+                        flight_dual_sum = sum(pi_duals.get(duty.id, 0.0) for duty in r.duties if isinstance(duty, Flight))
+                        log_debug(f"调试 - 机组 {crew.crewId} Roster {idx+1}: 航班对偶价格总和={flight_dual_sum:.6f}")
+                        
+                        # 输出前3个航班的对偶价格
+                        flight_duties = [duty for duty in r.duties if isinstance(duty, Flight)]
+                        for i, flight in enumerate(flight_duties[:3]):
+                            dual_val = pi_duals.get(flight.id, 0.0)
+                            log_debug(f"  航班 {flight.id}: 对偶价格={dual_val:.6f}")
+                    
                     # 获取详细的成本分解
                     cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                        r, crew, pi_duals, crew_sigma_dual
+                        r, crew, pi_duals, crew_sigma_dual, current_lambda
                     )
                     
                     reduced_cost = cost_details['reduced_cost']
                     status = "[有价值]" if reduced_cost < -1e-6 else "[无价值]"
                     
-                    # 只输出有价值的roster详细信息到日志文件
                     if reduced_cost < -1e-6:
-                        log_debug(f"\n机组 {crew.crewId} - Roster {idx+1} {status}:")
-                        log_debug(f"  总成本 (total_cost): {cost_details['total_cost']:.6f}")
-                        log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
-                        log_debug(f"  成本分解:")
-                        log_debug(f"    - 飞行奖励 (flight_reward): {cost_details['flight_reward']:.6f}")
-                        log_debug(f"    - 对偶价格收益 (dual_price_total): {cost_details['dual_price_total']:.6f}")
-                        log_debug(f"    - 置位惩罚 (positioning_penalty): {cost_details['positioning_penalty']:.6f}")
-                        log_debug(f"    - 外站过夜惩罚 (overnight_penalty): {cost_details['overnight_penalty']:.6f}")
-                        log_debug(f"    - 其他成本 (other_costs): {cost_details['other_costs']:.6f}")
-                        log_debug(f"    - 机组对偶系数 (crew_sigma_dual): {cost_details['crew_sigma_dual']:.6f}")
-                        log_debug(f"  统计信息:")
-                        log_debug(f"    - 航班数量: {cost_details['flight_count']}")
-                        log_debug(f"    - 总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
-                        log_debug(f"    - 值勤天数: {cost_details['duty_days']}")
-                        log_debug(f"    - 日均飞行时间: {cost_details['avg_daily_flight_hours']:.2f}小时")
-                        log_debug(f"    - 置位次数: {cost_details['positioning_count']}")
-                        log_debug(f"    - 外站过夜次数: {cost_details['overnight_count']}")
-                    
-                    if reduced_cost < -1e-6:
+                        valuable_count += 1
+                        # 简化日志输出，只记录关键信息
+                        # 只记录前3个有价值的roster的详细信息，其余只记录摘要
+                        if valuable_count <= 3:
+                            log_debug(f"\n机组 {crew.crewId} - Roster {idx+1} {status}:")
+                            log_debug(f"  Reduced Cost: {reduced_cost:.6f}, 航班数: {cost_details['flight_count']}, 飞行时间: {cost_details['total_flight_hours']:.2f}h")
+                        elif valuable_count <= 10:
+                            log_debug(f"机组 {crew.crewId} - Roster {idx+1}: RC={reduced_cost:.3f}, 航班={cost_details['flight_count']}, 时间={cost_details['total_flight_hours']:.1f}h")
+                        # 超过10个有价值roster后不再记录详细信息
+                        
                         master_problem.add_roster_column(r)
                         new_rosters_found_count += 1
-                        valuable_count += 1
                         
                 # print(f"\n  机组 {crew.crewId}: 共有 {valuable_count} 个有价值的roster被添加到主问题")
             else:
@@ -181,7 +186,7 @@ def main():
         print(f"本轮新增有价值roster数量: {new_rosters_found_count}")
         
         # 求解当前主问题获取最优解（输出详细调试信息）
-        pi_duals, sigma_duals, current_obj_val = master_problem.solve_lp(verbose=True)
+        pi_duals, sigma_duals, current_obj_val = master_problem.solve_lp(verbose=True, use_multiple_starts=True, num_starts=3)
         if current_obj_val is not None:  # 求解成功
             print(f"当前主问题最优目标函数值: {current_obj_val:.6f}")
             
@@ -244,6 +249,21 @@ def main():
     print(f"未覆盖航班惩罚: {uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY:.2f}")
     print(f"初始解总成本: {initial_total_cost:.2f}")
     
+    # 验证初始解航班覆盖率
+    print(f"\n=== 初始解航班覆盖率验证 ===")
+    validator = CoverageValidator(min_coverage_rate=0.8)
+    initial_coverage_result = validator.validate_coverage(flights, initial_rosters)
+    print(validator.get_coverage_report(initial_coverage_result))
+    
+    if not initial_coverage_result['is_valid']:
+        print("\n⚠️  警告：初始解不满足80%航班覆盖率要求！")
+        print("程序将继续运行，但最终结果可能不符合竞赛要求。")
+        suggestions = validator.suggest_improvements(initial_coverage_result)
+        for suggestion in suggestions:
+            print(suggestion)
+    else:
+        print("\n✅ 初始解满足航班覆盖率要求")
+    
     # 调试：分析roster成本的分布
     print(f"\n=== Roster成本调试信息 ===")
     roster_costs = [roster.cost for roster in initial_rosters]
@@ -294,16 +314,32 @@ def main():
             final_cost = final_model.ObjVal
             print(f"\n最终解成本: {final_cost:.2f}, 包含 {len(selected_rosters)} 个排班方案。")
             
+            # 验证航班覆盖率
+            print("\n=== 最终解航班覆盖率验证 ===")
+            validator = CoverageValidator(min_coverage_rate=0.8)
+            coverage_result = validator.validate_coverage(flights, selected_rosters)
+            print(validator.get_coverage_report(coverage_result))
+            
+            if not coverage_result['is_valid']:
+                print("\n⚠️  警告：最终解不满足80%航班覆盖率要求！")
+                print("根据竞赛规则，此解决方案可能被判定为无效。")
+                suggestions = validator.suggest_improvements(coverage_result)
+                for suggestion in suggestions:
+                    print(suggestion)
+            
             # 比较解的质量
-            if final_cost <= initial_total_cost:
-                print(f"最终解优于初始解 (改善: {initial_total_cost - final_cost:.2f})")
+            if final_cost <= initial_total_cost and coverage_result['is_valid']:
+                print(f"\n✅ 最终解优于初始解且满足覆盖率要求 (改善: {initial_total_cost - final_cost:.2f})")
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 output_file = f"output/rosterResult_{timestamp}.csv"
                 write_results_to_csv(selected_rosters, output_file)
                 print(f"最终结果已写入文件: {output_file}")
                 final_solution_found = True
+            elif coverage_result['is_valid']:
+                print(f"\n⚠️  最终解满足覆盖率但劣于初始解 (恶化: {final_cost - initial_total_cost:.2f})")
+                print("将检查初始解的覆盖率后决定使用哪个解")
             else:
-                print(f"最终解劣于初始解 (恶化: {final_cost - initial_total_cost:.2f})，将使用初始解")
+                print(f"\n❌ 最终解不满足覆盖率要求，将使用初始解")
         else:
             print("\n最终解未选择任何排班方案")
     else:
@@ -312,11 +348,20 @@ def main():
     # --- 7. 回退到初始解 ---
     if not final_solution_found:
         print("\n使用初始解作为最终输出...")
+        
+        # 初始解的覆盖率验证已在前面完成，这里直接使用结果
+        if not initial_coverage_result['is_valid']:
+            print("\n❌ 警告：初始解不满足80%航班覆盖率要求！")
+            print("根据竞赛规则，此解决方案可能被判定为无效。")
+        else:
+            print("\n✅ 使用满足覆盖率要求的初始解作为最终输出")
+        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = f"output/rosterResult_{timestamp}.csv"
         write_results_to_csv(initial_rosters, output_file)
         print(f"初始解已写入文件: {output_file}")
         print(f"初始解统计: 成本 {initial_cost:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
+        print(f"覆盖率: {initial_coverage_result['coverage_rate']:.1%}")
     
     # 关闭日志文件
     log_debug(f"\n=== 程序结束 ===\n结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

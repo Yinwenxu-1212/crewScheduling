@@ -37,8 +37,8 @@ class AttentionGuidedSubproblemSolver:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # 增加搜索参数
-        self.max_iterations = 100000  # 进一步增加最大迭代次数
-        self.beam_width = 10  # 保持beam search的宽度
+        self.max_iterations = 10000  # 恢复更大的迭代次数以提高搜索质量
+        self.beam_width = 20  # 恢复更大的beam search宽度以提高搜索质量
         
         # 约束参数
         self.MAX_DUTY_DAY_HOURS = 12.0
@@ -266,7 +266,7 @@ class AttentionGuidedSubproblemSolver:
                                       buses: List[BusInfo], ground_duties: List[GroundDuty],
                                       dual_prices: Dict[str, float], 
                                       planning_start_dt: datetime, planning_end_dt: datetime,
-                                      layover_airports: Set[str], crew_sigma_dual: float, iteration_round: int = 0) -> List[Roster]:
+                                      layover_airports: Set[str], crew_sigma_dual: float, iteration_round: int = 0, external_log_func=None, lambda_k: float = 0.0) -> List[Roster]:
         """使用注意力模型指导的子问题求解"""
         
         # 初始化
@@ -343,15 +343,17 @@ class AttentionGuidedSubproblemSolver:
         # 主循环
         iteration_count = 0
         # 动态调整搜索参数，基于迭代轮次增加多样性
-        max_iterations = 100000  # 最大迭代次数
+        # max_iterations 在上面根据迭代轮次设置
         
         # 根据迭代轮次调整搜索参数
-        if iteration_round == 0:
+        if iteration_round == 0:  # 第一轮
             max_valuable_rosters = min(len(all_tasks), 50)
-            self.max_candidates_per_expansion = 8  # 第一轮较少候选
+            self.max_candidates_per_expansion = 8
+            max_iterations = self.max_iterations
         else:
-            max_valuable_rosters = min(len(all_tasks), 60)  # 后续轮次允许更多方案
-            self.max_candidates_per_expansion = 12  # 后续轮次更多候选
+            max_valuable_rosters = min(len(all_tasks), 60)
+            self.max_candidates_per_expansion = 12
+            max_iterations = self.max_iterations
         
         # 添加随机种子扰动，确保每轮生成不同结果
         random.seed(42 + iteration_round * 17 + hash(crew.crewId) % 1000)
@@ -467,24 +469,41 @@ class AttentionGuidedSubproblemSolver:
                         # 使用scoring_system计算完整成本
                         scoring_system = ScoringSystem(flights, [crew], layover_airports)
                         cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                            temp_roster, crew, dual_prices, crew_sigma_dual
+                            temp_roster, crew, dual_prices, crew_sigma_dual, lambda_k
                         )
                         
                         # 简单质量检查
                         reduced_cost = cost_details['reduced_cost']
                         
+                        # 记录所有考虑的roster的详细信息（不管是否有价值）
+                        roster_status = "有价值" if reduced_cost < -1e-6 else "无价值"
+                        self._log_debug(f"\n考虑的Roster ({roster_status}):")
+                        self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
+                        self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
+                        self._log_debug(f"  航班数量: {cost_details['flight_count']}")
+                        self._log_debug(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                        self._log_debug(f"  值勤天数: {cost_details['duty_days']}")
+                        self._log_debug(f"  总成本: {cost_details['total_cost']:.6f}")
+                        self._log_debug(f"  对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                        
+                        # 调用外部日志函数记录roster信息
+                        if external_log_func:
+                            value_status = "有价值" if reduced_cost < -1e-6 else "无价值"
+                            external_log_func(f"机组 {crew.crewId} - 考虑的Roster ({value_status}):")
+                            external_log_func(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
+                            external_log_func(f"  Reduced Cost: {reduced_cost:.6f}")
+                            external_log_func(f"  航班数量: {cost_details['flight_count']}")
+                            external_log_func(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                            external_log_func(f"  值勤天数: {cost_details['duty_days']}")
+                            external_log_func(f"  总成本: {cost_details['total_cost']:.6f}")
+                            external_log_func(f"  对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                            external_log_func("")  # 空行分隔
+                        
                         if reduced_cost < -1e-6:  # 基础有价值条件
                             # 使用计算出的成本创建最终roster
                             roster = Roster(crew.crewId, roster_tasks, cost_details['total_cost'])
                             found_rosters.append(roster)
-                            
-                            # 记录有价值roster的详细信息
-                            self._log_debug(f"\n找到有价值Roster #{len(found_rosters)}:")
-                            self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
-                            self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
-                            self._log_debug(f"  航班数量: {cost_details['flight_count']}")
-                            self._log_debug(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
-                            self._log_debug(f"  值勤天数: {cost_details['duty_days']}")
+                            self._log_debug(f"  >>> 添加到有价值roster列表 #{len(found_rosters)}")
             
             # 获取候选任务
             candidates = self._get_valid_candidates(
@@ -635,16 +654,19 @@ class AttentionGuidedSubproblemSolver:
             filter_stats['valid_candidates'] += 1
         
         # 输出过滤统计（仅在前几次调用时）
-        # if len(candidates) == 0 and current_label.node.time.hour < 12:  # 只在早期时间输出
-        #     self._log_debug(f"      候选任务过滤统计 - 位置: {current_airport}, 时间: {current_time}")
-        #     self._log_debug(f"        总任务数: {filter_stats['total_tasks']}")
-        #     self._log_debug(f"        已使用: {filter_stats['already_used']}")
-        #     self._log_debug(f"        时间约束过滤: {filter_stats['time_constraint']}")
-        #     self._log_debug(f"        地点约束过滤: {filter_stats['location_constraint']}")
-        #     self._log_debug(f"        连接时间过滤: {filter_stats['connection_time']}")
-        #     self._log_debug(f"        值勤约束过滤: {filter_stats['duty_constraint']}")
-        #     self._log_debug(f"        过夜约束过滤: {filter_stats['overnight_constraint']}")
-        #     self._log_debug(f"        有效候选: {filter_stats['valid_candidates']}")
+        # 输出候选任务过滤统计（特别是当没有找到候选时）
+        if len(candidates) == 0:
+            self._log_debug(f"      候选任务过滤统计 - 位置: {current_airport}, 时间: {current_time.strftime('%m-%d %H:%M')}")
+            self._log_debug(f"        总任务数: {filter_stats['total_tasks']}")
+            self._log_debug(f"        已使用: {filter_stats['already_used']}")
+            self._log_debug(f"        时间约束过滤: {filter_stats['time_constraint']}")
+            self._log_debug(f"        地点约束过滤: {filter_stats['location_constraint']}")
+            self._log_debug(f"        连接时间过滤: {filter_stats['connection_time']}")
+            self._log_debug(f"        值勤约束过滤: {filter_stats['duty_constraint']}")
+            self._log_debug(f"        过夜约束过滤: {filter_stats['overnight_constraint']}")
+            self._log_debug(f"        有效候选: {filter_stats['valid_candidates']}")
+        elif len(candidates) > 0:
+            self._log_debug(f"      找到 {len(candidates)} 个有效候选任务 - 位置: {current_airport}, 时间: {current_time.strftime('%m-%d %H:%M')}")
         
         return candidates
     
@@ -881,7 +903,7 @@ def solve_subproblem_for_crew_with_attention(
     crew: Crew, all_flights: List[Flight], all_bus_info: List[BusInfo],
     crew_ground_duties: List[GroundDuty], dual_prices: Dict[str, float],
     layover_stations: Dict[str, dict], crew_leg_match_dict: Dict[str, List[str]],
-    crew_sigma_dual: float, iteration_round: int = 0
+    crew_sigma_dual: float, iteration_round: int = 0, external_log_func=None, lambda_k: float = 0.0
 ) -> List[Roster]:
     """使用注意力模型指导的子问题求解包装函数"""
     # layover_stations 已经是机场代码的集合，直接使用
@@ -889,8 +911,8 @@ def solve_subproblem_for_crew_with_attention(
     
     # 添加缺失的planning日期定义
     from datetime import datetime
-    planning_start_dt = datetime.strptime("2025-05-29 00:00:00", "%Y-%m-%d %H:%M:%S")
-    planning_end_dt = datetime.strptime("2025-06-05 00:00:00", "%Y-%m-%d %H:%M:%S")
+    planning_start_dt = datetime.strptime("2025-04-29 00:00:00", "%Y-%m-%d %H:%M:%S")
+    planning_end_dt = datetime.strptime("2025-05-07 23:59:59", "%Y-%m-%d %H:%M:%S")
     
     # 定义模型路径
     model_path = "models/best_model.pth"
@@ -898,7 +920,7 @@ def solve_subproblem_for_crew_with_attention(
     solver = AttentionGuidedSubproblemSolver(model_path)
     return solver.solve_subproblem_with_attention(
         crew, all_flights, all_bus_info, crew_ground_duties, dual_prices, 
-        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual, iteration_round
+        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual, iteration_round, external_log_func, lambda_k
     )
 
 # 在AttentionGuidedSubproblemSolver类中添加值四修二约束检查方法

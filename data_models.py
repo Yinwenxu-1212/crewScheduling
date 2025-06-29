@@ -7,13 +7,24 @@ import pandas as pd
 
 class Flight:
     """Represents a flight segment. Columns from flight.csv."""
-    def __init__(self, id, flightNo, depaAirport, arriAirport, std, sta, fleet, aircraftNo, flyTime):
+    def __init__(self, id, depaAirport, arriAirport, std, sta, fleet, aircraftNo, flyTime, flightNo=None):
         self.id = str(id).strip() if pd.notna(id) else None
-        self.flightNo = flightNo
+        # 新数据中id就是原来的flightNo
+        self.flightNo = flightNo if flightNo is not None else self.id
         self.depaAirport = depaAirport
         self.arriAirport = arriAirport
-        self.std = datetime.strptime(std, '%Y/%m/%d %H:%M')
-        self.sta = datetime.strptime(sta, '%Y/%m/%d %H:%M')
+        
+        # 支持两种日期格式：新格式 '2025-05-06 08:00:00' 和旧格式 '2025/5/1 10:20'
+        try:
+            self.std = datetime.strptime(std, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.std = datetime.strptime(std, '%Y/%m/%d %H:%M')
+        
+        try:
+            self.sta = datetime.strptime(sta, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.sta = datetime.strptime(sta, '%Y/%m/%d %H:%M')
+            
         self.fleet = fleet
         self.aircraftNo = aircraftNo
         self.flyTime = int(flyTime)
@@ -39,8 +50,18 @@ class GroundDuty:
         self.id = str(id).strip() if pd.notna(id) else None
         self.crewId = str(crewId).strip() if pd.notna(crewId) else None
         self.isDuty = isDuty
-        self.startTime = datetime.strptime(startTime, '%Y/%m/%d %H:%M')
-        self.endTime = datetime.strptime(endTime, '%Y/%m/%d %H:%M')
+        
+        # 支持两种日期格式
+        try:
+            self.startTime = datetime.strptime(startTime, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.startTime = datetime.strptime(startTime, '%Y/%m/%d %H:%M')
+            
+        try:
+            self.endTime = datetime.strptime(endTime, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.endTime = datetime.strptime(endTime, '%Y/%m/%d %H:%M')
+            
         self.airport = airport
 
     def __repr__(self):
@@ -51,13 +72,25 @@ class GroundDuty:
 class BusInfo:
     """Represents ground transportation. Columns from bus.csv."""
     def __init__(self, id, depaAirport, arriAirport, td, ta):
-        self.id = id  # 移除多余的逗号
+        self.id = id
         self.depaAirport = depaAirport
         self.arriAirport = arriAirport
-        self.td = datetime.strptime(td, '%Y/%m/%d %H:%M')  # 添加缺失的属性
-        self.ta = datetime.strptime(ta, '%Y/%m/%d %H:%M')   # 添加缺失的属性
-        self.startTime = datetime.strptime(td, '%Y/%m/%d %H:%M')
-        self.endTime = datetime.strptime(ta, '%Y/%m/%d %H:%M')
+        
+        # 支持两种日期格式
+        try:
+            self.td = datetime.strptime(td, '%Y-%m-%d %H:%M:%S')
+            self.startTime = datetime.strptime(td, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.td = datetime.strptime(td, '%Y/%m/%d %H:%M')
+            self.startTime = datetime.strptime(td, '%Y/%m/%d %H:%M')
+            
+        try:
+            self.ta = datetime.strptime(ta, '%Y-%m-%d %H:%M:%S')
+            self.endTime = datetime.strptime(ta, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            self.ta = datetime.strptime(ta, '%Y/%m/%d %H:%M')
+            self.endTime = datetime.strptime(ta, '%Y/%m/%d %H:%M')
+            
         self.cost = 0
 
     def __repr__(self):

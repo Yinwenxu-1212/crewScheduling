@@ -27,7 +27,7 @@ class ScoringSystem:
         
         # 评分参数
         self.FLY_TIME_MULTIPLIER = 1000
-        self.UNCOVERED_FLIGHT_PENALTY = -5
+        self.UNCOVERED_FLIGHT_PENALTY = -5   # 未覆盖航班惩罚
         self.NEW_LAYOVER_STATION_PENALTY = -10
         self.AWAY_OVERNIGHT_PENALTY = -0.5
         self.POSITIONING_PENALTY = -0.5
@@ -330,7 +330,7 @@ class ScoringSystem:
     
     def calculate_roster_cost_with_dual_prices(self, roster: Roster, crew: Crew, 
                                              dual_prices: Dict[str, float], 
-                                             crew_sigma_dual: float) -> Dict[str, float]:
+                                             crew_sigma_dual: float, lambda_k: float = 0.0) -> Dict[str, float]:
         """
         计算单个排班方案的完整成本，包括对偶价格
         返回详细的成本分解，用于reduced cost计算
@@ -353,7 +353,7 @@ class ScoringSystem:
                 'overnight_count': 0
             }
         
-        # 1. 计算飞行奖励（基于日均飞时，严格按照赛题公式）
+        # 1. 计算飞行奖励（基于日均飞时，按照新的Dinkelbach算法要求）
         total_flight_hours = 0.0
         duty_calendar_days = set()
         flight_count = 0
@@ -374,9 +374,14 @@ class ScoringSystem:
                     duty_calendar_days.add(current_date)
                     current_date += timedelta(days=1)
         
-        total_duty_days = len(duty_calendar_days)
+        # 根据新要求：分母直接为该roster的值勤天数，不再考虑不重复日历天数
+        total_duty_days = len(duty_calendar_days)  # 这个roster的值勤天数
         avg_daily_flight_hours = total_flight_hours / total_duty_days if total_duty_days > 0 else 0.0
-        flight_reward = -(avg_daily_flight_hours * 1000 )  # 负值表示奖励，与赛题公式一致
+        
+        # 新的Dinkelbach算法中的目标函数系数：1000 * C_p - lambda_k * d_p
+        # 其中C_p是总飞行时间，d_p是值勤天数
+        # lambda_k不需要乘以1000系数
+        flight_reward = -(1000 * total_flight_hours - lambda_k * total_duty_days)  # 负值表示奖励
         
         # 2. 计算对偶价格收益
         dual_price_total = 0.0

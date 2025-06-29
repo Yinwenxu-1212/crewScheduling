@@ -30,7 +30,19 @@ class CrewRosteringEnv:
 
     def _get_initial_crew_state(self, crew):
         last_task = max(self.dh.crew_ground_duties.get(crew['crewId'], []), key=lambda x: x['endTime'], default=None)
-        return {'last_task_end_time': last_task['endTime'] if last_task else self.planning_start_dt, 'last_location': last_task['airport'] if last_task else crew['stayStation']}
+        return {
+            'last_task_end_time': last_task['endTime'] if last_task else self.planning_start_dt,
+            'last_location': last_task['airport'] if last_task else crew['stayStation'],
+            'duty_start_time': None,  # 当前值勤开始时间
+            'duty_flight_time': 0,    # 值勤内飞行时间
+            'duty_flight_count': 0,   # 值勤内航班数
+            'duty_task_count': 0,     # 值勤内任务数
+            'total_flight_hours': 0,  # 总飞行时间
+            'total_positioning': 0,   # 总调机次数
+            'total_away_overnights': 0,  # 总外站过夜
+            'total_calendar_days': set(),  # 总日历天数
+            'cost': 0                 # 累计成本
+        }
 
     def _build_priority_queue(self):
         priorities = []
@@ -61,14 +73,42 @@ class CrewRosteringEnv:
         return observation, info
         
     def _build_state_vector(self, crew_state, crew_info):
-        vec = np.zeros(config.STATE_DIM)
-        now = crew_state['last_task_end_time']
-        vec[0] = (now - self.planning_start_dt).total_seconds() / (3600*24*7)
-        vec[1], vec[2] = now.hour / 24.0, now.weekday() / 7.0
-        vec[3] = 1 if crew_state['last_location'] == crew_info['base'] else 0
-        total_flights = len(self.dh.data['flights'])
-        vec[4] = len(self.unassigned_flight_ids) / total_flights if total_flights > 0 else 0
-        return vec
+        """
+        构建状态向量，与attention_guided_subproblem_solver.py中的_extract_state_features保持一致
+        """
+        features = np.zeros(config.STATE_DIM)
+        
+        # 时间特征
+        current_time = crew_state['last_task_end_time']
+        features[0] = current_time.weekday()  # 星期几
+        features[1] = current_time.hour  # 小时
+        features[2] = current_time.day  # 日期
+        
+        # 位置特征（机场哈希）
+        if crew_state['last_location']:
+            features[3] = hash(crew_state['last_location']) % 1000
+        
+        # 值勤状态特征 - 从crew_state中获取
+        if crew_state.get('duty_start_time'):
+            duty_duration = (current_time - crew_state['duty_start_time']).total_seconds() / 3600
+            features[4] = min(duty_duration, 24)  # 当前值勤时长（小时）
+            features[5] = crew_state.get('duty_flight_time', 0)  # 值勤内飞行时间
+            features[6] = crew_state.get('duty_flight_count', 0)  # 值勤内航班数
+            features[7] = crew_state.get('duty_task_count', 0)  # 值勤内任务数
+        
+        # 累计资源特征
+        features[8] = crew_state.get('total_flight_hours', 0)  # 总飞行时间
+        features[9] = crew_state.get('total_positioning', 0)  # 总调机次数
+        features[10] = crew_state.get('total_away_overnights', 0)  # 总外站过夜
+        features[11] = len(crew_state.get('total_calendar_days', set()))  # 总日历天数
+        
+        # 成本特征
+        features[12] = crew_state.get('cost', 0) / 1000.0  # 归一化成本
+        
+        # 机组基地特征
+        features[13] = 1 if crew_state['last_location'] == crew_info['base'] else 0
+        
+        return features
 
     def _get_valid_actions(self, crew_info, crew_state):
         last_loc, last_time = crew_state['last_location'], crew_state['last_task_end_time']
@@ -115,17 +155,43 @@ class CrewRosteringEnv:
         return len(violated_rules) == 0, violated_rules
     
     def _task_to_feature_vector(self, task, crew_state, crew_info):
-        vec = np.zeros(config.ACTION_DIM)
-        vec[0] = (task['startTime'] - crew_state['last_task_end_time']).total_seconds() / 3600
-        vec[1] = task.get('flyTime', 0) / 60.0
-        vec[2] = 1 if task.get('type') == 'flight' else 0
-        vec[3] = 1 if 'positioning' in task.get('type', '') else 0
-        vec[4] = 1 if task.get('arriAirport') == crew_info['base'] else 0
-        vec[5] = -task.get('violation_penalty', 0)
-        next_location = task.get('arriAirport')
-        unassigned_departures_next = self.dh.data['flights'][(self.dh.data['flights']['id'].isin(self.unassigned_flight_ids)) & (self.dh.data['flights']['depaAirport'] == next_location)].shape[0]
-        vec[6] = unassigned_departures_next / 10.0
-        return vec
+        """
+        将任务转换为特征向量，用于强化学习的动作表示。
+        与attention_guided_subproblem_solver.py中的_extract_task_features保持一致
+        """
+        features = np.zeros(config.ACTION_DIM)
+        
+        # 连接时间
+        connection_time = (task['startTime'] - crew_state['last_task_end_time']).total_seconds() / 3600
+        features[0] = min(connection_time, 48)  # 限制在48小时内
+        
+        # 任务类型特征
+        if task['type'] == 'flight':
+            features[1] = 1
+            features[2] = task.get('flyTime', 0) / 60.0  # 飞行时间（小时）
+        elif 'positioning' in task.get('type', ''):
+            features[3] = 1
+            if 'bus' in task.get('type', ''):
+                features[4] = 1  # 巴士调机
+            else:
+                features[5] = 1  # 飞行调机
+        elif task['type'] == 'ground_duty':
+            features[6] = 1  # 占位任务特征
+        
+        # 机场特征
+        features[7] = hash(task['depaAirport']) % 1000
+        features[8] = hash(task['arriAirport']) % 1000
+        
+        # 时间特征
+        features[9] = task['startTime'].weekday()
+        features[10] = task['startTime'].hour
+        features[11] = task['endTime'].hour
+        
+        # 任务持续时间
+        duration = (task['endTime'] - task['startTime']).total_seconds() / 3600
+        features[12] = min(duration, 24)
+        
+        return features
 
     def step(self, action_idx):
         reward = 0
@@ -147,8 +213,43 @@ class CrewRosteringEnv:
             task_type = task.get('type', '')
             if task_type == 'flight':
                 if task['taskId'] in self.unassigned_flight_ids: self.unassigned_flight_ids.remove(task['taskId'])
-            self.crew_states[crew_id]['last_task_end_time'] = task['endTime']
-            self.crew_states[crew_id]['last_location'] = task['arriAirport']
+            
+            # 更新crew_state中的所有状态信息
+            crew_state = self.crew_states[crew_id]
+            
+            # 计算连接时间（基于之前的任务结束时间）
+            connection_time = (task['startTime'] - crew_state['last_task_end_time']).total_seconds() / 3600
+            
+            # 更新基本状态
+            crew_state['last_task_end_time'] = task['endTime']
+            crew_state['last_location'] = task['arriAirport']
+            
+            # 更新值勤状态
+            if connection_time >= 12 or crew_state['duty_start_time'] is None:  # 新值勤开始
+                crew_state['duty_start_time'] = task['startTime']
+                crew_state['duty_flight_time'] = 0
+                crew_state['duty_flight_count'] = 0
+                crew_state['duty_task_count'] = 0
+            
+            crew_state['duty_task_count'] += 1
+            if task_type == 'flight':
+                crew_state['duty_flight_count'] += 1
+                crew_state['duty_flight_time'] += task.get('flyTime', 0) / 60.0
+                crew_state['total_flight_hours'] += task.get('flyTime', 0) / 60.0
+            elif 'positioning' in task_type:
+                crew_state['total_positioning'] += 1
+            
+            # 更新外站过夜
+            if task['arriAirport'] != crew_info['base']:
+                crew_state['total_away_overnights'] += 1
+            
+            # 更新日历天数
+            crew_state['total_calendar_days'].add(task['startTime'].date())
+            crew_state['total_calendar_days'].add(task['endTime'].date())
+            
+            # 更新成本（简化版）
+            crew_state['cost'] += task.get('flyTime', 0) * 0.1  # 简化的成本计算
+            
             reward += self._calculate_immediate_reward(task, crew_info)
             reward -= task.get('violation_penalty', 0) * config.PENALTY_RULE_VIOLATION * 0.2
 

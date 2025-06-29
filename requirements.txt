@@ -1,24 +1,50 @@
-# Core optimization libraries
-gurobipy>=9.0.0
+# 优化求解器
+gurobipy>=10.0.0
 
-# Machine learning and deep learning
-torch>=1.8.0
-torchvision>=0.9.0
-numpy>=1.19.0
+# 数据处理
+pandas>=1.5.0
+numpy>=1.21.0
 
-# Data processing
-pandas>=1.2.0
+# 深度学习框架
+torch>=1.12.0
+torchvision>=0.13.0
 
-# Standard libraries (usually included with Python)
-# datetime - built-in
-# typing - built-in
-# csv - built-in
-# os - built-in
-# time - built-in
-# math - built-in
+# 机器学习
+scikit-learn>=1.1.0
 
-# Optional: For enhanced functionality
-# matplotlib>=3.3.0  # For plotting and visualization
-# seaborn>=0.11.0    # For statistical visualization
-# jupyter>=1.0.0     # For notebook development
-# scikit-learn>=0.24.0  # For additional ML utilities
+# 数值计算和科学计算
+scipy>=1.9.0
+
+# 日期时间处理
+python-dateutil>=2.8.0
+
+# 进度条
+tqdm>=4.64.0
+
+# 配置文件处理
+pyyaml>=6.0
+
+# 日志记录
+loguru>=0.6.0
+
+# 类型检查
+typing-extensions>=4.0.0
+
+# 数据验证
+pydantic>=1.10.0
+
+# 内存优化
+psutil>=5.9.0
+
+# 图形绘制（可选）
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Jupyter支持（开发用）
+jupyter>=1.0.0
+ipykernel>=6.15.0
+
+# 代码格式化（开发用）
+black>=22.0.0
+flake8>=5.0.0
+mypy>=0.971

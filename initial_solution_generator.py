@@ -332,14 +332,23 @@ def generate_initial_rosters_with_heuristic(
     """
     print("正在使用启发式算法生成初始解...")
     
-    # 设置开始日期
-    start_date = datetime(2025, 5, 28).date()
+    # 调试信息
+    print(f"航班数量: {len(flights)}")
+    print(f"机组数量: {len(crews)}")
+    print(f"地面任务数量: {len(ground_duties)}")
+    print(f"大巴任务数量: {len(bus_info)}")
+    print(f"机组-航班匹配关系数量: {sum(len(flight_ids) for flight_ids in crew_leg_match_dict.values())}")
+    
+    # 设置开始日期 - 修改为覆盖所有数据文件的最早日期
+    start_date = datetime(2025, 4, 29).date()
     
     # 构建crew_leg_matches_set
     crew_leg_matches_set = set()
     for crew_id, flight_ids in crew_leg_match_dict.items():
         for flight_id in flight_ids:
             crew_leg_matches_set.add((crew_id, flight_id))
+    
+    print(f"机组-航班匹配对数量: {len(crew_leg_matches_set)}")
     
     # 构建layover_stations_set (简化处理)
     layover_stations_set = set()
@@ -355,7 +364,8 @@ def generate_initial_rosters_with_heuristic(
     sorted_tasks = sorted(all_tasks, key=lambda t: (t['priority'], t['start_time']))
     unassigned_task_ids = {t['id'] for t in sorted_tasks}
 
-    for crew in crews:
+    assigned_tasks_count = 0
+    for crew_idx, crew in enumerate(crews):
         # 初始化机组状态
         crew.schedule = []
         crew.current_location = crew.stayStation
@@ -380,6 +390,7 @@ def generate_initial_rosters_with_heuristic(
         crew.last_fdp_end_time_for_cycle_check = None
         crew.fdp_phase = 'none'  # FDP 阶段: 'none', 'pre_flight', 'in_flight', 'post_flight'
 
+        crew_assigned_count = 0
         while True:
             best_task_to_assign = None
             for task_info in sorted_tasks:
@@ -395,8 +406,13 @@ def generate_initial_rosters_with_heuristic(
             if best_task_to_assign:
                 assign_task_greedy(crew, best_task_to_assign['task_obj'], best_task_to_assign['type'], start_date)
                 unassigned_task_ids.remove(best_task_to_assign['id'])
+                crew_assigned_count += 1
+                assigned_tasks_count += 1
             else:
-                break 
+                break
+        
+        if crew_idx < 5:  # 只打印前5个机组的详细信息
+            print(f"机组 {crew.crewId} 分配了 {crew_assigned_count} 个任务") 
         
         if crew.schedule:
             # 转换为Roster格式，使用评分系统计算正确的成本
@@ -407,7 +423,7 @@ def generate_initial_rosters_with_heuristic(
                 scoring_system = ScoringSystem(flights, crews, layover_stations)
                 # 使用calculate_roster_cost_with_dual_prices方法，传入空的对偶价格
                 cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                    roster, crew, {}, 0.0
+                    roster, crew, {}, 0.0, 0.0
                 )
                 roster.cost = cost_details['total_cost']
             else:

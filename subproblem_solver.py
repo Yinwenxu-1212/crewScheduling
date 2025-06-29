@@ -21,7 +21,7 @@ CSV_HEADER = [
     'next_task_dual_price',
     'label'
 ]
-REWARD_PER_FLIGHT_HOUR = -1000
+REWARD_PER_FLIGHT_HOUR = -1000  
 PENALTY_PER_AWAY_OVERNIGHT = 0.5
 PENALTY_PER_POSITIONING = 0.5
 
@@ -126,7 +126,7 @@ def solve_subproblem_for_crew(
                 [{'task': b, 'type': 'bus'} for b in all_bus_info] + \
                 [{'task': gd, 'type': 'ground_duty'} for gd in schedulable_ground_duties]
     
-    start_node = Node(airport=crew.stayStation, time=datetime(2025, 5, 28, 0, 0))
+    start_node = Node(airport=crew.stayStation, time=datetime(2025, 4, 29, 0, 0))
     tie_breaker = itertools.count()
     initial_label = Label(cost=0, path=[], node=start_node, duty_start_time=None,
                         duty_flight_time=0, duty_flight_count=0, duty_task_count=0,
@@ -402,7 +402,7 @@ def solve_subproblem_for_crew(
                 print(f"      [子问题发现!] 机组 {crew.crewId}: 找到负成本方案! Reduced Cost: {new_cost:.2f}")
                 final_calendar_days_count = len(new_label.total_calendar_days) or 1
                 avg_flight_hours = new_label.total_flight_hours / final_calendar_days_count
-                true_score = (avg_flight_hours * 1000) - (new_label.total_away_overnights * PENALTY_PER_AWAY_OVERNIGHT) - (new_label.total_positioning * PENALTY_PER_POSITIONING)
+                true_score = (avg_flight_hours * 1) - (new_label.total_away_overnights * PENALTY_PER_AWAY_OVERNIGHT) - (new_label.total_positioning * PENALTY_PER_POSITIONING)
                 found_rosters.append(Roster(crew.crewId, new_path, -true_score))
                 
                 temp_label_tb = new_label.tie_breaker

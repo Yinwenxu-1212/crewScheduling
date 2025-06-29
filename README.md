@@ -1,168 +1,159 @@
-# 机组排班优化系统 (Crew Scheduling Optimization System)
+# 机组排班优化系统 (Crew Scheduling Optimization)
 
-基于列生成算法和注意力机制的航空公司机组排班优化解决方案。
+基于列生成算法和Dinkelbach算法的机组排班优化系统，用于解决航空公司机组人员的排班问题。
 
-## 📋 项目概述
+## 项目概述
 
-本项目是一个先进的机组排班优化系统，采用列生成算法结合强化学习和注意力机制，为航空公司提供高效的机组排班解决方案。系统能够在满足各种运营约束的前提下，最大化飞行时间利用率并最小化运营成本。
+本项目实现了一个完整的机组排班优化解决方案，主要特点包括：
 
-### 🎯 主要特性
+- **列生成算法**：高效求解大规模排班问题
+- **Dinkelbach算法**：处理分数规划目标函数
+- **注意力机制**：智能引导子问题求解
+- **多约束处理**：支持复杂的航空业务规则
 
-- **列生成算法**: 采用经典的列生成方法求解大规模机组排班问题
-- **注意力机制**: 集成基于Transformer的注意力模型指导子问题求解
-- **智能约束处理**: 支持90%航班覆盖率约束和多种运营规则
-- **实时监控**: 提供详细的求解过程监控和性能分析
-- **灵活配置**: 支持多种参数调优和约束配置
+## 核心算法
 
-## 🏗️ 系统架构
+### 1. 列生成框架
+- 主问题：集合覆盖模型，选择最优排班组合
+- 子问题：生成具有负reduced cost的新排班方案
+- 迭代优化：直到无法找到改进方案
+
+### 2. Dinkelbach算法
+- 处理飞行时间与值勤天数的比值优化
+- 参数化目标函数：max(1000×飞行时间 - λ×值勤天数)
+- 自适应λ更新：确保算法收敛
+
+### 3. 注意力引导求解
+- 深度学习模型预测最优决策
+- Beam Search策略探索解空间
+- 启发式剪枝提高求解效率
+
+## 项目结构
 
 ```
 crewSchedule_cg/
 ├── main.py                              # 主程序入口
-├── master_problem.py                    # 主问题求解器
-├── subproblem_solver.py                 # 子问题求解器
-├── attention_guided_subproblem_solver.py # 注意力引导的子问题求解器
 ├── data_loader.py                       # 数据加载模块
 ├── data_models.py                       # 数据模型定义
-├── scoring_system.py                    # 评分系统
+├── master_problem.py                    # 主问题求解器
+├── dinkelbach_optimizer.py              # Dinkelbach算法实现
+├── subproblem_solver.py                 # 传统子问题求解器
+├── attention_guided_subproblem_solver.py # 注意力引导子问题求解器
+├── scoring_system.py                    # 排班方案评分系统
 ├── initial_solution_generator.py        # 初始解生成器
+├── coverage_validator.py                # 覆盖率验证器
 ├── results_writer.py                    # 结果输出模块
-├── attention/                           # 注意力模型模块
-│   ├── config.py                        # 模型配置
-│   ├── model.py                         # 神经网络模型
-│   ├── environment.py                   # 强化学习环境
-│   ├── main.py                          # 模型训练入口
-│   └── utils.py                         # 工具函数
-├── data/                                # 数据文件
-├── output/                              # 输出结果
-├── debug/                               # 调试日志
-└── models/                              # 训练好的模型
+├── attention/                           # 注意力模型相关
+│   ├── model.py                        # 神经网络模型
+│   ├── environment.py                  # 强化学习环境
+│   ├── config.py                       # 模型配置
+│   └── utils.py                        # 工具函数
+├── data/                               # 输入数据
+│   ├── flight.csv                     # 航班信息
+│   ├── crew.csv                       # 机组信息
+│   ├── crewLegMatch.csv               # 机组航段匹配
+│   ├── busInfo.csv                    # 班车信息
+│   ├── groundDuty.csv                 # 地面值勤
+│   └── layoverStation.csv             # 过夜站点
+├── models/                             # 预训练模型
+└── requirements.txt                    # 依赖包列表
 ```
 
-## 🚀 快速开始
+## 安装要求
 
-### 环境要求
-
+### Python版本
 - Python 3.8+
-- Gurobi Optimizer 9.0+
-- PyTorch 1.8+
-- CUDA (可选，用于GPU加速)
 
-### 安装依赖
-
+### 依赖包
 ```bash
-pip install gurobipy torch pandas numpy datetime
+pip install -r requirements.txt
 ```
 
-### 数据准备
+主要依赖：
+- `gurobipy`: 优化求解器
+- `pandas`: 数据处理
+- `numpy`: 数值计算
+- `torch`: 深度学习框架
+- `scikit-learn`: 机器学习工具
 
-将以下CSV文件放置在 `data/` 目录下：
+## 使用方法
 
-- `flight.csv` - 航班信息
-- `crew.csv` - 机组信息
-- `crewLegMatch.csv` - 机组航段匹配
-- `layoverStation.csv` - 过夜站点信息
-- `busInfo.csv` - 班车信息
-- `groundDuty.csv` - 地面任务信息
+### 1. 数据准备
+将输入数据文件放置在 `data/` 目录下：
+- `flight.csv`: 航班信息
+- `crew.csv`: 机组信息
+- `crewLegMatch.csv`: 机组航段匹配关系
+- 其他辅助数据文件
 
-### 运行系统
-
+### 2. 运行优化
 ```bash
 python main.py
 ```
 
-## 📊 核心算法
-
-### 列生成算法
-
-系统采用经典的列生成方法：
-
-1. **主问题**: 在已有roster集合中选择最优组合
-2. **子问题**: 为每个机组生成新的可行roster
-3. **迭代优化**: 通过对偶价格指导新列生成
-
-### 注意力机制
-
-集成了基于Transformer的注意力模型：
-
-- **Actor-Critic架构**: 策略网络和价值网络
-- **多头注意力**: 捕获航班间的复杂依赖关系
-- **强化学习训练**: PPO算法优化决策策略
-
-### 约束处理
-
-- **机组唯一性**: 每个机组最多分配一个roster
-- **时间窗约束**: 满足航班时间和机组可用性
-- **规则约束**: 符合民航局相关规定
-
-## 📈 评分系统
-
-系统采用多维度评分机制：
-
-- **飞行时间得分**: 值勤日日均飞时 × 1000
-- **未覆盖航班惩罚**: 未覆盖航班数 × (-5)
-- **过夜站点惩罚**: 新增过夜站点数 × (-10)
-- **外站过夜惩罚**: 外站过夜天数 × (-0.5)
-- **置位惩罚**: 置位次数 × (-0.5)
-- **违规惩罚**: 违规次数 × (-10)
-
-## 🔧 配置选项
-
-### 主要参数
-
-- `TIME_LIMIT_SECONDS`: 求解时间限制
-- `MAX_ITERATIONS`: 最大迭代次数
-- `MIN_COVERAGE_RATIO`: 最小航班覆盖率 (默认0.77)
-- `UNCOVERED_FLIGHT_PENALTY`: 未覆盖航班惩罚系数
-
-### 注意力模型参数
-
-- `LEARNING_RATE`: 学习率 (3e-5)
-- `GAMMA`: 折扣因子 (0.998)
-- `PPO_EPSILON`: PPO裁剪参数 (0.2)
-- `ENTROPY_COEF`: 熵系数 (0.01)
-
-## 📁 输出文件
-
-- `rosterResult.csv`: 最终排班结果
+### 3. 查看结果
+优化结果将保存在 `output/` 目录下：
+- `rosterResult_YYYYMMDD_HHMMSS.csv`: 最终排班方案
 - `initial_solution.csv`: 初始解
-- `roster_cost_debug_*.log`: 调试日志
-- `debug_rosters_*.csv`: 调试用roster信息
 
-## 🔍 监控与调试
+## 配置参数
 
-系统提供详细的运行监控：
+### 算法参数
+- `MAX_ITERATIONS`: 最大迭代次数 (默认: 100)
+- `CONVERGENCE_THRESHOLD`: 收敛阈值 (默认: 1e-6)
+- `TIME_LIMIT`: 时间限制 (默认: 3600秒)
 
-- **实时进度**: 显示当前迭代和求解状态
-- **性能指标**: 目标函数值、未覆盖航班数、求解时间
-- **调试日志**: 详细的成本计算和约束检查信息
-- **错误处理**: 智能的异常处理和恢复机制
+### 业务约束
+- `MAX_FLIGHT_HOURS`: 最大飞行小时数 (默认: 100)
+- `MAX_DUTY_DAYS`: 最大值勤天数 (默认: 20)
+- `MIN_REST_TIME`: 最小休息时间 (默认: 12小时)
 
-## 🤝 贡献指南
+### 惩罚系数
+- `FLY_TIME_MULTIPLIER`: 飞行时间奖励系数 (默认: 1000)
+- `UNCOVERED_FLIGHT_PENALTY`: 未覆盖航班惩罚 (默认: -5)
+- `POSITIONING_PENALTY`: 定位惩罚 (默认: -0.5)
+- `AWAY_OVERNIGHT_PENALTY`: 外站过夜惩罚 (默认: -0.5)
 
-欢迎提交Issue和Pull Request来改进项目：
+## 算法特性
 
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
+### 优势
+1. **高效性**: 列生成算法处理大规模问题
+2. **智能性**: 注意力机制提升求解质量
+3. **灵活性**: 支持多种业务约束和目标
+4. **稳定性**: Dinkelbach算法保证收敛
 
-## 📄 许可证
+### 适用场景
+- 航空公司机组排班
+- 大规模人员调度
+- 资源分配优化
+- 分数规划问题
 
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+## 开发说明
 
-## 📞 联系方式
+### 代码规范
+- 遵循PEP 8编码规范
+- 使用类型注解提高代码可读性
+- 详细的文档字符串说明
+
+### 调试功能
+- 详细的日志记录
+- 中间结果保存
+- 性能监控指标
+
+### 扩展性
+- 模块化设计便于功能扩展
+- 插件式求解器架构
+- 可配置的约束和目标函数
+
+## 许可证
+
+本项目仅供学术研究和教育用途使用。
+
+## 联系方式
 
 如有问题或建议，请通过以下方式联系：
-
-- 项目Issues: [GitHub Issues](https://github.com/Yinwenxu-1212/crewScheduling)
-- 邮箱: 2151102@tongji.edu.cn
-
-## 🙏 致谢
-
-感谢所有为本项目做出贡献的开发者和研究人员。
+- 项目仓库: [https://github.com/Yinwenxu-1212/crewScheduling]
+- 邮箱: [2151102@tongji.edu.cn]
 
 ---
 
-**注意**: 本项目仅用于学术研究和教育目的。在生产环境中使用前，请确保充分测试并符合相关法规要求。
+*最后更新: 2025年*
