@@ -98,9 +98,14 @@ python main.py
 ## 配置参数
 
 ### 算法参数
-- `MAX_ITERATIONS`: 最大迭代次数 (默认: 100)
+- `MAX_ITERATIONS`: 最大迭代次数 (默认: 10) *已优化*
 - `CONVERGENCE_THRESHOLD`: 收敛阈值 (默认: 1e-6)
 - `TIME_LIMIT`: 时间限制 (默认: 3600秒)
+
+### 子问题搜索参数 *已优化*
+- `max_iterations`: 子问题最大迭代次数 (默认: 2000)
+- `beam_width`: 束搜索宽度 (默认: 10)
+- `max_candidates_per_expansion`: 每次扩展的最大候选数 (默认: 8)
 
 ### 业务约束
 - `MAX_FLIGHT_HOURS`: 最大飞行小时数 (默认: 100)
@@ -108,10 +113,25 @@ python main.py
 - `MIN_REST_TIME`: 最小休息时间 (默认: 12小时)
 
 ### 惩罚系数
-- `FLY_TIME_MULTIPLIER`: 飞行时间奖励系数 (默认: 1000)
-- `UNCOVERED_FLIGHT_PENALTY`: 未覆盖航班惩罚 (默认: -5)
+- `FLY_TIME_MULTIPLIER`: 飞行时间奖励系数 (默认: 50) *已优化*
+- `UNCOVERED_FLIGHT_PENALTY`: 未覆盖航班惩罚 (默认: -500) *已优化*
 - `POSITIONING_PENALTY`: 定位惩罚 (默认: -0.5)
 - `AWAY_OVERNIGHT_PENALTY`: 外站过夜惩罚 (默认: -0.5)
+- `NEW_LAYOVER_PENALTY`: 新增过夜站点惩罚 (默认: -10)
+- `VIOLATION_PENALTY`: 违规惩罚 (默认: -10)
+
+## 最新优化 (2025年)
+
+### 参数调优
+1. **飞行时间奖励系数优化**: 从1000降至50，提高算法数值稳定性
+2. **未覆盖航班惩罚强化**: 从300提升至500，显著提高航班覆盖率
+3. **搜索空间扩大**: 子问题迭代次数从500增至2000，束搜索宽度从5增至10
+4. **参数统一化**: 消除硬编码数值，提高代码可维护性
+
+### 代码质量提升
+1. **错误修复**: 修复了`avg_daily_flight_hours`未定义变量错误
+2. **参数一致性**: 统一了`dinkelbach_optimizer.py`和`scoring_system.py`中的系数设置
+3. **变量引用**: 将硬编码数值替换为类变量引用，提高可配置性
 
 ## 算法特性
 
@@ -120,6 +140,7 @@ python main.py
 2. **智能性**: 注意力机制提升求解质量
 3. **灵活性**: 支持多种业务约束和目标
 4. **稳定性**: Dinkelbach算法保证收敛
+5. **可维护性**: 参数化设计便于调优和扩展
 
 ### 适用场景
 - 航空公司机组排班

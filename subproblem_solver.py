@@ -21,7 +21,7 @@ CSV_HEADER = [
     'next_task_dual_price',
     'label'
 ]
-REWARD_PER_FLIGHT_HOUR = -1000  
+REWARD_PER_FLIGHT_HOUR = -100  
 PENALTY_PER_AWAY_OVERNIGHT = 0.5
 PENALTY_PER_POSITIONING = 0.5
 
@@ -398,7 +398,7 @@ def solve_subproblem_for_crew(
                 heapq.heappush(pq, duty_end_label)
                 parent_map[duty_end_label.tie_breaker] = (current_label.tie_breaker, features)
 
-            if next_node.airport == crew.base and new_cost < -1e-6:
+            if next_node.airport == crew.base and new_cost < -1e-4:
                 print(f"      [子问题发现!] 机组 {crew.crewId}: 找到负成本方案! Reduced Cost: {new_cost:.2f}")
                 final_calendar_days_count = len(new_label.total_calendar_days) or 1
                 avg_flight_hours = new_label.total_flight_hours / final_calendar_days_count

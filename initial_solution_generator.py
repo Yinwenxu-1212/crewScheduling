@@ -197,15 +197,13 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
             temp_cycle_days_count = (current_task_date - temp_cycle_start_date_val).days + 1
         
         if temp_cycle_days_count > MAX_FLIGHT_CYCLE_DAYS:
-            # 如果超期，需要检查是否在基地结束上个周期并有足够休息
-            # This check is complex: requires knowing if the *previous* cycle ended at base with 2 days rest.
-            # Simplified: if it's a new FDP and adding it makes cycle days > MAX, AND the crew is not starting this FDP at base after a long rest, it's a violation.
-            # A more robust check would be in assign_task_greedy when a cycle actually completes or resets.
-            # For now, if it looks like it will exceed, and the previous FDP didn't end at base with a cycle-ending rest, deny.
+            # 飞行周期超过4天限制，检查是否可以通过基地休息重置周期
+            # 严格要求：必须在基地有足够休息时间才能重置周期
             if not (crew.last_activity_end_location == crew.base and \
                       crew.last_rest_end_time and \
-                      (task_start_time - crew.last_fdp_end_time_for_cycle_check if crew.last_fdp_end_time_for_cycle_check else timedelta(0)) >= MIN_REST_DAYS_AT_BASE_FOR_CYCLE_RESET):
-                return False # 飞行周期可能超限
+                      crew.last_fdp_end_time_for_cycle_check and \
+                      (task_start_time - crew.last_fdp_end_time_for_cycle_check) >= MIN_REST_DAYS_AT_BASE_FOR_CYCLE_RESET):
+                return False # 飞行周期超限
     
     # 9. 计划期内总飞行值勤时间限制 (Rule 3.5)
     # 应该累加的是FDP的实际值勤时间。此检查在assign_task_greedy中进行更新和检查。
@@ -258,7 +256,8 @@ def assign_task_greedy(crew, task, task_type, start_date): # task可以是Flight
             if crew.current_cycle_start_date: 
                 # 检查是否在基地完成周期性休息
                 if crew.last_activity_end_location == crew.base and \
-                   (crew.last_rest_end_time - crew.last_fdp_end_time_for_cycle_check if crew.last_fdp_end_time_for_cycle_check else timedelta(0)) >= MIN_REST_DAYS_AT_BASE_FOR_CYCLE_RESET:
+                   crew.last_fdp_end_time_for_cycle_check and \
+                   (crew.last_rest_end_time - crew.last_fdp_end_time_for_cycle_check) >= MIN_REST_DAYS_AT_BASE_FOR_CYCLE_RESET:
                     crew.current_cycle_start_date = None # 重置周期
                     crew.current_cycle_days = 0
                     crew.consecutive_duty_days = 0 # 在基地长休后重置连续执勤
@@ -322,6 +321,8 @@ def assign_task_greedy(crew, task, task_type, start_date): # task可以是Flight
     else: # Any non-ground duty task (flight, bus) ends ground duty status
         crew.is_on_ground_duty = False
         crew.current_ground_duty_end_time = None
+    
+
 
 def generate_initial_rosters_with_heuristic(
     flights: List[Flight], crews: List[Crew], bus_info: List[BusInfo], 
@@ -358,7 +359,9 @@ def generate_initial_rosters_with_heuristic(
     for f in flights: all_tasks.append({'task_obj': f, 'type': 'flight', 'start_time': f.std, 'id': f.id, 'priority': 1})
     for gd in ground_duties: all_tasks.append({'task_obj': gd, 'type': 'ground_duty', 'start_time': gd.startTime, 'id': ('gd', gd.id), 'priority': 2})
     for bi in bus_info: all_tasks.append({'task_obj': bi, 'type': 'bus', 'start_time': bi.startTime, 'id': ('bus', bi.id), 'priority': 3})
+    
 
+    
     # 优先分配飞行任务，然后是地面任务，最后是大巴
     # 在相同类型任务中，按开始时间排序
     sorted_tasks = sorted(all_tasks, key=lambda t: (t['priority'], t['start_time']))
@@ -441,7 +444,7 @@ def generate_initial_rosters_with_heuristic(
     output_dir = "output"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
+
     output_path = os.path.join(output_dir, "initial_solution.csv")
     write_results_to_csv(initial_rosters, output_path)
     

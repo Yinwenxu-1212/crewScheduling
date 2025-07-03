@@ -10,7 +10,7 @@ Dinkelbach算法实现
 import gurobipy as gp
 from gurobipy import GRB
 from typing import List, Dict, Tuple, Optional
-from data_models import Flight, Roster, Crew
+from data_models import Flight, Roster, Crew, BusInfo, GroundDuty
 from datetime import timedelta
 
 class DinkelbachOptimizer:
@@ -22,9 +22,10 @@ class DinkelbachOptimizer:
         self.uncovered_vars = {}
         self.flight_constraints = {}
         self.crew_constraints = {}
+        self.ground_duty_constraints = {}  # 添加地面值勤约束字典
         
         # 惩罚系数（根据竞赛规则设定）
-        self.UNCOVERED_FLIGHT_PENALTY = 5  # 未覆盖航班惩罚
+        self.UNCOVERED_FLIGHT_PENALTY = 500  # 未覆盖航班惩罚（大幅增加以提高覆盖率）
         self.NEW_LAYOVER_PENALTY = 10      # 新增过夜站点惩罚
         self.AWAY_OVERNIGHT_PENALTY = 0.5  # 外站过夜惩罚
         self.POSITIONING_PENALTY = 0.5     # 置位惩罚
@@ -50,6 +51,7 @@ class DinkelbachOptimizer:
         self.model = gp.Model("CrewSchedulingDinkelbach")
         
         # 设置Gurobi参数以改善对偶价格访问
+        self.model.setParam('OutputFlag', 0)  # 关闭详细输出
         self.model.setParam('Presolve', 0)  # 禁用预处理
         self.model.setParam('NumericFocus', 2)  # 提高数值稳定性
         self.model.setParam('InfUnbdInfo', 1)  # 启用无界信息
@@ -127,6 +129,8 @@ class DinkelbachOptimizer:
             gp.quicksum(crew_vars) <= 1,
             name=f"crew_{roster.crew_id}"
         )
+        # 强制Gurobi模型立即处理所有挂起的修改
+        self.model.update()
     
     def _calculate_roster_metrics(self, roster: Roster) -> Dict:
         """计算roster的各项指标"""
@@ -149,8 +153,11 @@ class DinkelbachOptimizer:
                 while current_date <= end_date:
                     duty_dates.add(current_date)
                     current_date += timedelta(days=1)
-            else:
-                # 非航班任务（如置位）
+            
+            # 统一的置位判断逻辑
+            if hasattr(duty, 'type') and 'positioning' in duty.type.lower():
+                positioning_count += 1
+            elif isinstance(duty, BusInfo):  # BusInfo类型直接视为置位
                 positioning_count += 1
         
         duty_days = len(duty_dates)
@@ -166,16 +173,18 @@ class DinkelbachOptimizer:
     def _update_objective_function(self, lambda_k: float):
         """根据当前lambda_k更新目标函数"""
         # 构建Dinkelbach参数化后的目标函数
-        # 最大化: 1000 * C_p * x_p - lambda_k * d_p * x_p - 其他惩罚项
+        # 最大化: 50 * C_p * x_p - lambda_k * d_p * x_p - 其他惩罚项
         
         objective_expr = gp.LinExpr()
+        roster_terms_count = 0
+        uncovered_terms_count = 0
         
-        # 1. Roster相关项：1000 * 总飞行时间 - lambda_k * 值勤天数 - 其他惩罚
+        # 1. Roster相关项：50 * 总飞行时间 - lambda_k * 值勤天数 - 其他惩罚
         for roster, var in self.roster_vars.items():
             metrics = roster.metrics
             
             # 飞行时间收益项
-            flight_hours_coeff = 1000 * metrics['total_flight_hours']
+            flight_hours_coeff = 50 * metrics['total_flight_hours']
             
             # 值勤天数惩罚项（Dinkelbach参数化）
             duty_days_coeff = -lambda_k * metrics['duty_days']
@@ -190,19 +199,58 @@ class DinkelbachOptimizer:
                           positioning_coeff + away_overnight_coeff + new_layover_coeff)
             
             objective_expr.addTerms(total_coeff, var)
+            roster_terms_count += 1
         
         # 2. 未覆盖航班惩罚项
         for flight_id, uncovered_var in self.uncovered_vars.items():
             objective_expr.addTerms(-self.UNCOVERED_FLIGHT_PENALTY, uncovered_var)
+            uncovered_terms_count += 1
+        
+        # 第一步：打印并验证目标函数表达式
+        print(f"目标函数调试: roster项数={roster_terms_count}, 未覆盖项数={uncovered_terms_count}, λ={lambda_k:.6f}")
+        if roster_terms_count == 0 and uncovered_terms_count == 0:
+            print("⚠️ 警告：目标函数表达式为空！")
+        
+        # 详细打印目标函数表达式的内容
+        print(f"目标函数表达式详情:")
+        print(f"  - 表达式大小: {objective_expr.size()}")
+        print(f"  - 常数项: {objective_expr.getConstant()}")
+        
+        # 打印前5个变量的系数示例
+        if objective_expr.size() > 0:
+            print(f"  - 前5个变量系数示例:")
+            count = 0
+            for i in range(min(5, objective_expr.size())):
+                try:
+                    var = objective_expr.getVar(i)
+                    coeff = objective_expr.getCoeff(i)
+                    var_name = var.VarName if hasattr(var, 'VarName') else f"Var_{i}"
+                    print(f"    变量 {var_name}: 系数 {coeff:.6f}")
+                    count += 1
+                    if count >= 5:
+                        break
+                except Exception as e:
+                    print(f"    变量 {i}: 无法获取详细信息 ({e})")
+                    count += 1
+                    if count >= 5:
+                        break
         
         # 设置目标函数（最大化）
         self.model.setObjective(objective_expr, sense=GRB.MAXIMIZE)
+        
+        # 第二步：将Gurobi模型写入文件进行详细分析
+        try:
+            model_filename = f"debug_model_lambda_{lambda_k:.2f}.lp"
+            self.model.write(model_filename)
+            print(f"模型已写入文件: {model_filename}")
+        except Exception as e:
+            print(f"写入模型文件失败: {e}")
     
     def solve_dinkelbach_with_multiple_starts(self, num_starts: int = 3, verbose: bool = True) -> Tuple[Optional[Dict], Optional[Dict], float]:
         """使用多起始点策略的Dinkelbach算法求解分数规划问题"""
         
         if verbose:
-            print(f"\n开始多起始点Dinkelbach算法求解 (起始点数量: {num_starts})...")
+            print(f"开始多起始点Dinkelbach算法求解 (起始点数量: {num_starts})...")
         
         best_solution = None
         best_objective = float('-inf')
@@ -225,8 +273,7 @@ class DinkelbachOptimizer:
                 initial_lambdas.append(avg_flight_hours * perturbation)
         
         for start_idx, initial_lambda in enumerate(initial_lambdas[:num_starts]):
-            if verbose:
-                print(f"\n=== 起始点 {start_idx + 1}/{num_starts}: 初始λ = {initial_lambda:.6f} ===")
+            # 简化起始点信息输出
             
             # 重置lambda值
             self.lambda_k = initial_lambda
@@ -239,11 +286,10 @@ class DinkelbachOptimizer:
                 best_objective = objective
                 best_pi_duals = pi_duals
                 best_sigma_duals = sigma_duals
-                if verbose:
-                    print(f"*** 找到更好的解！目标函数值: {objective:.6f} ***")
+                # 找到更好的解
         
         if verbose:
-            print(f"\n多起始点求解完成，最佳目标函数值: {best_objective:.6f}")
+            print(f"多起始点求解完成，最佳目标函数值: {best_objective:.6f}")
         
         return best_pi_duals, best_sigma_duals, best_objective
     
@@ -255,11 +301,10 @@ class DinkelbachOptimizer:
         """单起始点Dinkelbach算法实现"""
         
         if verbose:
-            print("\n开始Dinkelbach算法求解...")
+            print("开始Dinkelbach算法求解...")
         
         for iteration in range(self.max_iterations):
-            if verbose:
-                print(f"\nDinkelbach迭代 {iteration + 1}, lambda_k = {self.lambda_k:.6f}")
+            # 简化迭代信息输出
             
             # 更新目标函数
             self._update_objective_function(self.lambda_k)
@@ -282,7 +327,7 @@ class DinkelbachOptimizer:
             for roster, var in self.roster_vars.items():
                 if var.X > 0.5:  # 被选中的roster
                     metrics = roster.metrics
-                    numerator += 1000 * metrics['total_flight_hours']  # 修复：与目标函数中的1000系数保持一致
+                    numerator += 50 * metrics['total_flight_hours']  # 修复：与目标函数中的50系数保持一致
                     denominator += metrics['duty_days']
                     
                     # 减去其他惩罚项
@@ -301,11 +346,7 @@ class DinkelbachOptimizer:
             else:
                 new_lambda = 0.0
             
-            if verbose:
-                print(f"  分子 (收益): {numerator:.6f}")
-                print(f"  分母 (值勤天数): {denominator:.6f}")
-                print(f"  新lambda: {new_lambda:.6f}")
-                print(f"  目标函数值: {self.model.ObjVal:.6f}")
+            # 简化迭代详细信息输出
             
             # 改进的收敛性检查
             lambda_change = abs(new_lambda - self.lambda_k)
@@ -319,8 +360,7 @@ class DinkelbachOptimizer:
             # 检查收敛性（需要满足最小迭代次数）
             if iteration >= self.min_iterations and lambda_change < current_tolerance:
                 if verbose:
-                    print(f"\nDinkelbach算法收敛！最终lambda = {new_lambda:.6f}")
-                    print(f"收敛条件: 迭代{iteration+1} >= 最小迭代{self.min_iterations}, λ变化{lambda_change:.8f} < 容差{current_tolerance:.8f}")
+                    print(f"Dinkelbach算法收敛！最终lambda = {new_lambda:.6f}")
                 break
             
             # 检查停滞情况
@@ -336,8 +376,7 @@ class DinkelbachOptimizer:
                                     for i in range(1, len(self._lambda_history))]
                     if all(change < current_tolerance * 10 for change in recent_changes[-self.stagnation_threshold:]):
                         if verbose:
-                            print(f"\n检测到λ值停滞，提前终止迭代")
-                            print(f"最近{self.stagnation_threshold}次变化: {recent_changes[-self.stagnation_threshold:]}")
+                            print(f"检测到λ值停滞，提前终止迭代")
                         break
             else:
                 self._lambda_history = [self.lambda_k, new_lambda]
@@ -346,7 +385,7 @@ class DinkelbachOptimizer:
         
         else:
             if verbose:
-                print(f"\nDinkelbach算法达到最大迭代次数 {self.max_iterations}")
+                print(f"Dinkelbach算法达到最大迭代次数 {self.max_iterations}")
         
         # 提取对偶价格
         pi_duals = {}
@@ -354,10 +393,7 @@ class DinkelbachOptimizer:
         
         # 获取对偶价格（LP松弛模型可以直接获取）
         if self.model.Status == GRB.OPTIMAL:
-            if verbose:
-                print(f"模型状态: 最优解 (Status={self.model.Status})")
-                print(f"约束数量: 航班约束={len(self.flight_constraints)}, 机组约束={len(self.crew_constraints)}")
-                print(f"变量数量: roster变量={len(self.roster_vars)}, 未覆盖变量={len(self.uncovered_vars)}")
+            # 简化模型状态输出
             
             # 直接获取对偶价格（连续变量模型）
             for flight_id, constr in self.flight_constraints.items():
@@ -366,23 +402,7 @@ class DinkelbachOptimizer:
             for crew_id, constr in self.crew_constraints.items():
                 sigma_duals[crew_id] = -constr.Pi
                 
-            if verbose:
-                non_zero_pi = sum(1 for v in pi_duals.values() if abs(v) > 1e-9)
-                non_zero_sigma = sum(1 for v in sigma_duals.values() if abs(v) > 1e-9)
-                print(f"成功获取对偶价格: π非零={non_zero_pi}/{len(pi_duals)}, σ非零={non_zero_sigma}/{len(sigma_duals)}")
-                
-                # 调试：输出一些对偶价格的实际数值
-                pi_values = [v for v in pi_duals.values() if abs(v) > 1e-9]
-                if pi_values:
-                    print(f"π对偶价格样本: 最大={max(pi_values):.6f}, 最小={min(pi_values):.6f}, 平均={sum(pi_values)/len(pi_values):.6f}")
-                else:
-                    print("所有π对偶价格都接近0")
-                    
-                sigma_values = [v for v in sigma_duals.values() if abs(v) > 1e-9]
-                if sigma_values:
-                    print(f"σ对偶价格样本: 最大={max(sigma_values):.6f}, 最小={min(sigma_values):.6f}, 平均={sum(sigma_values)/len(sigma_values):.6f}")
-                else:
-                    print("所有σ对偶价格都接近0")
+            # 简化对偶价格输出
         else:
             if verbose:
                 print(f"模型状态非最优: Status={self.model.Status}")
@@ -393,7 +413,34 @@ class DinkelbachOptimizer:
             for crew_id in self.crew_constraints.keys():
                 sigma_duals[crew_id] = 0.0
         
-        return pi_duals, sigma_duals, self.model.ObjVal
+        # 计算原始问题的目标函数值（不是Dinkelbach参数化后的值）
+        # 原始问题目标函数：(100 * 总飞行时间 - 各种惩罚项) / 总值勤天数
+        final_numerator = 0.0
+        final_denominator = 0.0
+        
+        for roster, var in self.roster_vars.items():
+            if var.X > 0.5:  # 被选中的roster
+                metrics = roster.metrics
+                final_numerator += 100 * metrics['total_flight_hours']
+                final_denominator += metrics['duty_days']
+                
+                # 减去其他惩罚项
+                final_numerator -= (self.POSITIONING_PENALTY * metrics['positioning_count'] +
+                                   self.AWAY_OVERNIGHT_PENALTY * metrics['away_overnight_days'] +
+                                   self.NEW_LAYOVER_PENALTY * metrics['new_layover_stations'])
+        
+        # 减去未覆盖航班惩罚
+        for uncovered_var in self.uncovered_vars.values():
+            if uncovered_var.X > 0.5:
+                final_numerator -= self.UNCOVERED_FLIGHT_PENALTY
+        
+        # 计算原始问题的目标函数值（日均飞时得分）
+        if final_denominator > 1e-9:
+            original_objective = final_numerator / final_denominator
+        else:
+            original_objective = 0.0
+            
+        return pi_duals, sigma_duals, original_objective
     
     def get_solution_summary(self) -> Dict:
         """获取当前解的详细信息"""
@@ -418,9 +465,27 @@ class DinkelbachOptimizer:
             if uncovered_var.X > 0.5:
                 uncovered_flights += 1
         
-        # 计算最终得分
-        avg_daily_flight_hours = total_flight_hours / total_duty_days if total_duty_days > 0 else 0
-        final_score = avg_daily_flight_hours * 1000 - uncovered_flights * self.UNCOVERED_FLIGHT_PENALTY
+        # 计算最终得分（原始问题的目标函数值：日均飞时得分）
+        # 原始问题目标函数：(100 * 总飞行时间 - 各种惩罚项) / 总值勤天数
+        total_penalties = 0.0
+        
+        # 计算所有惩罚项
+        for roster in selected_rosters:
+            metrics = roster.metrics
+            total_penalties += (self.POSITIONING_PENALTY * metrics['positioning_count'] +
+                               self.AWAY_OVERNIGHT_PENALTY * metrics['away_overnight_days'] +
+                               self.NEW_LAYOVER_PENALTY * metrics['new_layover_stations'])
+        
+        # 加上未覆盖航班惩罚
+        total_penalties += uncovered_flights * self.UNCOVERED_FLIGHT_PENALTY
+        
+        # 计算原始问题的目标函数值（日均飞时得分）
+        if total_duty_days > 0:
+            final_score = (100 * total_flight_hours - total_penalties) / total_duty_days
+            avg_daily_flight_hours = total_flight_hours / total_duty_days
+        else:
+            final_score = 0.0
+            avg_daily_flight_hours = 0.0
         
         return {
             'selected_rosters': selected_rosters,

@@ -142,10 +142,30 @@ debug/
 output/
 *.log
 
+# Gurobi model files
+*.lp
+*.mps
+*.sol
+*.ilp
+
+# Optimization results
+rosterResult_*.csv
+crew_detail_*.csv
+test_report.csv
+optimization_*.log
+
+# Model checkpoints
+models/*.pth
+!models/best_model.pth
+
 # Temporary files
 *.tmp
 *.temp
 *~
+
+# Submit directories (keep structure but ignore content)
+submit/*/
+!submit/.gitkeep
 
 # OS generated files
 .DS_Store

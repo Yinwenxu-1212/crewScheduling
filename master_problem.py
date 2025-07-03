@@ -8,9 +8,10 @@ from data_models import Flight, Roster, Crew
 from dinkelbach_optimizer import DinkelbachOptimizer
 
 class MasterProblem:
-    def __init__(self, flights: List[Flight], crews: List[Crew]):
+    def __init__(self, flights: List[Flight], crews: List[Crew], ground_duties: List = None):
         self.flights = flights
         self.crews = crews
+        self.ground_duties = ground_duties or []
         
         # 使用Dinkelbach优化器替代原来的简单模型
         self.dinkelbach_optimizer = DinkelbachOptimizer(flights, crews)
@@ -61,6 +62,33 @@ class MasterProblem:
 
     def solve_bip(self):
         print("正在求解最终的BIP模型...")
+        
+        # 将所有变量设置为二进制
+        for var in self.roster_vars.values():
+            var.vtype = GRB.BINARY
+        for var in self.uncovered_vars.values():
+            var.vtype = GRB.BINARY
+        
+        # 在整数规划阶段，确保占位任务强制执行约束为等式
+        for ground_duty in self.ground_duties:
+            if ground_duty.id in self.dinkelbach_optimizer.ground_duty_constraints:
+                # 移除旧的>=约束
+                old_constr = self.dinkelbach_optimizer.ground_duty_constraints[ground_duty.id]
+                self.model.remove(old_constr)
+                
+                # 收集所有包含此占位任务的roster变量
+                covering_vars = []
+                for r, v in self.roster_vars.items():
+                    if any(hasattr(task, 'id') and task.id == ground_duty.id for task in r.duties):
+                        covering_vars.append(v)
+                
+                # 添加强制执行约束：sum(所有包含此占位任务的rosters) == 1
+                if covering_vars:  # 只有当存在包含该占位任务的roster时才添加约束
+                    self.dinkelbach_optimizer.ground_duty_constraints[ground_duty.id] = self.model.addConstr(
+                        gp.quicksum(covering_vars) == 1,
+                        name=f"ground_duty_force_{ground_duty.id}"
+                    )
+        
         self.model.optimize()
         return self.model
 

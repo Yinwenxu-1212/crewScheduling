@@ -138,14 +138,7 @@ class CoverageValidator:
             coverage_gap = self.min_coverage_rate - validation_result['coverage_rate']
             needed_flights = int(coverage_gap * validation_result['total_flights']) + 1
             
-            suggestions.append(f"需要额外覆盖至少 {needed_flights} 个航班才能达到要求")
-            suggestions.append("建议检查以下方面:")
-            suggestions.append("1. 机组资质匹配 - 确保有足够的合格机组")
-            suggestions.append("2. 时间约束 - 检查FDP和休息时间限制")
-            suggestions.append("3. 地点衔接 - 优化机组的地理位置安排")
-            suggestions.append("4. 任务分配策略 - 调整贪心算法的优先级")
-            suggestions.append("5. 增加机组数量 - 如果约束允许")
-            
+            suggestions.append(f"需要额外覆盖至少 {needed_flights} 个航班才能达到要求")        
             # 分析未覆盖航班的特征
             uncovered = validation_result['uncovered_flights']
             if uncovered:

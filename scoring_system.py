@@ -13,7 +13,7 @@
 
 from datetime import datetime, timedelta
 from typing import List, Dict, Set
-from data_models import Flight, Roster, Crew, LayoverStation
+from data_models import Flight, Roster, Crew, LayoverStation, BusInfo, GroundDuty
 
 class ScoringSystem:
     def __init__(self, flights: List[Flight], crews: List[Crew], layover_stations):
@@ -26,8 +26,8 @@ class ScoringSystem:
             self.layover_stations_set = {station.airport for station in layover_stations}
         
         # 评分参数
-        self.FLY_TIME_MULTIPLIER = 1000
-        self.UNCOVERED_FLIGHT_PENALTY = -5   # 未覆盖航班惩罚
+        self.FLY_TIME_MULTIPLIER = 50
+        self.UNCOVERED_FLIGHT_PENALTY = -500   # 未覆盖航班惩罚（大幅增加以提高覆盖率）
         self.NEW_LAYOVER_STATION_PENALTY = -10
         self.AWAY_OVERNIGHT_PENALTY = -0.5
         self.POSITIONING_PENALTY = -0.5
@@ -36,7 +36,7 @@ class ScoringSystem:
     def calculate_roster_score(self, roster: Roster, crew: Crew) -> float:
         """
         计算单个排班方案的得分，严格按照赛题评分公式
-        返回正值作为成本（用于最小化目标函数）
+        返回正值作为成本（用于最小化目标函数）使用满足覆盖率要求的初始解作为最终输出
         
         评分公式：
         1. 值勤日日均飞时得分 = 值勤日日均飞时 * 1000
@@ -177,7 +177,7 @@ class ScoringSystem:
         avg_daily_fly_time = total_flight_hours / total_duty_days if total_duty_days > 0 else 0
         
         # 按照赛题公式计算得分
-        fly_time_score = avg_daily_fly_time * 1000  # 值勤日日均飞时 * 1000
+        fly_time_score = avg_daily_fly_time * self.FLY_TIME_MULTIPLIER  # 值勤日日均飞时 * FLY_TIME_MULTIPLIER
         new_layover_penalty = len(new_layover_stations) * (-10)  # 每个新增过夜站点扣10分
         away_overnight_penalty = away_overnight_days * (-0.5)  # 每天外站过夜扣0.5分
         positioning_penalty = positioning_count * (-0.5)  # 每个置位扣0.5分
@@ -302,8 +302,8 @@ class ScoringSystem:
         total_duty_days = len(all_duty_calendar_days)
         avg_daily_fly_time = total_flight_hours / total_duty_days if total_duty_days > 0 else 0
         
-        fly_time_score = avg_daily_fly_time * 1000  # 值勤日日均飞时 * 1000
-        uncovered_penalty = uncovered_flights * (-5)  # 每个未覆盖航班扣5分
+        fly_time_score = avg_daily_fly_time * self.FLY_TIME_MULTIPLIER  # 值勤日日均飞时 * FLY_TIME_MULTIPLIER
+        uncovered_penalty = uncovered_flights * self.UNCOVERED_FLIGHT_PENALTY  # 每个未覆盖航班惩罚
         new_layover_penalty = len(new_layover_stations) * (-10)  # 每个新增过夜站点扣10分
         away_overnight_penalty = away_overnight_days * (-0.5)  # 每天外站过夜扣0.5分
         positioning_penalty = positioning_count * (-0.5)  # 每个置位扣0.5分
@@ -337,14 +337,15 @@ class ScoringSystem:
         """
         if not roster.duties:
             return {
-                'total_cost': -crew_sigma_dual,
+                'total_cost': 0.0,  # c_j = 0 for empty roster
                 'flight_reward': 0.0,
                 'dual_price_total': 0.0,
+                'dual_contribution': crew_sigma_dual,  # π^T A_j = crew_sigma_dual
                 'positioning_penalty': 0.0,
                 'overnight_penalty': 0.0,
                 'other_costs': 0.0,
                 'crew_sigma_dual': crew_sigma_dual,
-                'reduced_cost': -crew_sigma_dual,
+                'reduced_cost': 0.0 - crew_sigma_dual,  # c_j - π^T A_j = 0 - crew_sigma_dual
                 'flight_count': 0,
                 'total_flight_hours': 0.0,
                 'duty_days': 0,
@@ -378,10 +379,11 @@ class ScoringSystem:
         total_duty_days = len(duty_calendar_days)  # 这个roster的值勤天数
         avg_daily_flight_hours = total_flight_hours / total_duty_days if total_duty_days > 0 else 0.0
         
-        # 新的Dinkelbach算法中的目标函数系数：1000 * C_p - lambda_k * d_p
+        # 新的Dinkelbach算法中的目标函数系数：FLY_TIME_MULTIPLIER * C_p - lambda_k * d_p
         # 其中C_p是总飞行时间，d_p是值勤天数
-        # lambda_k不需要乘以1000系数
-        flight_reward = -(1000 * total_flight_hours - lambda_k * total_duty_days)  # 负值表示奖励
+        # lambda_k不需要乘以FLY_TIME_MULTIPLIER系数
+        # 在列生成中，这应该是成本，所以不加负号
+        flight_reward = self.FLY_TIME_MULTIPLIER * total_flight_hours - lambda_k * total_duty_days
         
         # 2. 计算对偶价格收益
         dual_price_total = 0.0
@@ -393,12 +395,18 @@ class ScoringSystem:
         positioning_penalty = 0.0
         positioning_count = 0
         for duty in roster.duties:
-            if hasattr(duty, 'type') and 'positioning' in str(duty.type):
-                positioning_penalty += 0.5  # PENALTY_PER_POSITIONING
-                positioning_count += 1
-            elif not isinstance(duty, Flight):  # 假设非Flight任务为置位
+            if isinstance(duty, Flight):
+                # 检查是否为置位航班（根据任务类型判断）
+                if hasattr(duty, 'type') and 'positioning' in duty.type:
+                    positioning_penalty += 0.5
+                    positioning_count += 1
+            elif isinstance(duty, BusInfo):
+                # 巴士任务（地面交通）- 在attention模块中标记为positioning_bus
                 positioning_penalty += 0.5
                 positioning_count += 1
+            elif isinstance(duty, GroundDuty):
+                # 地面值勤任务（培训、待命等），不是置位
+                pass
         
         # 4. 计算外站过夜惩罚
         overnight_penalty = 0.0
@@ -444,13 +452,18 @@ class ScoringSystem:
                 other_costs += duty.cost
         
         # 6. 计算总成本和reduced cost
-        total_cost = flight_reward - dual_price_total + positioning_penalty + overnight_penalty + other_costs
-        reduced_cost = total_cost - crew_sigma_dual
+        # 修正reduced cost计算公式: c_j - π^T A_j
+        # c_j = 原始成本 (flight_reward - penalties，因为penalties是正值但应该减少成本)
+        # π^T A_j = 对偶价格贡献 (dual_price_total + crew_sigma_dual)
+        total_cost = flight_reward - positioning_penalty - overnight_penalty + other_costs
+        dual_contribution = dual_price_total + crew_sigma_dual
+        reduced_cost = total_cost - dual_contribution
         
         return {
             'total_cost': total_cost,
             'flight_reward': flight_reward,
             'dual_price_total': dual_price_total,
+            'dual_contribution': dual_contribution,
             'positioning_penalty': positioning_penalty,
             'overnight_penalty': overnight_penalty,
             'other_costs': other_costs,
@@ -466,9 +479,11 @@ class ScoringSystem:
     
     def _check_roster_violations(self, roster: Roster, crew: Crew) -> int:
         """
-        检查排班方案的违规情况，返回违规次数
-        基于竞赛规则实现完整的违规检查
+        检查排班方案的违规情况
+        使用新的FDP和DutyDay概念
         """
+        from data_models import DutyDay, FlightDutyPeriod
+        
         if not roster.duties:
             return 0
         
@@ -477,44 +492,305 @@ class ScoringSystem:
         # 按时间排序任务
         sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
         
-        # 识别飞行值勤期（FDP）
-        fdps = self._identify_flight_duty_periods(sorted_duties)
+        # 组织任务为值勤日
+        duty_days = self._organize_into_duty_days(sorted_duties)
         
-        # 检查每个FDP的违规情况
+        # 检查每个值勤日和其中的FDP
         total_flight_duty_time = 0.0
-        for fdp in fdps:
-            fdp_violations = self._check_fdp_violations(fdp)
-            violations += fdp_violations
+        all_fdps = []
+        
+        for duty_day in duty_days:
+            # 组织值勤日中的FDP
+            duty_day.organize_into_fdps()
             
-            # 计算FDP的飞行值勤时间
-            if fdp:
-                fdp_start = getattr(fdp[0], 'std', getattr(fdp[0], 'startTime', None))
-                fdp_end = getattr(fdp[-1], 'sta', getattr(fdp[-1], 'endTime', None))
-                if fdp_start and fdp_end:
-                    fdp_duration = (fdp_end - fdp_start).total_seconds() / 3600.0
-                    total_flight_duty_time += fdp_duration
+            # 检查每个FDP的违规情况
+            for fdp in duty_day.fdps:
+                if fdp.is_valid():
+                    violations += fdp.violates_constraints()
+                    total_flight_duty_time += fdp.duty_time / 60.0  # 转换为小时
+                    all_fdps.append(fdp)
         
         # 检查飞行周期违规
-        cycle_violations = self._check_flight_cycle_violations(sorted_duties, crew)
+        cycle_violations = self._check_flight_cycle_violations_new(duty_days, crew)
         violations += cycle_violations
         
-        # 检查总飞行值勤时间限制（规则3.5）
+        # 检查总飞行值勤时间限制（规则9）
         if total_flight_duty_time > 60:  # 60小时限制
             violations += 1
         
-        # 检查休息时间违规
-        rest_violations = self._check_rest_time_violations(fdps)
+        # 检查FDP间休息时间违规
+        rest_violations = self._check_fdp_rest_violations(all_fdps)
         violations += rest_violations
         
-        # 检查值四修二工作模式违规（新增）
+        # 检查值四修二工作模式违规
         work_pattern_violations = self._check_work_rest_pattern_violations(sorted_duties, crew)
         violations += work_pattern_violations
+        
+        # 检查地点衔接规则违规
+        location_violations = self._check_location_connection_violations(sorted_duties, crew)
+        violations += location_violations
+
+        return violations
+    
+    def _check_location_connection_violations(self, sorted_duties: List, crew: Crew) -> int:
+        """
+        检查地点衔接规则违规
+        规则2: 地点衔接规则
+        - 第一个任务的出发地必须是机组驻留地
+        - 相邻任务的到达地和出发地必须一致
+        """
+        violations = 0
+        
+        if not sorted_duties:
+            return violations
+        
+        # 检查第一个任务的出发地是否为机组驻留地
+        first_task = sorted_duties[0]
+        first_departure = None
+        
+        if hasattr(first_task, 'depaAirport'):
+            first_departure = first_task.depaAirport
+        elif hasattr(first_task, 'startLocation'):
+            first_departure = first_task.startLocation
+        elif hasattr(first_task, 'airport'):
+            first_departure = first_task.airport
+        
+        # 检查第一个任务出发地是否为机组驻留地
+        crew_stay_station = getattr(crew, 'stayStation', None) or getattr(crew, 'baseAirport', None)
+        if first_departure and crew_stay_station and first_departure != crew_stay_station:
+            violations += 1
+        
+        # 检查相邻任务的地点衔接
+        for i in range(len(sorted_duties) - 1):
+            curr_task = sorted_duties[i]
+            next_task = sorted_duties[i + 1]
+            
+            # 获取当前任务的到达地
+            curr_arrival = None
+            if hasattr(curr_task, 'arriAirport'):
+                curr_arrival = curr_task.arriAirport
+            elif hasattr(curr_task, 'endLocation'):
+                curr_arrival = curr_task.endLocation
+            elif hasattr(curr_task, 'airport'):
+                curr_arrival = curr_task.airport
+            
+            # 获取下一个任务的出发地
+            next_departure = None
+            if hasattr(next_task, 'depaAirport'):
+                next_departure = next_task.depaAirport
+            elif hasattr(next_task, 'startLocation'):
+                next_departure = next_task.startLocation
+            elif hasattr(next_task, 'airport'):
+                next_departure = next_task.airport
+            
+            # 检查地点衔接
+            if curr_arrival and next_departure and curr_arrival != next_departure:
+                violations += 1
+        
+        return violations
+    
+    def _organize_into_duty_days(self, sorted_duties: List) -> List:
+        """
+        将任务组织为值勤日
+        根据比赛定义：值勤日是一连串值勤任务，不等同于日历日
+        值勤日之间需要有足够的休息时间间隔
+        """
+        from data_models import DutyDay
+        from datetime import timedelta
+        
+        if not sorted_duties:
+            return []
+            
+        duty_days = []
+        current_day = DutyDay()
+        
+        for i, duty in enumerate(sorted_duties):
+            duty_start = getattr(duty, 'std', getattr(duty, 'startTime', None))
+            
+            if not duty_start:
+                continue
+                
+            # 如果是第一个任务，直接加入当前值勤日
+            if i == 0:
+                current_day.add_task(duty)
+                continue
+                
+            # 检查与前一个任务的时间间隔
+            prev_duty = sorted_duties[i-1]
+            prev_end = getattr(prev_duty, 'sta', getattr(prev_duty, 'endTime', None))
+            
+            if prev_end and duty_start:
+                rest_interval = duty_start - prev_end
+                
+                # 判断是否需要开始新的值勤日
+                # 规则：如果休息时间超过12小时，或者值勤日已超过24小时，开始新值勤日
+                should_start_new_duty_day = False
+                
+                # 1. 休息时间超过12小时
+                if rest_interval >= timedelta(hours=12):
+                    should_start_new_duty_day = True
+                    
+                # 2. 当前值勤日已经超过24小时
+                elif current_day.start_time and (duty_start - current_day.start_time) > timedelta(hours=24):
+                    should_start_new_duty_day = True
+                    
+                # 3. 跨越了太多日历日（超过2个日历日）
+                elif (current_day.start_time and 
+                      (duty_start.date() - current_day.start_time.date()).days > 1):
+                    should_start_new_duty_day = True
+                
+                if should_start_new_duty_day:
+                    # 结束当前值勤日，开始新的值勤日
+                    if current_day.tasks:
+                        duty_days.append(current_day)
+                    current_day = DutyDay()
+            
+            current_day.add_task(duty)
+        
+        # 添加最后一个值勤日
+        if current_day.tasks:
+            duty_days.append(current_day)
+        
+        # 如果有可过夜机场数据，更新所有值勤日的飞行值勤日状态
+        if hasattr(self, 'layover_stations_set') and self.layover_stations_set:
+            for duty_day in duty_days:
+                duty_day.set_layover_stations(self.layover_stations_set)
+        
+        return duty_days
+    
+    def _check_flight_cycle_violations_new(self, duty_days: List, crew: Crew) -> int:
+        """
+        检查飞行周期违规（基于正确的值勤日概念）
+        飞行周期定义：
+        1. 由值勤日组成（可能包含少于2个完整日历日的休息）
+        2. 必须包含飞行值勤日
+        3. 飞行周期末尾一定为飞行值勤日
+        4. 最多横跨4个日历日
+        5. 开始前必须连续休息2个完整日历日
+        """
+        violations = 0
+        current_cycle_duty_days = []
+        last_cycle_end_date = None
+        
+        for i, duty_day in enumerate(duty_days):
+            # 检查是否为飞行值勤日
+            if duty_day.is_flight_duty_day:
+                # 如果当前没有活跃的飞行周期，开始新的飞行周期
+                if not current_cycle_duty_days:
+                    # 检查开始前的休息要求（2个完整日历日）
+                    if last_cycle_end_date and duty_day.start_date:
+                        rest_days = (duty_day.start_date - last_cycle_end_date).days
+                        if rest_days < 2:
+                            violations += 1
+                    
+                    current_cycle_duty_days = [duty_day]
+                else:
+                    # 继续当前飞行周期
+                    current_cycle_duty_days.append(duty_day)
+                
+                # 检查是否返回基地（飞行周期结束）
+                last_task = duty_day.tasks[-1] if duty_day.tasks else None
+                if last_task and hasattr(last_task, 'arriAirport'):
+                    if last_task.arriAirport == crew.baseAirport:
+                        # 返回基地，结束当前飞行周期
+                        cycle_violations = self._validate_flight_cycle(current_cycle_duty_days)
+                        violations += cycle_violations
+                        
+                        last_cycle_end_date = duty_day.end_date
+                        current_cycle_duty_days = []
+            else:
+                # 非飞行值勤日
+                if current_cycle_duty_days:
+                    # 检查是否可以加入当前飞行周期（少于2个完整日历日的休息）
+                    last_flight_duty = current_cycle_duty_days[-1]
+                    if (duty_day.start_date and last_flight_duty.end_date and
+                        (duty_day.start_date - last_flight_duty.end_date).days < 2):
+                        # 可以加入当前飞行周期
+                        current_cycle_duty_days.append(duty_day)
+                    else:
+                        # 休息时间过长，当前飞行周期异常结束（末尾不是飞行值勤日）
+                        violations += 1  # 飞行周期末尾必须是飞行值勤日
+                        current_cycle_duty_days = []
+        
+        # 检查最后一个未完成的周期
+        if current_cycle_duty_days:
+            # 检查最后一个值勤日是否为飞行值勤日
+            if not current_cycle_duty_days[-1].is_flight_duty_day:
+                violations += 1  # 飞行周期末尾必须是飞行值勤日
+            
+            cycle_violations = self._validate_flight_cycle(current_cycle_duty_days)
+            violations += cycle_violations
+        
+        return violations
+    
+    def _validate_flight_cycle(self, cycle_duty_days: List) -> int:
+        """
+        验证单个飞行周期的完整性
+        根据比赛定义检查飞行周期约束
+        """
+        violations = 0
+        
+        if not cycle_duty_days:
+            return violations
+        
+        # 规则1: 飞行周期必须包含飞行值勤日
+        has_flight_duty_day = any(duty_day.is_flight_duty_day for duty_day in cycle_duty_days)
+        if not has_flight_duty_day:
+            violations += 1
+        
+        # 规则2: 飞行周期末尾必须是飞行值勤日
+        if not cycle_duty_days[-1].is_flight_duty_day:
+            violations += 1
+        
+        # 规则3: 飞行周期最多横跨4个日历日
+        if cycle_duty_days:
+            start_date = cycle_duty_days[0].start_date
+            end_date = cycle_duty_days[-1].end_date
+            
+            if start_date and end_date:
+                calendar_days_span = (end_date - start_date).days + 1
+                if calendar_days_span > 4:
+                    violations += 1
+        
+        # 规则4: 检查飞行周期内值勤日之间的休息间隔
+        for i in range(1, len(cycle_duty_days)):
+            prev_duty = cycle_duty_days[i-1]
+            curr_duty = cycle_duty_days[i]
+            
+            if (prev_duty.end_date and curr_duty.start_date and
+                prev_duty.end_date != curr_duty.start_date):
+                # 如果不是连续的值勤日，检查休息时间
+                rest_days = (curr_duty.start_date - prev_duty.end_date).days
+                if rest_days >= 2:
+                    # 休息时间过长，不应该在同一个飞行周期内
+                    violations += 1
+        
+        return violations
+    
+    def _check_fdp_rest_violations(self, fdps: List) -> int:
+        """
+        检查FDP间休息时间违规
+        """
+        violations = 0
+        
+        for i in range(1, len(fdps)):
+            prev_fdp = fdps[i-1]
+            curr_fdp = fdps[i]
+            
+            if prev_fdp.tasks and curr_fdp.tasks:
+                prev_end = getattr(prev_fdp.tasks[-1], 'sta', getattr(prev_fdp.tasks[-1], 'endTime', None))
+                curr_start = getattr(curr_fdp.tasks[0], 'std', getattr(curr_fdp.tasks[0], 'startTime', None))
+                
+                if prev_end and curr_start:
+                    rest_time = (curr_start - prev_end).total_seconds() / 3600.0
+                    if rest_time < 12:  # FDP间至少12小时休息
+                        violations += 1
         
         return violations
     
     def _identify_flight_duty_periods(self, sorted_duties: List) -> List[List]:
         """
-        识别飞行值勤期（FDP）
+        识别飞行值勤期（FDP）- 保留旧方法以兼容
         FDP是连续的飞行任务和相关的地面任务组合
         """
         fdps = []
