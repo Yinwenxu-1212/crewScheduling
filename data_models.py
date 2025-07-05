@@ -360,7 +360,7 @@ class Roster:
         self.is_ddh = 'DDH' in str(duties)
 
     def __repr__(self):
-        duty_repr = ", ".join([d.flightNo if isinstance(d, Flight) else d.task if isinstance(d, GroundDuty) else type(d).__name__ for d in self.duties])
+        duty_repr = ", ".join([d.flightNo if isinstance(d, Flight) else d.id if isinstance(d, GroundDuty) else type(d).__name__ for d in self.duties])
         return f"Roster(Crew: {self.crew_id}, Cost: {self.cost:.2f}, Duties: [{duty_repr}])"
 
 # --- Helper classes for the subproblem solver ---

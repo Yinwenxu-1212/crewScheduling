@@ -7,6 +7,7 @@ from data_models import Crew, Flight, BusInfo, GroundDuty, Node, Roster, RestPer
 from typing import List, Dict, Set, Optional
 import csv
 import os
+from unified_config import config
 
 # --- 全局变量，用于ML数据收集 ---
 TRAINING_DATA_FILE = 'subproblem_training_data.csv'
@@ -21,9 +22,11 @@ CSV_HEADER = [
     'next_task_dual_price',
     'label'
 ]
-REWARD_PER_FLIGHT_HOUR = -100  
-PENALTY_PER_AWAY_OVERNIGHT = 0.5
-PENALTY_PER_POSITIONING = 0.5
+# 使用统一配置的参数
+optimization_params = config.get_optimization_params()
+REWARD_PER_FLIGHT_HOUR = -optimization_params['flight_time_reward']  # 注意：子问题中使用负值
+PENALTY_PER_AWAY_OVERNIGHT = optimization_params['away_overnight_penalty']
+PENALTY_PER_POSITIONING = optimization_params['positioning_penalty']
 
 # --- 规则常数 ---
 MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT = timedelta(minutes=30)  # 飞机尾号相同时的最小衔接时间
@@ -116,10 +119,11 @@ def solve_subproblem_for_crew(
     flights_by_id = {f.id: f for f in all_flights}
     qualified_flight_ids = crew_leg_match_dict.get(crew.crewId, [])
     crew_flights = [flights_by_id[fid] for fid in qualified_flight_ids if fid in flights_by_id]
-     # --- 【GroundDuty】区分处理“值勤占位”和“休息占位” ---
-    # “值勤占位”(isDuty=True)是可连接的任务
+     # --- 【GroundDuty】区分处理"值勤占位"和"休息占位" ---
+    # 注意：GroundDuty是占位任务，不是置位任务。置位任务包括飞行置位和大巴置位(BusInfo)
+    # "值勤占位"(isDuty=True)是可连接的任务
     schedulable_ground_duties = [gd for gd in all_crew_ground_duties if gd.isDuty and gd.crewId == crew.crewId]
-    # “休息占位”(isDuty=False)或其他机长的任务，是需要避开的障碍
+    # "休息占位"(isDuty=False)或其他机长的任务，是需要避开的障碍
     conflicting_ground_duties = [gd for gd in all_crew_ground_duties if not gd.isDuty and gd.crewId == crew.crewId]
 
     all_tasks = [{'task': f, 'type': 'flight'} for f in crew_flights] + \
@@ -212,7 +216,7 @@ def solve_subproblem_for_crew(
                     to_airport=task_dep_station,
                     earliest_start=current_label.node.time,
                     all_bus=all_bus_info,
-                    all_ddh=[f for f in crew_flights if f.flightNo.startswith("DH")]
+                    all_ddh=crew_flights  # 所有航班都可以用作置位，不只是DDH开头的
                 )
 
                 for pos_task in positioning_tasks:
@@ -327,10 +331,12 @@ def solve_subproblem_for_crew(
                 new_duty_flight_time += task.flyTime
                 new_duty_flight_count += 1
                 new_total_flight_hours += task.flyTime / 60.0
-            else: # Bus
-                # --- 置位任务成本为0，仅作为连接手段 ---
+            else: # Bus或GroundDuty
+                # --- 大巴置位任务(BusInfo)成本为0，仅作为连接手段 ---
+                # --- GroundDuty是占位任务，不是置位任务，但在此处统一处理 ---
                 cost_increase += 0
-                new_total_positioning += 1
+                if task_info['type'] == 'bus':  # 只有大巴置位才计入置位次数
+                    new_total_positioning += 1
 
             new_duty_task_count += 1
             

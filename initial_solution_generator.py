@@ -6,6 +6,7 @@ import os
 from data_models import Flight, Crew, BusInfo, GroundDuty, Roster
 from scoring_system import ScoringSystem
 from results_writer import write_results_to_csv
+from constraint_checker import UnifiedConstraintChecker
 
 # FDP (Flight Duty Period) Rules - Centralized Configuration
 FDP_RULES = {
@@ -55,8 +56,8 @@ def can_assign_task_greedy(crew, task, task_type, crew_leg_matches_set, layover_
     if task_type == "flight" and (crew.crewId, task.id) not in crew_leg_matches_set:
         return False # 机组与航班不匹配
 
-    task_start_time = task.std if task_type == "flight" else (task.td if task_type == "bus" else task.startTime)
-    task_end_time = task.sta if task_type == "flight" else (task.ta if task_type == "bus" else task.endTime)
+    task_start_time = task.std if task_type == "flight" else (task.startTime if task_type == "bus" else task.startTime)
+    task_end_time = task.sta if task_type == "flight" else (task.endTime if task_type == "bus" else task.endTime)
     task_origin = task.depaAirport if task_type == "flight" else (task.depaAirport if task_type == "bus" else task.airport)
     task_destination = task.arriAirport if task_type == "flight" else (task.arriAirport if task_type == "bus" else task.airport)
     flight_duration = timedelta(minutes=task.flyTime) if task_type == "flight" else timedelta(0)
@@ -315,6 +316,7 @@ def assign_task_greedy(crew, task, task_type, start_date): # task可以是Flight
     crew.last_activity_end_location = task_destination
     crew.last_activity_aircraft_no = task_aircraft_no
 
+    # 更新占位任务状态（groundDuty是占位任务，不是置位任务）
     if task_type == "ground_duty":
         crew.is_on_ground_duty = True
         crew.current_ground_duty_end_time = task_end_time
@@ -330,6 +332,7 @@ def generate_initial_rosters_with_heuristic(
 ) -> List[Roster]:
     """
     使用与crew_scheduling_solver.py相同的贪心启发式算法生成初始解。
+    地面值勤任务必须分配给预定义的机组。
     """
     print("正在使用启发式算法生成初始解...")
     
@@ -354,9 +357,14 @@ def generate_initial_rosters_with_heuristic(
     # 构建layover_stations_set (简化处理)
     layover_stations_set = set()
     
+    # 创建地面值勤到机组的映射
+    ground_duty_to_crew = {gd.id: gd.crewId for gd in ground_duties}
+    print(f"地面值勤预定义分配数量: {len(ground_duty_to_crew)}")
+    
     initial_rosters = []
     all_tasks = []
     for f in flights: all_tasks.append({'task_obj': f, 'type': 'flight', 'start_time': f.std, 'id': f.id, 'priority': 1})
+    # groundDuty是占位任务，不是置位任务 - 但必须分配给预定义的机组
     for gd in ground_duties: all_tasks.append({'task_obj': gd, 'type': 'ground_duty', 'start_time': gd.startTime, 'id': ('gd', gd.id), 'priority': 2})
     for bi in bus_info: all_tasks.append({'task_obj': bi, 'type': 'bus', 'start_time': bi.startTime, 'id': ('bus', bi.id), 'priority': 3})
     
@@ -402,6 +410,13 @@ def generate_initial_rosters_with_heuristic(
                 task_id = task_info['id']
 
                 if task_id in unassigned_task_ids:
+                    # 对于地面值勤任务，检查是否分配给了正确的机组
+                    if task_type == 'ground_duty':
+                        ground_duty_id = task_obj.id
+                        expected_crew_id = ground_duty_to_crew.get(ground_duty_id)
+                        if expected_crew_id != crew.crewId:
+                            continue  # 跳过不属于当前机组的地面值勤
+                    
                     if can_assign_task_greedy(crew, task_obj, task_type, crew_leg_matches_set, layover_stations_set, start_date):
                         best_task_to_assign = task_info
                         break
@@ -426,7 +441,7 @@ def generate_initial_rosters_with_heuristic(
                 scoring_system = ScoringSystem(flights, crews, layover_stations)
                 # 使用calculate_roster_cost_with_dual_prices方法，传入空的对偶价格
                 cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                    roster, crew, {}, 0.0, 0.0
+                    roster, crew, {}, 0.0
                 )
                 roster.cost = cost_details['total_cost']
             else:
@@ -446,6 +461,6 @@ def generate_initial_rosters_with_heuristic(
         os.makedirs(output_dir)
 
     output_path = os.path.join(output_dir, "initial_solution.csv")
-    write_results_to_csv(initial_rosters, output_path)
+    write_results_to_csv(initial_rosters, output_path, None)  # 初始解阶段没有master_problem信息
     
     return initial_rosters

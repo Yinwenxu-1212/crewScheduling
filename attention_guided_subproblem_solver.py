@@ -9,29 +9,283 @@ import torch
 import numpy as np
 import random
 from attention.model import ActorCritic
-from attention import config
+from attention import config as attention_config
 from scoring_system import ScoringSystem
-from unified_constraint_checker import UnifiedConstraintChecker
+from constraint_checker import UnifiedConstraintChecker
+from collections import defaultdict
+import time
 
-# 继承原有的常量和规则
-from subproblem_solver import (
-    TRAINING_DATA_FILE, CSV_HEADER, REWARD_PER_FLIGHT_HOUR, 
-    PENALTY_PER_AWAY_OVERNIGHT, PENALTY_PER_POSITIONING,
-    MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT, MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT, MIN_CONNECTION_TIME_BUS,
-    MAX_DUTY_DAY_HOURS, MIN_REST_HOURS, MAX_FLIGHTS_IN_DUTY, 
-    MAX_TASKS_IN_DUTY, MAX_FLIGHT_TIME_IN_DUTY_HOURS,
-    is_conflicting, find_positioning_tasks
-)
+# 导入统一配置
+from unified_config import config
+
+# 使用统一配置的参数
+optimization_params = config.get_optimization_params()
+REWARD_PER_FLIGHT_HOUR = -optimization_params['flight_time_reward']  # 注意：子问题中使用负值
+PENALTY_PER_AWAY_OVERNIGHT = optimization_params['away_overnight_penalty']
+PENALTY_PER_POSITIONING = optimization_params['positioning_penalty']
+
+# 从统一配置获取约束参数
+constraint_params = config.get_constraint_params()
+MIN_REST_HOURS = constraint_params['min_rest_hours']
+MAX_DUTY_DAY_HOURS = constraint_params['max_duty_day_hours']
+MAX_FLIGHT_TIME_IN_DUTY_HOURS = constraint_params['max_flight_time_in_duty_hours']
 
 # 添加总飞行时间约束常量
 MAX_TOTAL_FLIGHT_HOURS = 60.0  # 计划期内总飞行时间上限（小时）
 
-# 添加缺失的常量定义
-MAX_TASKS_PER_CREW = 50  # 每个机组人员的最大任务数
-MAX_FLIGHTS_PER_CREW = 30  # 每个机组人员的最大飞行数
+# 连接时间常量（从统一配置获取，转换为timedelta）
+MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT = timedelta(minutes=config.MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT_MINUTES)
+MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT = timedelta(hours=config.MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT_HOURS)
+MIN_CONNECTION_TIME_BUS = timedelta(hours=config.MIN_CONNECTION_TIME_BUS_HOURS)
 
 # 从data_models导入Label类
 from data_models import Label
+
+# ===== 性能优化组件 =====
+class ConvergenceManager:
+    """智能收敛管理器"""
+    
+    def __init__(self, improvement_threshold=1e-6, stagnation_limit=5, min_iterations=5):
+        self.obj_history = []
+        self.improvement_threshold = improvement_threshold
+        self.stagnation_limit = stagnation_limit
+        self.min_iterations = min_iterations
+        self.roster_count_history = []
+        
+    def should_terminate(self, current_obj, new_rosters_count, iteration):
+        """智能收敛判断 - 修复过早终止问题"""
+        self.obj_history.append(current_obj)
+        self.roster_count_history.append(new_rosters_count)
+        
+        # 增加最少迭代次数保证，确保充分搜索
+        min_required_iterations = max(self.min_iterations, 10)  # 至少10次迭代
+        if len(self.obj_history) < min_required_iterations:
+            return False
+        
+        # 在早期迭代中更宽松的终止条件
+        if iteration < 20:  # 前20次迭代不轻易终止
+            return False
+        
+        # 检查目标函数改善 - 放宽条件
+        if len(self.obj_history) >= 3:  # 需要更多历史数据
+            recent_improvements = [
+                self.obj_history[i] - self.obj_history[i-1] 
+                for i in range(-2, 0)  # 最近2次改善
+            ]
+            
+            # 只有连续多次无改善且无新roster才考虑终止
+            all_no_improvement = all(imp < self.improvement_threshold for imp in recent_improvements)
+            recent_no_rosters = sum(self.roster_count_history[-3:]) == 0  # 最近3轮无roster
+            
+            if all_no_improvement and recent_no_rosters:
+                return True
+        
+        # 检查长期停滞 - 增加停滞轮数要求
+        extended_stagnation_limit = max(self.stagnation_limit, 8)  # 至少8轮停滞
+        if len(self.obj_history) >= extended_stagnation_limit:
+            recent_objs = self.obj_history[-extended_stagnation_limit:]
+            recent_max = max(recent_objs)
+            recent_min = min(recent_objs)
+            
+            # 目标函数变化很小
+            if recent_max - recent_min < self.improvement_threshold:
+                # 同时检查roster生成情况 - 更严格的条件
+                recent_rosters = sum(self.roster_count_history[-extended_stagnation_limit:])
+                if recent_rosters == 0:  # 完全没有新roster
+                    return True
+        
+        return False
+
+class TaskIndexManager:
+    """任务索引管理器 - 高效的任务查找和过滤"""
+    
+    def __init__(self):
+        self.tasks_by_time_hour = defaultdict(list)
+        self.tasks_by_location = defaultdict(list)
+        self.tasks_by_day = defaultdict(list)
+        self.tasks_by_type = defaultdict(list)
+        self.eligible_tasks_cache = {}
+        self.all_tasks = []
+        
+    def preprocess_tasks(self, all_tasks):
+        """预处理任务，建立多维索引"""
+        self.all_tasks = all_tasks
+        
+        for task in all_tasks:
+            task_start = task['startTime']
+            
+            # 按小时索引
+            hour_key = task_start.hour
+            self.tasks_by_time_hour[hour_key].append(task)
+            
+            # 按日期索引
+            date_key = task_start.date()
+            self.tasks_by_day[date_key].append(task)
+            
+            # 按出发机场索引
+            depa_airport = task['depaAirport']
+            self.tasks_by_location[depa_airport].append(task)
+            
+            # 按任务类型索引
+            task_type = task['type']
+            self.tasks_by_type[task_type].append(task)
+    
+    def get_time_filtered_tasks(self, current_time, time_window_hours=48):
+        """获取时间窗口内的任务"""
+        candidates = []
+        end_time = current_time + timedelta(hours=time_window_hours)
+        
+        # 按日期快速过滤
+        current_date = current_time.date()
+        end_date = end_time.date()
+        
+        date = current_date
+        while date <= end_date:
+            if date in self.tasks_by_day:
+                for task in self.tasks_by_day[date]:
+                    if current_time <= task['startTime'] <= end_time:
+                        candidates.append(task)
+            date += timedelta(days=1)
+        
+        return candidates
+    
+    def get_candidates_optimized(self, current_label, crew, time_window_hours=48):
+        """优化的候选任务获取"""
+        current_time = current_label.node.time
+        current_airport = current_label.node.airport
+        used_task_ids = current_label.used_task_ids
+        
+        # 构建缓存键
+        cache_key = (
+            current_airport,
+            int(current_time.timestamp()) // 3600,  # 小时级别
+            len(used_task_ids),
+            bool(current_label.duty_start_time)
+        )
+        
+        # 检查缓存
+        if cache_key in self.eligible_tasks_cache:
+            cached_candidates = self.eligible_tasks_cache[cache_key]
+            # 过滤已使用的任务
+            return [task for task in cached_candidates if task['taskId'] not in used_task_ids]
+        
+        # 第一步：时间过滤
+        time_candidates = self.get_time_filtered_tasks(current_time, time_window_hours)
+        
+        # 第二步：地点过滤（包含可达性检查）
+        reachable_airports = self._get_reachable_airports(current_airport, current_time)
+        location_candidates = [task for task in time_candidates 
+                             if task['depaAirport'] in reachable_airports]
+        
+        # 第三步：基本可行性过滤
+        feasible_candidates = []
+        for task in location_candidates:
+            if self._basic_feasibility_check(task, current_label, crew):
+                feasible_candidates.append(task)
+        
+        # 缓存结果
+        self.eligible_tasks_cache[cache_key] = feasible_candidates
+        
+        # 最终过滤已使用的任务
+        final_candidates = [task for task in feasible_candidates if task['taskId'] not in used_task_ids]
+        
+        return final_candidates
+    
+    def _get_reachable_airports(self, current_airport, current_time):
+        """获取可达机场（包括需要置位的）"""
+        reachable = {current_airport}
+        
+        # 检查是否可以通过置位到达其他机场
+        positioning_tasks = self.tasks_by_type.get('positioning_bus', [])
+        
+        for pos_task in positioning_tasks:
+            if (pos_task['depaAirport'] == current_airport and 
+                pos_task['startTime'] >= current_time):
+                reachable.add(pos_task['arriAirport'])
+        
+        return reachable
+    
+    def _basic_feasibility_check(self, task, current_label, crew):
+        """基本可行性检查"""
+        current_time = current_label.node.time
+        
+        # 时间检查
+        if task['startTime'] <= current_time:
+            return False
+        
+        # 连接时间检查
+        connection_time = task['startTime'] - current_time
+        if connection_time < timedelta(minutes=30):  # 最小连接时间
+            return False
+        
+        # 值勤日基本检查
+        if current_label.duty_start_time:
+            # 检查值勤日长度
+            potential_duty_end = task['endTime']
+            duty_length = potential_duty_end - current_label.duty_start_time
+            if duty_length > timedelta(hours=12):  # 最大值勤时间
+                return False
+            
+            # 检查任务数量
+            if current_label.duty_task_count >= 6:  # 最大任务数
+                return False
+            
+            # 检查飞行任务数量
+            if (task['type'] == 'flight' and 
+                current_label.duty_flight_count >= 4):  # 最大飞行任务数
+                return False
+        
+        return True
+    
+    def clear_cache(self):
+        """清理缓存"""
+        self.eligible_tasks_cache.clear()
+
+class StateKeyOptimizer:
+    """状态键优化器"""
+    
+    @staticmethod
+    def get_compact_state_key(current_label):
+        """生成紧凑的状态键"""
+        return (
+            hash(current_label.node.airport) % 10000,  # 机场哈希压缩
+            int(current_label.node.time.timestamp()) // 3600,  # 小时级精度
+            len(current_label.used_task_ids),  # 任务数量而非完整集合
+            bool(current_label.duty_start_time),  # 是否在值勤中
+            current_label.duty_flight_count,
+            int(current_label.total_flight_hours),  # 整数小时数
+            current_label.current_cycle_days,  # 飞行周期天数
+            current_label.duty_days_count  # 值勤日数量
+        )
+
+class MemoryManager:
+    """内存管理器"""
+    
+    def __init__(self, max_visited_states=100000, cleanup_interval=1000):
+        self.max_visited_states = max_visited_states
+        self.cleanup_interval = cleanup_interval
+        self.cleanup_counter = 0
+        
+    def should_cleanup(self, visited_set):
+        """判断是否需要清理内存"""
+        self.cleanup_counter += 1
+        
+        return (len(visited_set) > self.max_visited_states or 
+                self.cleanup_counter % self.cleanup_interval == 0)
+    
+    def cleanup_visited_states(self, visited_set, keep_ratio=0.7):
+        """清理访问状态集合，保留最近的状态"""
+        if len(visited_set) <= self.max_visited_states * keep_ratio:
+            return visited_set
+        
+        # 简单策略：随机保留一部分状态
+        states_list = list(visited_set)
+        keep_count = int(len(states_list) * keep_ratio)
+        
+        random.shuffle(states_list)
+        new_visited = set(states_list[:keep_count])
+        
+        return new_visited
 
 class AttentionGuidedSubproblemSolver:
     """使用注意力模型指导的子问题求解器"""
@@ -42,8 +296,8 @@ class AttentionGuidedSubproblemSolver:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # 增大搜索参数以提高覆盖率
-        self.max_iterations = 1000  # 增加迭代次数
-        self.beam_width = 5  # 增大beam search宽度
+        self.max_iterations = config.MAX_SUBPROBLEM_ITERATIONS  # 使用统一配置的子问题迭代次数
+        self.beam_width = config.BEAM_WIDTH  # 使用统一配置的beam search宽度
         
         # 约束参数
         self.MAX_DUTY_DAY_HOURS = 12.0
@@ -78,9 +332,9 @@ class AttentionGuidedSubproblemSolver:
         
         # 加载预训练的注意力模型
         self.model = ActorCritic(
-            state_dim=config.STATE_DIM,
-            action_dim=config.ACTION_DIM,
-            hidden_dim=config.HIDDEN_DIM
+            state_dim=attention_config.STATE_DIM,
+            action_dim=attention_config.ACTION_DIM,
+            hidden_dim=attention_config.HIDDEN_DIM
         ).to(self.device)
         
         if model_path and os.path.exists(model_path):
@@ -89,45 +343,45 @@ class AttentionGuidedSubproblemSolver:
             # 适配动作特征权重维度
             if 'actor_action_encoder.0.weight' in checkpoint:
                 old_weight = checkpoint['actor_action_encoder.0.weight']  # [256, old_dim]
-                if old_weight.shape[1] != config.ACTION_DIM:
-                    if old_weight.shape[1] > config.ACTION_DIM:
+                if old_weight.shape[1] != attention_config.ACTION_DIM:
+                    if old_weight.shape[1] > attention_config.ACTION_DIM:
                         # 截取前N维，保留最重要的特征
-                        checkpoint['actor_action_encoder.0.weight'] = old_weight[:, :config.ACTION_DIM]
+                        checkpoint['actor_action_encoder.0.weight'] = old_weight[:, :attention_config.ACTION_DIM]
                         if self.debug_log:
-                            self.debug_log.write(f"动作特征维度适配: {old_weight.shape[1]} -> {config.ACTION_DIM}\n")
+                            self.debug_log.write(f"动作特征维度适配: {old_weight.shape[1]} -> {attention_config.ACTION_DIM}\n")
                     else:
                         # 如果旧维度小于新维度，用零填充
-                        new_weight = torch.zeros(old_weight.shape[0], config.ACTION_DIM)
+                        new_weight = torch.zeros(old_weight.shape[0], attention_config.ACTION_DIM)
                         new_weight[:, :old_weight.shape[1]] = old_weight
                         checkpoint['actor_action_encoder.0.weight'] = new_weight
                         if self.debug_log:
-                            self.debug_log.write(f"动作特征维度扩展: {old_weight.shape[1]} -> {config.ACTION_DIM}\n")
+                            self.debug_log.write(f"动作特征维度扩展: {old_weight.shape[1]} -> {attention_config.ACTION_DIM}\n")
             
             # 适配状态特征权重维度
             if 'actor_state_encoder.0.weight' in checkpoint:
                 old_weight = checkpoint['actor_state_encoder.0.weight']  # [256, old_dim]
-                if old_weight.shape[1] != config.STATE_DIM:
-                    if old_weight.shape[1] > config.STATE_DIM:
+                if old_weight.shape[1] != attention_config.STATE_DIM:
+                    if old_weight.shape[1] > attention_config.STATE_DIM:
                         # 截取前N维
-                        checkpoint['actor_state_encoder.0.weight'] = old_weight[:, :config.STATE_DIM]
+                        checkpoint['actor_state_encoder.0.weight'] = old_weight[:, :attention_config.STATE_DIM]
                         if self.debug_log:
-                            self.debug_log.write(f"状态特征维度适配: {old_weight.shape[1]} -> {config.STATE_DIM}\n")
+                            self.debug_log.write(f"状态特征维度适配: {old_weight.shape[1]} -> {attention_config.STATE_DIM}\n")
                     else:
                         # 用零填充
-                        new_weight = torch.zeros(old_weight.shape[0], config.STATE_DIM)
+                        new_weight = torch.zeros(old_weight.shape[0], attention_config.STATE_DIM)
                         new_weight[:, :old_weight.shape[1]] = old_weight
                         checkpoint['actor_state_encoder.0.weight'] = new_weight
                         if self.debug_log:
-                            self.debug_log.write(f"状态特征维度扩展: {old_weight.shape[1]} -> {config.STATE_DIM}\n")
+                            self.debug_log.write(f"状态特征维度扩展: {old_weight.shape[1]} -> {attention_config.STATE_DIM}\n")
             
             # 同样处理critic网络的状态编码器
             if 'critic.0.weight' in checkpoint:
                 old_weight = checkpoint['critic.0.weight']  # [256, old_dim]
-                if old_weight.shape[1] != config.STATE_DIM:
-                    if old_weight.shape[1] > config.STATE_DIM:
-                        checkpoint['critic.0.weight'] = old_weight[:, :config.STATE_DIM]
+                if old_weight.shape[1] != attention_config.STATE_DIM:
+                    if old_weight.shape[1] > attention_config.STATE_DIM:
+                        checkpoint['critic.0.weight'] = old_weight[:, :attention_config.STATE_DIM]
                     else:
-                        new_weight = torch.zeros(old_weight.shape[0], config.STATE_DIM)
+                        new_weight = torch.zeros(old_weight.shape[0], attention_config.STATE_DIM)
                         new_weight[:, :old_weight.shape[1]] = old_weight
                         checkpoint['critic.0.weight'] = new_weight
             
@@ -140,8 +394,21 @@ class AttentionGuidedSubproblemSolver:
                 self.debug_log.write(f"警告：未找到预训练模型 {model_path}，使用随机初始化的模型\n")
         
         # 注意力引导的参数
-        self.max_candidates_per_expansion = 5  # 每次扩展最多考虑的候选任务数
+        self.max_candidates_per_expansion = 8  # 每次扩展最多考虑的候选任务数
         self.use_attention_guidance = True
+        
+        # 初始化优化组件
+        self.convergence_manager = ConvergenceManager(
+            improvement_threshold=getattr(config, 'CONVERGENCE_THRESHOLD', 1e-4),
+            stagnation_limit=getattr(config, 'STAGNATION_LIMIT', 3),
+            min_iterations=getattr(config, 'MIN_ITERATIONS', 2)
+        )
+        self.task_index_manager = TaskIndexManager()
+        self.state_key_optimizer = StateKeyOptimizer()
+        self.memory_manager = MemoryManager(
+            max_visited_states=getattr(config, 'MAX_VISITED_STATES', 100000),
+            cleanup_interval=getattr(config, 'CLEANUP_INTERVAL', 1000)
+        )
     
     def __del__(self):
         """析构函数，关闭日志文件"""
@@ -158,7 +425,7 @@ class AttentionGuidedSubproblemSolver:
     
     def _extract_state_features(self, label: Label, crew: Crew) -> np.ndarray:
         """从当前标签状态提取状态特征向量"""
-        features = np.zeros(config.STATE_DIM)
+        features = np.zeros(attention_config.STATE_DIM)
         
         # 时间特征
         current_time = label.node.time
@@ -201,7 +468,7 @@ class AttentionGuidedSubproblemSolver:
     
     def _extract_task_features(self, task, current_label: Label) -> np.ndarray:
         """提取任务特征向量"""
-        features = np.zeros(config.ACTION_DIM)
+        features = np.zeros(attention_config.ACTION_DIM)
         
         # 连接时间
         connection_time = (task['startTime'] - current_label.node.time).total_seconds() / 3600
@@ -283,7 +550,7 @@ class AttentionGuidedSubproblemSolver:
                                       buses: List[BusInfo], ground_duties: List[GroundDuty],
                                       dual_prices: Dict[str, float], 
                                       planning_start_dt: datetime, planning_end_dt: datetime,
-                                      layover_airports: Set[str], crew_sigma_dual: float, iteration_round: int = 0, external_log_func=None, lambda_k: float = 0.0) -> List[Roster]:
+                                      layover_airports: Set[str], crew_sigma_dual: float, ground_duty_duals: Dict[str, float], iteration_round: int = 0, external_log_func=None) -> List[Roster]:
         """使用注意力模型指导的子问题求解"""
         
         # 初始化
@@ -314,11 +581,13 @@ class AttentionGuidedSubproblemSolver:
         # 准备任务数据时确保使用最新的对偶价格
         all_tasks = []
         
-        # 添加航班任务
+        # 添加航班任务 - 为每个航班创建执行和置位两种任务类型
         for flight in flights:
             # 确保使用当前迭代的对偶价格
             current_dual_price = dual_prices.get(flight.id, 0.0)
-            task_dict = {
+            
+            # 1. 执行航班任务（有飞行时间奖励和对偶价格收益）
+            execution_task = {
                 'type': 'flight',
                 'taskId': flight.id,
                 'startTime': flight.std,
@@ -326,10 +595,27 @@ class AttentionGuidedSubproblemSolver:
                 'depaAirport': flight.depaAirport,
                 'arriAirport': flight.arriAirport,
                 'flyTime': flight.flyTime,
-                'aircraftNo': flight.aircraftNo,  # 添加飞机尾号信息
-                'dual_price': current_dual_price  # 使用最新的对偶价格
+                'aircraftNo': flight.aircraftNo,
+                'dual_price': current_dual_price,  # 执行航班有对偶价格收益
+                'is_positioning': False  # 标记为执行任务
             }
-            all_tasks.append(task_dict)
+            all_tasks.append(execution_task)
+            
+            # 2. 置位航班任务（无飞行时间奖励，有置位惩罚）
+            positioning_task = {
+                'type': 'positioning_flight',
+                'taskId': flight.id + '_pos',  # 添加后缀区分置位任务
+                'original_flight_id': flight.id,  # 保存原始航班ID
+                'startTime': flight.std,
+                'endTime': flight.sta,
+                'depaAirport': flight.depaAirport,
+                'arriAirport': flight.arriAirport,
+                'flyTime': flight.flyTime,
+                'aircraftNo': flight.aircraftNo,
+                'dual_price': 0.0,  # 置位航班无对偶价格收益
+                'is_positioning': True  # 标记为置位任务
+            }
+            all_tasks.append(positioning_task)
         
         # 添加巴士任务
         for bus in buses:
@@ -346,6 +632,8 @@ class AttentionGuidedSubproblemSolver:
         
         # 添加占位任务
         for ground_duty in ground_duties:
+            # 使用传入的占位任务对偶价格
+            current_dual_price = ground_duty_duals.get(ground_duty.id, 0.0)
             task_dict = {
                 'type': 'ground_duty',
                 'taskId': ground_duty.id,
@@ -353,7 +641,7 @@ class AttentionGuidedSubproblemSolver:
                 'endTime': ground_duty.endTime,
                 'depaAirport': ground_duty.airport,
                 'arriAirport': ground_duty.airport,  # 占位任务起降机场相同
-                'dual_price': 0.0
+                'dual_price': current_dual_price
             }
             all_tasks.append(task_dict)
         
@@ -364,12 +652,12 @@ class AttentionGuidedSubproblemSolver:
         
         # 根据迭代轮次调整搜索参数
         if iteration_round == 0:  # 第一轮
-            max_valuable_rosters = min(len(all_tasks), 50)
-            self.max_candidates_per_expansion = 3
+            max_valuable_rosters = min(len(all_tasks), 100)
+            self.max_candidates_per_expansion = 8
             max_iterations = self.max_iterations
         else:
-            max_valuable_rosters = min(len(all_tasks), 60)
-            self.max_candidates_per_expansion = 4
+            max_valuable_rosters = min(len(all_tasks), 150)
+            self.max_candidates_per_expansion = 12
             max_iterations = self.max_iterations
         
         # 添加随机种子扰动，确保每轮生成不同结果
@@ -390,10 +678,23 @@ class AttentionGuidedSubproblemSolver:
         self._log_debug(f"初始状态: 队列={len(labels)}, 任务={len(all_tasks)}")
         self._log_debug(f"多样性设置: 候选数={self.max_candidates_per_expansion}, 阈值={diversity_threshold}")
         
-        # 基本循环条件
+        # 基本循环条件 - 添加智能收敛判断
+        last_roster_count = 0
         while (labels and 
                iteration_count < max_iterations and 
                len(found_rosters) < max_valuable_rosters):
+            
+            # 检查智能收敛条件 - 修复过早检查问题
+            current_obj = -len(found_rosters)  # 简单的目标函数：最大化roster数量
+            new_rosters_count = len(found_rosters) - last_roster_count
+            
+            # 只在有足够迭代历史后才检查收敛，避免过早终止
+            if (iteration_count > 50 and  # 至少50次迭代后才考虑收敛
+                self.convergence_manager.should_terminate(current_obj, new_rosters_count, iteration_count)):
+                self._log_debug(f"智能收敛终止：迭代{iteration_count}，方案{len(found_rosters)}")
+                break
+            
+            last_roster_count = len(found_rosters)
             iteration_count += 1
             total_labels_processed += 1
             
@@ -403,19 +704,17 @@ class AttentionGuidedSubproblemSolver:
             if iteration_count % 5000 == 0:
                 self._log_debug(f"  进度 {iteration_count}: 队列={len(labels)}, 方案={len(found_rosters)}")
             
-            # 改进状态键，包含更多信息
-            state_key = (
-                current_label.node.airport, 
-                current_label.node.time.replace(second=0, microsecond=0),  # 精确到分钟
-                tuple(sorted(current_label.used_task_ids)),
-                current_label.duty_start_time.replace(second=0, microsecond=0) if current_label.duty_start_time else None,
-                current_label.duty_flight_count,
-                current_label.duty_task_count
-            )
+            # 使用优化的状态键
+            state_key = self.state_key_optimizer.get_compact_state_key(current_label)
             
             if state_key in visited:
                 continue
             visited.add(state_key)
+            
+            # 内存管理 - 定期清理访问状态
+            if self.memory_manager.should_cleanup(visited):
+                visited = self.memory_manager.cleanup_visited_states(visited)
+                self.task_index_manager.clear_cache()  # 同时清理任务缓存
             
             # 路径多样性检查
             if iteration_round > 0 and len(current_label.path) >= 2:
@@ -459,7 +758,7 @@ class AttentionGuidedSubproblemSolver:
                 if roster_signature not in found_roster_signatures:
                     found_roster_signatures.add(roster_signature)
                     
-                    # 构建排班方案 - 添加去重逻辑
+                    # 构建排班方案 - 添加去重逻辑和置位航班处理
                     roster_tasks = []
                     seen_task_ids = set()
                     for task_info in current_label.path:
@@ -470,7 +769,13 @@ class AttentionGuidedSubproblemSolver:
                         seen_task_ids.add(task_id)
                         
                         if task_info['type'] == 'flight':
+                            # 执行航班
                             flight_obj = next(f for f in flights if f.id == task_id)
+                            roster_tasks.append(flight_obj)
+                        elif task_info['type'] == 'positioning_flight':
+                            # 置位航班：使用原始航班ID查找flight对象
+                            original_flight_id = task_info.get('original_flight_id', task_id.replace('_pos', ''))
+                            flight_obj = next(f for f in flights if f.id == original_flight_id)
                             roster_tasks.append(flight_obj)
                         elif task_info['type'] == 'positioning_bus':
                             bus_obj = next(b for b in buses if b.id == task_id)
@@ -486,7 +791,7 @@ class AttentionGuidedSubproblemSolver:
                         # 使用scoring_system计算完整成本
                         scoring_system = ScoringSystem(flights, [crew], layover_airports)
                         cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                            temp_roster, crew, dual_prices, crew_sigma_dual, lambda_k
+                            temp_roster, crew, dual_prices, crew_sigma_dual
                         )
                         
                         # 简单质量检查
@@ -497,13 +802,15 @@ class AttentionGuidedSubproblemSolver:
                         self._log_debug(f"\n考虑的Roster ({roster_status}):")
                         self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
                         self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
-                        self._log_debug(f"  当前Lambda值: {lambda_k:.6f}")
+                        self._log_debug(f"  最大化线性目标函数")
                         self._log_debug(f"  飞行奖励值: {cost_details.get('flight_reward', 0):.6f}")
                         self._log_debug(f"  航班数量: {cost_details['flight_count']}")
                         self._log_debug(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
                         self._log_debug(f"  值勤天数: {cost_details['duty_days']}")
                         self._log_debug(f"  总成本: {cost_details['total_cost']:.6f}")
-                        self._log_debug(f"  对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                        self._log_debug(f"  航班对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                        self._log_debug(f"  机组对偶价格: {cost_details.get('crew_sigma_dual', 0):.6f}")
+                        self._log_debug(f"  对偶价格总贡献: {cost_details.get('dual_contribution', 0):.6f}")
                         
                         # 调用外部日志函数记录roster信息
                         if external_log_func:
@@ -511,13 +818,15 @@ class AttentionGuidedSubproblemSolver:
                             external_log_func(f"机组 {crew.crewId} - 考虑的Roster ({value_status}):")
                             external_log_func(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
                             external_log_func(f"  Reduced Cost: {reduced_cost:.6f}")
-                            external_log_func(f"  当前Lambda值: {lambda_k:.6f}")
+                            external_log_func(f"  最大化线性目标函数")
                             external_log_func(f"  飞行奖励值: {cost_details.get('flight_reward', 0):.6f}")
                             external_log_func(f"  航班数量: {cost_details['flight_count']}")
                             external_log_func(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
                             external_log_func(f"  值勤天数: {cost_details['duty_days']}")
                             external_log_func(f"  总成本: {cost_details['total_cost']:.6f}")
-                            external_log_func(f"  对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                            external_log_func(f"  航班对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
+                            external_log_func(f"  机组对偶价格: {cost_details.get('crew_sigma_dual', 0):.6f}")
+                            external_log_func(f"  对偶价格总贡献: {cost_details.get('dual_contribution', 0):.6f}")
                             external_log_func("")  # 空行分隔
                         
                         if reduced_cost < -1e-4:  # 基础有价值条件
@@ -526,9 +835,18 @@ class AttentionGuidedSubproblemSolver:
                             found_rosters.append(roster)
                             self._log_debug(f"  >>> 添加到有价值roster列表 #{len(found_rosters)}")
             
-            # 获取候选任务
-            candidates = self._get_valid_candidates(
-                current_label, all_tasks, crew, layover_airports, planning_end_dt
+            # 获取候选任务 - 使用优化的任务索引管理器
+            if not hasattr(self, '_tasks_preprocessed'):
+                self.task_index_manager.preprocess_tasks(all_tasks)
+                self._tasks_preprocessed = True
+            
+            candidates = self.task_index_manager.get_candidates_optimized(
+                current_label, crew, time_window_hours=48
+            )
+            
+            # 进一步过滤候选任务
+            candidates = self._filter_candidates_with_constraints(
+                candidates, current_label, crew, layover_airports, planning_end_dt
             )
             
             total_candidates_found += len(candidates)
@@ -596,205 +914,37 @@ class AttentionGuidedSubproblemSolver:
         
         return found_rosters
     
-    def _get_valid_candidates(self, current_label: Label, all_tasks: List[Dict], 
-                            crew: Crew, layover_airports: List[str], 
-                            planning_end_dt: datetime) -> List:
-        """获取当前标签的有效候选任务 - 优化版本"""
-        candidates = []
+    def _filter_candidates_with_constraints(self, candidates: List[Dict], current_label: Label,
+                                          crew: Crew, layover_airports: Set[str], 
+                                          planning_end_dt: datetime) -> List[Dict]:
+        """对候选任务进行详细约束检查"""
+        filtered_candidates = []
         current_time = current_label.node.time
         current_airport = current_label.node.airport
         
-        # 添加过滤统计
-        filter_stats = {
-            'total_tasks': len(all_tasks),
-            'already_used': 0,
-            'time_constraint': 0,
-            'location_constraint': 0,
-            'layover_constraint': 0,
-            'connection_time': 0,
-            'duty_time': 0,
-            'task_count': 0,
-            'flight_count': 0,
-            'duty_flight_time': 0,
-            'duty_constraint': 0,
-            'overnight_constraint': 0,
-            'valid_candidates': 0
-        }
-        
-        # 优化1: 快速预筛选 - 批量过滤最基本的约束
-        pre_filtered_tasks = []
-        used_task_ids = current_label.used_task_ids  # 缓存引用
-        
-        for task in all_tasks:
-            # 最快的检查：已使用和时间约束
-            if task['taskId'] in used_task_ids:
-                filter_stats['already_used'] += 1
-            elif task['startTime'] <= current_time or task['endTime'] > planning_end_dt:
-                filter_stats['time_constraint'] += 1
-            else:
-                pre_filtered_tasks.append(task)
-        
-        # 优化2: 提前终止 - 如果预筛选后没有任务，直接返回
-        if not pre_filtered_tasks:
-            self._log_filter_stats(filter_stats, current_airport, current_time, 0)
-            return candidates
-        
-        # 优化3: 批量检查简单约束
-        path_length = len(current_label.path)
-        current_flight_count = sum(1 for t in current_label.path if t.get('type') == 'flight')
-        
-        for task in pre_filtered_tasks:
-            # 优化4: 快速约束检查 - 按失败概率排序
-            
-            # 检查任务数量约束（快速检查）
-            if path_length >= MAX_TASKS_PER_CREW:
-                filter_stats['task_count'] += 1
+        for task in candidates:
+            # 检查是否已使用
+            if task['taskId'] in current_label.used_task_ids:
                 continue
-            
-            # 检查飞行数量约束（快速检查）
+                
+            # 检查时间约束
+            if task['startTime'] <= current_time or task['endTime'] > planning_end_dt:
+                continue
+                
+            # 检查总飞行时间约束（规则9：总飞行值勤时间限制）
             if task['type'] == 'flight':
-                if current_flight_count + 1 > MAX_FLIGHTS_PER_CREW:
-                    filter_stats['flight_count'] += 1
+                current_flight_hours = sum(t.get('flyTime', 0) / 60.0 for t in current_label.path if t.get('type') == 'flight')
+                task_flight_hours = task.get('flyTime', 0) / 60.0
+                if current_flight_hours + task_flight_hours > MAX_TOTAL_FLIGHT_HOURS:
                     continue
             
-            # 优化5: 地点约束检查 - 使用缓存避免重复查找
-            if task['depaAirport'] != current_airport:
-                # 使用缓存键避免重复查找置位任务
-                cache_key = f"{current_airport}_{task['depaAirport']}_{current_time.strftime('%Y%m%d_%H%M')}"
-                
-                if not hasattr(self, '_positioning_cache'):
-                    self._positioning_cache = {}
-                
-                if cache_key not in self._positioning_cache:
-                    # 查找从当前机场到任务出发机场的置位任务
-                    from subproblem_solver import find_positioning_tasks
-                    
-                    # 获取机组的航班列表用于查找DH航班
-                    crew_flights = [f for f in all_tasks if f.get('type') == 'flight']
-                    all_ddh = [f for f in crew_flights if f.get('flightNo', '').startswith('DH')]
-                    
-                    # 查找置位任务
-                    positioning_tasks = find_positioning_tasks(
-                        from_airport=current_airport,
-                        to_airport=task['depaAirport'],
-                        earliest_start=current_time,
-                        all_bus=[t for t in all_tasks if t.get('type') == 'bus'],
-                        all_ddh=all_ddh
-                    )
-                    
-                    self._positioning_cache[cache_key] = positioning_tasks
-                else:
-                    positioning_tasks = self._positioning_cache[cache_key]
-                
-                # 如果找到置位任务，将其添加到候选列表
-                positioning_added = False
-                for pos_task in positioning_tasks:
-                    pos_start = pos_task.get('startTime') if hasattr(pos_task, 'startTime') else pos_task.get('std')
-                    pos_end = pos_task.get('endTime') if hasattr(pos_task, 'endTime') else pos_task.get('sta')
-                    
-                    if pos_start and pos_end and pos_start >= current_time:
-                        # 创建置位任务字典
-                        pos_task_dict = {
-                            'taskId': getattr(pos_task, 'taskId', f"POS_{pos_task.get('flightNo', 'BUS')}_{pos_start.strftime('%Y%m%d_%H%M')}"),
-                            'type': 'positioning' if hasattr(pos_task, 'flightNo') else 'bus',
-                            'startTime': pos_start,
-                            'endTime': pos_end,
-                            'depaAirport': current_airport,
-                            'arriAirport': task['depaAirport'],
-                            'flightNo': getattr(pos_task, 'flightNo', 'BUS'),
-                            'flyTime': getattr(pos_task, 'flyTime', 0)
-                        }
-                        
-                        # 检查置位任务是否已被使用
-                        if pos_task_dict['taskId'] not in used_task_ids:
-                            candidates.append(pos_task_dict)
-                            filter_stats['valid_candidates'] += 1
-                            positioning_added = True
-                
-                # 如果没有找到置位任务，则跳过这个任务
-                if not positioning_added:
-                    filter_stats['location_constraint'] += 1
-                    continue
-            
-            # 检查值勤日必须从可过夜机场开始
-            if current_label.duty_start_time is None and current_label.path:
-                # 如果即将开始一个新值勤日（即刚结束一次休息），那么当前机场必须是合法的过夜站
-                if current_airport not in layover_airports:
-                    filter_stats['layover_constraint'] += 1
-                    continue
-            
-            # 检查连接时间
-            connection_time = task['startTime'] - current_time
-            
-            # 获取最后一个任务用于连接时间检查
-            last_task = None
-            if current_label.path:
-                for t in reversed(current_label.path):
-                    if hasattr(t, 'std') or t.get('type') == 'flight':  # 是航班任务
-                        last_task = t
-                        break
-            
-            # 根据任务类型和飞机尾号确定最小连接时间
-            if task['type'] == 'flight':
-                if last_task and hasattr(last_task, 'aircraftNo') and task.get('aircraftNo'):
-                    if task['aircraftNo'] == last_task.aircraftNo:
-                        min_connection_time = MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT
-                    else:
-                        min_connection_time = MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT
-                else:
-                    min_connection_time = MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT
-                
-                if connection_time < min_connection_time:
-                    filter_stats['connection_time'] += 1
-                    continue
-            elif task['type'] in ['positioning_bus', 'bus']:
-                if connection_time < MIN_CONNECTION_TIME_BUS:
-                    filter_stats['connection_time'] += 1
-                    continue
-            
-            # 检查值勤日时长约束
-            if current_label.duty_start_time is not None:
-                duty_duration = (task['endTime'] - current_label.duty_start_time).total_seconds() / 3600
-                if duty_duration > MAX_DUTY_DAY_HOURS:
-                    filter_stats['duty_time'] += 1
-                    continue
-            
-            # 检查任务数量约束
-            if len(current_label.path) >= MAX_TASKS_PER_CREW:
-                filter_stats['task_count'] += 1
-                continue
-            
-            # 检查飞行数量约束
-            flight_count = sum(1 for t in current_label.path if t.get('type') == 'flight')
-            if task['type'] == 'flight':
-                flight_count += 1
-            if flight_count > MAX_FLIGHTS_PER_CREW:
-                filter_stats['flight_count'] += 1
-                continue
-            
-            # 优化6: 值勤内飞行时间约束（快速计算）
-            if current_label.duty_start_time is not None and task['type'] == 'flight':
-                # 使用预计算的值勤飞行时间
-                potential_duty_flight_time = current_label.duty_flight_time + task.get('flyTime', 0) / 60.0
-                if potential_duty_flight_time > MAX_FLIGHT_TIME_IN_DUTY_HOURS:
-                    filter_stats['duty_flight_time'] += 1
-                    continue
-            
-            # 优化7: 延迟复杂约束检查到最后
-            # 将最耗时的统一约束检查放到最后
-            if not self._check_duty_constraints(current_label, task, crew):
-                filter_stats['duty_constraint'] += 1
-                continue
-            
-            # 移除了晚上8点过夜约束检查 - 该约束不在原始竞赛规则中
-            
-            candidates.append(task)
-            filter_stats['valid_candidates'] += 1
+            # 使用统一约束检查器进行详细检查
+            if self.constraint_checker.can_assign_task_to_label(current_label, task, crew):
+                filtered_candidates.append(task)
         
-        # 优化8: 简化日志输出
-        self._log_filter_stats(filter_stats, current_airport, current_time, len(candidates))
-        
-        return candidates
+        return filtered_candidates
+    
+    # 原来的_get_valid_candidates方法已被优化的候选任务获取方法替代
     
     def _log_filter_stats(self, filter_stats: dict, current_airport: str, current_time: datetime, candidates_count: int):
         """统一的过滤统计日志输出"""
@@ -847,19 +997,26 @@ class AttentionGuidedSubproblemSolver:
             # 计算成本增量 - 使用更准确的成本计算
             cost_delta = 0.0
             if task['type'] == 'flight':
-                # 使用任务字典中存储的最新对偶价格
+                # 执行航班：有对偶价格收益
                 dual_price = task.get('dual_price', 0.0)
                 cost_delta -= dual_price  # 航班的对偶价格收益（负成本）      
-                # print(f"  航班 {task['taskId']}: 对偶价格={dual_price:.6f}, 成本增量={cost_delta:.6f}")
+                # print(f"  执行航班 {task['taskId']}: 对偶价格={dual_price:.6f}, 成本增量={cost_delta:.6f}")
                 
-            elif 'positioning' in task['type']:
-                # 调机的惩罚
+            elif task['type'] == 'positioning_flight':
+                # 置位航班：有置位惩罚，无对偶价格收益
                 cost_delta += PENALTY_PER_POSITIONING
-                # print(f"  调机 {task['taskId']}: 惩罚={PENALTY_PER_POSITIONING:.6f}")
+                # print(f"  置位航班 {task['taskId']}: 惩罚={PENALTY_PER_POSITIONING:.6f}")
+                
+            elif task['type'] == 'positioning_bus':
+                # 置位巴士：有置位惩罚
+                cost_delta += PENALTY_PER_POSITIONING
+                # print(f"  置位巴士 {task['taskId']}: 惩罚={PENALTY_PER_POSITIONING:.6f}")
+                
             elif task['type'] == 'ground_duty':
-                # 占位任务通常没有额外成本
-                # print(f"  占位任务 {task['taskId']}: 无额外成本")
-                pass
+                # 占位任务的对偶价格收益
+                dual_price = task.get('dual_price', 0.0)
+                cost_delta -= dual_price  # 占位任务的对偶价格收益（负成本）
+                # print(f"  占位任务 {task['taskId']}: 对偶价格={dual_price:.6f}, 成本增量={cost_delta:.6f}")
             
             # 检查是否需要结束当前值勤日或开始新值勤日
             new_duty_start_time = current_label.duty_start_time
@@ -893,6 +1050,10 @@ class AttentionGuidedSubproblemSolver:
                     new_duty_start_time = task['startTime']  # 开始新值勤日
                     new_duty_days_count = current_label.duty_days_count + 1
                     is_new_duty = True
+            
+            # 置位规则检查：同一值勤日内，仅允许在开始或结束进行置位
+            if not self._validate_positioning_rules_in_duty(current_label, task, is_new_duty):
+                return None  # 违反置位规则
             
             # 更新值勤相关计数器
             new_duty_flight_time = current_label.duty_flight_time
@@ -930,6 +1091,19 @@ class AttentionGuidedSubproblemSolver:
             new_used_task_ids = current_label.used_task_ids.copy()
             new_used_task_ids.add(task['taskId'])
             
+            # 更新飞行值勤日状态
+            new_has_flown_in_duty = current_label.has_flown_in_duty
+            if is_new_duty:
+                # 新值勤日，重置飞行状态
+                new_has_flown_in_duty = (task['type'] == 'flight')
+            else:
+                # 继续当前值勤日，更新飞行状态
+                new_has_flown_in_duty = new_has_flown_in_duty or (task['type'] == 'flight')
+            
+            # 验证飞行值勤日的可过夜机场约束
+            if not self._validate_flight_duty_day_layover_constraint(current_label, task, is_new_duty, new_has_flown_in_duty):
+                return None  # 违反飞行值勤日可过夜机场约束
+            
             # 飞行周期管理（规则11：飞行周期约束）
             new_cycle_start = current_label.current_cycle_start
             new_cycle_days = current_label.current_cycle_days
@@ -940,20 +1114,29 @@ class AttentionGuidedSubproblemSolver:
                 new_last_base_return = task['endTime'].date()
                 # 如果有活跃的飞行周期，结束它
                 if new_cycle_start is not None:
-                    # 优化：检查飞行周期末尾是否为飞行值勤日
-                    if not self._is_flight_duty_day_ending(current_label, task):
+                    # 检查飞行周期末尾是否为飞行值勤日
+                    if not self._is_flight_duty_day_ending_enhanced(current_label, task, is_new_duty):
                         return None  # 飞行周期末尾必须是飞行值勤日
                     new_cycle_start = None
                     new_cycle_days = 0
             else:
                 # 不在基地，检查是否需要开始新的飞行周期
-                if new_cycle_start is None and task['type'] == 'flight':
-                    new_cycle_start = task_date
-                    new_cycle_days = 1
+                if new_cycle_start is None:
+                    # 飞行周期开始条件：飞行任务、置位任务或值勤占位
+                    if (task['type'] == 'flight' or 
+                        'positioning' in task['type'] or 
+                        task['type'] == 'ground_duty'):
+                        # 计算实际周期开始日期（考虑置位任务的影响）
+                        new_cycle_start = self._get_cycle_actual_start_date(current_label, task)
+                        new_cycle_days = (task_date - new_cycle_start).days + 1
                 elif new_cycle_start is not None:
                     # 更新周期天数
                     cycle_duration = (task_date - new_cycle_start).days + 1
                     new_cycle_days = cycle_duration
+                    
+                    # 检查飞行周期最大持续时间（4个日历日）
+                    if new_cycle_days > 4:
+                        return None  # 飞行周期不能超过4个日历日
             
             # 创建新标签
             new_label = Label(
@@ -968,7 +1151,7 @@ class AttentionGuidedSubproblemSolver:
                 total_positioning=new_total_positioning,
                 total_away_overnights=current_label.total_away_overnights,
                 total_calendar_days=new_calendar_days,
-                has_flown_in_duty=current_label.has_flown_in_duty or (task['type'] == 'flight'),
+                has_flown_in_duty=new_has_flown_in_duty,
                 used_task_ids=new_used_task_ids,
                 tie_breaker=next(tie_breaker),
                 current_cycle_start=new_cycle_start,
@@ -1012,12 +1195,173 @@ class AttentionGuidedSubproblemSolver:
         except Exception as e:
             print(f"Error creating new label: {e}")
             return None
+    
+    def _validate_positioning_rules_in_duty(self, current_label, task, is_new_duty):
+        """
+        验证置位规则：同一值勤日内，仅允许在开始或结束进行置位
+        """
+        # 如果当前任务不是置位任务，无需检查
+        if not self._is_positioning_task_enhanced(task):
+            return True
+        
+        # 如果是新值勤日开始，置位任务可以作为开始
+        if is_new_duty:
+            return True
+        
+        # 如果是继续当前值勤日，需要检查置位规则
+        if current_label.duty_start_time is not None:
+            # 检查当前值勤日中是否已经有置位任务
+            duty_positioning_count = 0
+            duty_has_flight = False
+            
+            # 分析当前值勤日的任务组成
+            for path_task in current_label.path:
+                # 检查任务是否在当前值勤日内
+                if (hasattr(path_task, 'startTime') and 
+                    path_task.startTime >= current_label.duty_start_time):
+                    
+                    if self._is_positioning_task_enhanced(path_task):
+                        duty_positioning_count += 1
+                    elif (hasattr(path_task, 'type') and 
+                          str(path_task.type) == 'flight'):
+                        duty_has_flight = True
+            
+            # 如果值勤日中已经有置位任务且有飞行任务，不允许再添加置位
+            if duty_positioning_count > 0 and duty_has_flight:
+                return False
+            
+            # 如果值勤日中已经有多个置位任务，不允许
+            if duty_positioning_count >= 1:
+                return False
+        
+        return True
+    
+    def _is_positioning_task_enhanced(self, task):
+        """
+        增强版置位任务识别
+        根据attention模块的逻辑，置位任务包括：
+        1. 飞行置位：positioning_flight
+        2. 大巴置位：positioning_bus
+        注意：groundDuty是占位任务，不是置位任务
+        """
+        if isinstance(task, dict):
+            task_type = task.get('type', '')
+        else:
+            task_type = getattr(task, 'type', '')
+        
+        # 置位任务：飞行置位和大巴置位
+        return (str(task_type) == 'positioning_flight' or 
+                str(task_type) == 'positioning_bus' or
+                'positioning' in str(task_type).lower() and 'ground' not in str(task_type).lower())
+    
+    def _is_ground_duty_task(self, task):
+        """
+        识别占位任务（groundDuty）
+        根据用户澄清，groundDuty的识别可以从ID明确，ID格式为Grd_开头
+        """
+        if isinstance(task, dict):
+            task_type = task.get('type', '')
+            task_id = task.get('id', '') or task.get('taskId', '')
+        else:
+            task_type = getattr(task, 'type', '')
+            task_id = getattr(task, 'id', '')
+        
+        # 占位任务：groundDuty类型或ID以Grd_开头
+        return (str(task_type) == 'ground_duty' or 
+                str(task_type) == 'groundDuty' or
+                str(task_id).startswith('Grd_'))
+    
+    def _validate_flight_duty_day_layover_constraint(self, current_label, task, is_new_duty, has_flown_in_duty):
+        """
+        验证飞行值勤日的可过夜机场约束
+        飞行值勤日必须从可过夜机场开始到可过夜机场结束
+        """
+        # 如果不是飞行值勤日，无需检查此约束
+        if not has_flown_in_duty:
+            return True
+        
+        # 检查值勤日开始机场
+        duty_start_airport = None
+        if is_new_duty:
+            duty_start_airport = task['depaAirport']
+        else:
+            # 查找当前值勤日的开始机场
+            for path_task in current_label.path:
+                if (hasattr(path_task, 'startTime') and 
+                    current_label.duty_start_time and
+                    path_task.startTime >= current_label.duty_start_time):
+                    if hasattr(path_task, 'depaAirport'):
+                        duty_start_airport = path_task.depaAirport
+                        break
+                    elif hasattr(path_task, 'airport'):
+                        duty_start_airport = path_task.airport
+                        break
+        
+        # 检查值勤日结束机场
+        duty_end_airport = task['arriAirport'] if 'arriAirport' in task else task.get('airport')
+        
+        # 验证开始和结束机场都是可过夜机场
+        if (duty_start_airport and duty_start_airport not in self.layover_stations_set):
+            return False
+        
+        if (duty_end_airport and duty_end_airport not in self.layover_stations_set):
+            return False
+        
+        return True
+    
+    def _is_flight_duty_day_ending_enhanced(self, current_label, task, is_new_duty):
+        """
+        增强版飞行值勤日结束检查
+        严格区分值勤日和飞行值勤日，确保飞行周期末尾是飞行值勤日
+        """
+        # 如果是新值勤日开始，需要检查前一个值勤日是否为飞行值勤日
+        if is_new_duty and current_label.path:
+            # 检查当前标签的值勤日是否包含飞行任务
+            return current_label.has_flown_in_duty
+        
+        # 如果是继续当前值勤日，检查加入当前任务后是否构成飞行值勤日
+        if task['type'] == 'flight':
+            return True
+        
+        # 如果当前任务不是飞行任务，检查当前值勤日是否已经包含飞行任务
+        return current_label.has_flown_in_duty
+    
+    def _get_cycle_actual_start_date(self, current_label, task):
+        """
+        计算飞行周期的实际开始日期
+        考虑置位任务和值勤占位对周期开始的影响
+        """
+        task_date = task['startTime'].date()
+        
+        # 如果当前标签有路径，检查是否有置位任务影响周期开始
+        if current_label.path:
+            # 查找最近的置位任务或值勤占位
+            for i in range(len(current_label.path) - 1, -1, -1):
+                prev_task = current_label.path[i]
+                
+                # 检查是否为置位任务或值勤占位
+                if (hasattr(prev_task, 'type') and 
+                    ('positioning' in str(prev_task.type).lower() or 
+                     str(prev_task.type) == 'ground_duty')):
+                    # 如果找到置位任务，从该任务开始计算周期
+                    if hasattr(prev_task, 'startTime'):
+                        return prev_task.startTime.date()
+                    elif hasattr(prev_task, 'std'):
+                        return prev_task.std.date()
+                
+                # 如果遇到飞行任务，停止向前查找
+                if (hasattr(prev_task, 'type') and 
+                    str(prev_task.type) == 'flight'):
+                    break
+        
+        # 默认返回当前任务的日期
+        return task_date
 
 def solve_subproblem_for_crew_with_attention(
     crew: Crew, all_flights: List[Flight], all_bus_info: List[BusInfo],
     crew_ground_duties: List[GroundDuty], dual_prices: Dict[str, float],
     layover_stations, crew_leg_match_dict: Dict[str, List[str]],
-    crew_sigma_dual: float, iteration_round: int = 0, external_log_func=None, lambda_k: float = 0.0
+    crew_sigma_dual: float, ground_duty_duals: Dict[str, float] = None, iteration_round: int = 0, external_log_func=None
 ) -> List[Roster]:
     """使用注意力模型指导的子问题求解包装函数"""
     # 处理layover_stations参数，支持多种类型
@@ -1043,70 +1387,8 @@ def solve_subproblem_for_crew_with_attention(
     solver = AttentionGuidedSubproblemSolver(model_path, layover_stations_set=layover_airports)
     return solver.solve_subproblem_with_attention(
         crew, all_flights, all_bus_info, crew_ground_duties, dual_prices, 
-        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual, iteration_round, external_log_func, lambda_k
+        planning_start_dt, planning_end_dt, layover_airports, crew_sigma_dual, ground_duty_duals or {}, iteration_round, external_log_func
     )
-
-# 在AttentionGuidedSubproblemSolver类中添加值四修二约束检查方法
-class AttentionGuidedSubproblemSolverExtension:
-    def _check_work_rest_pattern_constraint(self, current_label: Label, task: dict, crew: Crew) -> bool:
-        """
-        检查值四修二工作模式约束
-        规则：连续工作不超过4天，工作4天后必须休息2天
-        """
-        if not hasattr(current_label, 'duty_days_count'):
-            return True  # 如果没有值勤日计数，跳过检查
-        
-        task_date = task['startTime'].date()
-        
-        # 简化检查：如果当前已经连续工作了4天，且新任务不是休息，则违规
-        if (current_label.duty_days_count >= 4 and 
-            task['type'] in ['flight'] and  # 实际工作任务
-            current_label.node.time.date() != task_date):  # 不是同一天的任务
-            
-            # 检查是否有足够的休息时间（简化为检查时间间隔）
-            time_gap = task['startTime'] - current_label.node.time
-            if time_gap.total_seconds() < 48 * 3600:  # 少于48小时休息
-                return False
-        
-        return True
-
-    def _is_flight_duty_day_ending(self, current_label, task):
-        """
-        检查飞行周期末尾是否为飞行值勤日
-        根据比赛定义：
-        1. 飞行值勤日必须包含飞行任务且从可过夜机场开始到可过夜机场结束
-        2. 占位任务可以单独构成值勤日，但不能单独构成飞行值勤日
-        3. 飞行周期末尾必须是飞行值勤日
-        """
-        # 如果当前任务是飞行任务，则当前值勤日肯定是飞行值勤日
-        if task['type'] == 'flight':
-            return True
-        
-        # 如果当前任务不是飞行任务，检查当前值勤日是否已经包含飞行任务
-        if current_label.has_flown_in_duty:
-            return True
-        
-        # 如果当前值勤日没有飞行任务，则不能作为飞行周期的末尾
-        # 但占位任务可以单独构成值勤日（只是不能作为飞行值勤日）
-        return False
-    
-    def _can_form_duty_day(self, current_label, task):
-        """
-        检查任务是否可以构成值勤日
-        占位任务可以单独构成值勤日，但不是飞行值勤日
-        """
-        # 所有类型的任务都可以构成值勤日
-        return True
-    
-    def _is_positioning_task(self, task):
-        """
-        检查是否为占位任务
-        """
-        return ('positioning' in task.get('type', '').lower() or 
-                'deadhead' in task.get('type', '').lower() or
-                task.get('type') == 'bus')
-AttentionGuidedSubproblemSolver._check_work_rest_pattern_constraint = AttentionGuidedSubproblemSolverExtension._check_work_rest_pattern_constraint
-AttentionGuidedSubproblemSolver._is_flight_duty_day_ending = AttentionGuidedSubproblemSolverExtension._is_flight_duty_day_ending
 
 
 

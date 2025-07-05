@@ -4,7 +4,7 @@ import csv
 from typing import List
 from data_models import Roster, Flight, BusInfo, GroundDuty, RestPeriod
 
-def write_results_to_csv(selected_rosters: List[Roster], output_path: str):
+def write_results_to_csv(selected_rosters: List[Roster], output_path: str, master_problem=None):
     """
     Writes the final selected rosters to a CSV file with the required
     3-column format: ['crewId', 'taskId', 'isDDH'].
@@ -39,11 +39,28 @@ def write_results_to_csv(selected_rosters: List[Roster], output_path: str):
                     # isDDH = 0 means it's an operational task (flight duty, ground duty).
                     is_ddh = 0
                     if isinstance(task, BusInfo):
-                        # Ground positioning is a deadhead task.
-                        is_ddh = 1
-                    elif isinstance(task, Flight) and task.flightNo.startswith("DH"):
-                        # Flights marked with 'DH' are deadhead tasks.
-                        is_ddh = 1
+                        # 检查大巴任务是否为置位任务
+                        if hasattr(task, 'type') and 'positioning' in str(task.type).lower():
+                            is_ddh = 1
+                        else:
+                            is_ddh = 1  # 默认大巴任务都是置位任务
+                    elif isinstance(task, Flight):
+                        # For flights, check if this flight is executed (not positioning)
+                        # First check if task has type attribute indicating positioning
+                        if hasattr(task, 'type') and 'positioning' in str(task.type).lower():
+                            is_ddh = 1
+                        elif master_problem and hasattr(master_problem, 'flight_execution_vars'):
+                            # If the flight execution variable is 0, this flight is used for positioning
+                            exec_var = master_problem.flight_execution_vars.get(task.id)
+                            if exec_var and hasattr(exec_var, 'X'):
+                                # If execution variable is close to 0, this is positioning
+                                is_ddh = 1 if exec_var.X < 0.5 else 0
+                            else:
+                                # Fallback: assume it's execution if no execution variable found
+                                is_ddh = 0
+                        else:
+                            # Fallback: check if flight number starts with "DH" (old logic)
+                            is_ddh = 1 if task.flightNo.startswith("DH") else 0
                     
                     writer.writerow([crew_id, task_id, is_ddh])
         
