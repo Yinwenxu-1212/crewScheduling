@@ -1,50 +1,68 @@
-# 优化求解器
-gurobipy>=10.0.0
+# =============================================================================
+# 机组排班优化系统依赖包
+# Crew Scheduling Optimization Dependencies
+# =============================================================================
 
-# 数据处理
-pandas>=1.5.0
-numpy>=1.21.0
+# 核心优化求解器 (Core Optimization)
+# ============================================
+gurobipy>=10.0.0,<11.0.0  # 商业优化求解器
 
-# 深度学习框架
-torch>=1.12.0
-torchvision>=0.13.0
+# 数据处理与科学计算 (Data Processing & Scientific Computing)
+# ============================================================
+pandas>=1.5.0,<2.0.0      # 数据处理和分析
+numpy>=1.21.0,<2.0.0       # 数值计算基础库
+scipy>=1.9.0,<2.0.0        # 科学计算工具
+python-dateutil>=2.8.0     # 日期时间处理
 
-# 机器学习
-scikit-learn>=1.1.0
+# 深度学习与AI (Deep Learning & AI)
+# ===================================
+torch>=1.12.0,<3.0.0       # PyTorch深度学习框架
+torchvision>=0.13.0,<1.0.0  # 计算机视觉工具
+scikit-learn>=1.1.0,<2.0.0  # 机器学习算法库
 
-# 数值计算和科学计算
-scipy>=1.9.0
+# 系统工具 (System Utilities)
+# ============================
+tqdm>=4.64.0               # 进度条显示
+loguru>=0.6.0               # 高级日志记录
+psutil>=5.9.0               # 系统和进程监控
+typing-extensions>=4.0.0    # 类型注解扩展
+pydantic>=1.10.0,<3.0.0    # 数据验证和设置管理
+pyyaml>=6.0                 # YAML配置文件处理
 
-# 日期时间处理
-python-dateutil>=2.8.0
+# =============================================================================
+# 可选依赖 (Optional Dependencies)
+# =============================================================================
+# 安装命令: pip install -r requirements.txt -r requirements-optional.txt
 
-# 进度条
-tqdm>=4.64.0
+# 数据可视化 (Data Visualization)
+# ================================
+# matplotlib>=3.5.0,<4.0.0    # 基础绘图库
+# seaborn>=0.11.0,<1.0.0       # 统计数据可视化
+# plotly>=5.0.0                # 交互式图表
 
-# 配置文件处理
-pyyaml>=6.0
+# =============================================================================
+# 开发依赖 (Development Dependencies)
+# =============================================================================
+# 安装命令: pip install -r requirements.txt -r requirements-dev.txt
 
-# 日志记录
-loguru>=0.6.0
+# 开发环境 (Development Environment)
+# ==================================
+# jupyter>=1.0.0               # Jupyter Notebook
+# ipykernel>=6.15.0            # Jupyter内核
+# notebook>=6.4.0              # Notebook界面
 
-# 类型检查
-typing-extensions>=4.0.0
+# 代码质量工具 (Code Quality Tools)
+# =================================
+# black>=22.0.0                # 代码格式化
+# isort>=5.10.0                # 导入排序
+# flake8>=5.0.0                # 代码风格检查
+# mypy>=0.971                  # 静态类型检查
+# bandit>=1.7.0                # 安全检查
+# pre-commit>=2.20.0           # Git钩子管理
 
-# 数据验证
-pydantic>=1.10.0
-
-# 内存优化
-psutil>=5.9.0
-
-# 图形绘制（可选）
-matplotlib>=3.5.0
-seaborn>=0.11.0
-
-# Jupyter支持（开发用）
-jupyter>=1.0.0
-ipykernel>=6.15.0
-
-# 代码格式化（开发用）
-black>=22.0.0
-flake8>=5.0.0
-mypy>=0.971
+# 测试工具 (Testing Tools)
+# ========================
+# pytest>=7.0.0               # 测试框架
+# pytest-cov>=3.0.0           # 覆盖率测试
+# pytest-mock>=3.8.0          # Mock测试
+# pytest-xdist>=2.5.0         # 并行测试

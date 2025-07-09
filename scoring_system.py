@@ -14,7 +14,7 @@
 from datetime import datetime, timedelta
 from typing import List, Dict, Set
 from data_models import Flight, Roster, Crew, LayoverStation, BusInfo, GroundDuty
-from unified_config import config
+from unified_config import UnifiedConfig
 
 class ScoringSystem:
     def __init__(self, flights: List[Flight], crews: List[Crew], layover_stations):
@@ -27,7 +27,7 @@ class ScoringSystem:
             self.layover_stations_set = {station.airport for station in layover_stations}
         
         # 使用统一配置的评分参数
-        scoring_params = config.get_scoring_params()
+        scoring_params = UnifiedConfig.get_scoring_params()
         self.FLY_TIME_MULTIPLIER = scoring_params['fly_time_multiplier']
         self.UNCOVERED_FLIGHT_PENALTY = scoring_params['uncovered_flight_penalty']
         self.NEW_LAYOVER_STATION_PENALTY = scoring_params['new_layover_penalty']
@@ -351,12 +351,12 @@ class ScoringSystem:
                 'total_cost': 0.0,  # c_j = 0 for empty roster
                 'flight_reward': 0.0,
                 'dual_price_total': 0.0,
-                'dual_contribution': crew_sigma_dual,  # π^T A_j = crew_sigma_dual
+                'dual_contribution': -crew_sigma_dual,  # π^T A_j = -crew_sigma_dual
                 'positioning_penalty': 0.0,
                 'overnight_penalty': 0.0,
                 'other_costs': 0.0,
                 'crew_sigma_dual': crew_sigma_dual,
-                'reduced_cost': 0.0 - crew_sigma_dual,  # c_j - π^T A_j = 0 - crew_sigma_dual
+                'reduced_cost': 0.0 - (-crew_sigma_dual),  # c_j - π^T A_j = 0 - (-crew_sigma_dual) = crew_sigma_dual
                 'flight_count': 0,
                 'total_flight_hours': 0.0,
                 'duty_days': 0,
@@ -390,8 +390,16 @@ class ScoringSystem:
         total_duty_days = len(duty_calendar_days)  # 这个roster的值勤天数
         avg_daily_flight_hours = total_flight_hours / total_duty_days if total_duty_days > 0 else 0.0
         
-        # 根据新要求：roster基础成本不包含飞行奖励
-        flight_reward = 0.0  # 飞行奖励现在只通过执行变量获得
+        # 根据数学模型：计算执行航班的飞行奖励（α·t_f）
+        optimization_params = UnifiedConfig.get_optimization_params()
+        flight_reward_rate = optimization_params['flight_time_reward']  # α = 100
+        flight_reward = 0.0
+        
+        for duty in sorted_duties:
+            if isinstance(duty, Flight):
+                # 只有执行航班才能获得飞行奖励
+                if not getattr(duty, 'is_positioning', False):
+                    flight_reward += flight_reward_rate * (duty.flyTime / 60.0)
         
         # 2. 计算对偶价格收益
         dual_price_total = 0.0
@@ -400,14 +408,15 @@ class ScoringSystem:
                 dual_price_total += dual_prices.get(duty.id, 0.0)
         
         # 3. 计算置位惩罚（使用统一配置的核心成本参数）
-        optimization_params = config.get_optimization_params()
+        optimization_params = UnifiedConfig.get_optimization_params()
         positioning_penalty_rate = optimization_params['positioning_penalty']
         positioning_penalty = 0.0
         positioning_count = 0
         for duty in roster.duties:
             if isinstance(duty, Flight):
-                # 检查是否为置位航班（根据任务类型判断）
-                if hasattr(duty, 'type') and 'positioning' in duty.type:
+                # 检查是否为置位航班（根据is_positioning属性或任务类型判断）
+                if (getattr(duty, 'is_positioning', False) or 
+                    (hasattr(duty, 'type') and 'positioning' in str(duty.type))):
                     positioning_penalty += positioning_penalty_rate
                     positioning_count += 1
             elif isinstance(duty, BusInfo):
@@ -465,10 +474,11 @@ class ScoringSystem:
         # 6. 计算总成本和reduced cost
         # 最小化问题的reduced cost计算: c_j - π^T A_j
         # c_j = 原始成本 (penalties - flight_reward，负值表示收益)
-        # π^T A_j = 对偶价格贡献 (dual_price_total + crew_sigma_dual)
+        # π^T A_j = 对偶价格贡献 (dual_price_total - crew_sigma_dual)
+        # 注意：机组约束是≤1的不等式，对偶价格为负，在reduced cost中应该用减法
         # 当reduced_cost < 0时，表示该roster有价值，应该加入主问题
         total_cost = positioning_penalty + overnight_penalty + other_costs - flight_reward
-        dual_contribution = dual_price_total + crew_sigma_dual
+        dual_contribution = dual_price_total - crew_sigma_dual  # 修正：机组对偶价格用减法
         reduced_cost = total_cost - dual_contribution
         
         return {

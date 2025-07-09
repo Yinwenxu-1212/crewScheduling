@@ -6,6 +6,7 @@ from typing import List
 from datetime import timedelta
 from data_models import Flight, Roster, Crew
 from unified_config import config
+from initial_solution_generator import calculate_unified_roster_cost
 
 class MasterProblem:
     def __init__(self, flights: List[Flight], crews: List[Crew], ground_duties: List = None, layover_stations = None):
@@ -21,143 +22,19 @@ class MasterProblem:
         self.AWAY_OVERNIGHT_PENALTY = optimization_params['away_overnight_penalty']
         self.NEW_LAYOVER_PENALTY = optimization_params['new_layover_penalty']
         self.UNCOVERED_FLIGHT_PENALTY = optimization_params['uncovered_flight_penalty']
-        # 🔧 修复：占位任务未覆盖惩罚（恢复合理值以确保优化器有动力覆盖占位任务）
-        # 注意：GroundDuty是占位任务，不是置位任务。置位任务包括飞行置位和大巴置位(BusInfo)
         self.UNCOVERED_GROUND_DUTY_PENALTY = optimization_params['uncovered_ground_duty_penalty']
         
         # 设置线性目标函数
         self.use_simple_objective = True
 
-    def add_roster(self, roster):
+    def add_roster(self, roster, is_initial_roster=False):
         """向主问题添加新的排班方案"""
-        self._add_roster(roster)
+        self._add_roster(roster, is_initial_roster)
     
-    def _add_roster(self, roster):
-        """向模型添加新的排班方案"""
-        if not hasattr(self, 'model'):
-            self._setup_model()
-        
-        # 计算roster的成本
-        roster_cost = self._calculate_roster_cost(roster)
-        
-        # 创建roster变量
-        var = self.model.addVar(
-            vtype=GRB.CONTINUOUS, lb=0, ub=1, 
-            obj=roster_cost,
-            name=f"roster_{roster.crew_id}_{len(self.roster_vars)}"
-        )
-        self.roster_vars[roster] = var
-        
-        # 更新目标函数以包含新的roster成本
-        # 重新构建完整的目标函数表达式
-        self._update_objective_function()
-        
-        # 更新机组约束
-        if roster.crew_id in self.crew_constraints:
-            # 移除旧约束
-            old_constr = self.crew_constraints[roster.crew_id]
-            self.model.remove(old_constr)
-            
-            # 收集该机组的所有roster变量
-            crew_vars = [v for r, v in self.roster_vars.items() if r.crew_id == roster.crew_id]
-            
-            # 添加新约束
-            self.crew_constraints[roster.crew_id] = self.model.addConstr(
-                gp.quicksum(crew_vars) <= 1,
-                name=f"crew_{roster.crew_id}"
-            )
-        
-        # 更新航班覆盖约束（精细化模型：roster-航班执行变量）
-        for duty in roster.duties:
-            if hasattr(duty, 'flightNo') and duty.id in self.flight_constraints:
-                # 为当前roster-航班对创建执行变量
-                roster_flight_key = (roster.crew_id, duty.id)
-                if roster_flight_key not in self.roster_flight_execution_vars:
-                    self.roster_flight_execution_vars[roster_flight_key] = self.model.addVar(
-                        vtype=GRB.CONTINUOUS, lb=0, ub=1, 
-                        name=f"exec_{roster.crew_id}_{duty.id}"
-                    )
-                
-                # 约束1：只有选中的roster才能执行其航班
-                # exec_roster_flight <= roster_var
-                self.model.addConstr(
-                    self.roster_flight_execution_vars[roster_flight_key] <= self.roster_vars[roster],
-                    name=f"exec_limit_{roster.crew_id}_{duty.id}"
-                )
-                
-                # 移除旧的航班覆盖约束
-                old_constr = self.flight_constraints[duty.id]
-                self.model.remove(old_constr)
-                
-                # 收集该航班的所有roster-航班执行变量
-                flight_exec_vars = []
-                for key, var in self.roster_flight_execution_vars.items():
-                    if key[1] == duty.id:  # key[1]是flight_id
-                        flight_exec_vars.append(var)
-                
-                # 约束2：每个航班最多被一个roster执行
-                # sum(exec_roster_flight) + uncovered = 1
-                self.flight_constraints[duty.id] = self.model.addConstr(
-                    gp.quicksum(flight_exec_vars) + self.uncovered_vars[duty.id] == 1,
-                    name=f"flight_unique_exec_{duty.id}"
-                )
-                
-                # 更新航班总执行状态变量
-                # flight_execution_var = sum(exec_roster_flight for this flight)
-                self.model.addConstr(
-                    self.flight_execution_vars[duty.id] == gp.quicksum(flight_exec_vars),
-                    name=f"flight_total_exec_{duty.id}"
-                )
-        
-        # 更新占位任务约束（修正：根据ID识别占位任务，ID以Grd_开头）
-        # 注意：GroundDuty是占位任务，不是置位任务。置位任务包括飞行置位和大巴置位(BusInfo)
-        for duty in roster.duties:
-            # 识别占位任务：检查ID是否以Grd_开头或类型为GroundDuty
-            is_ground_duty = False
-            ground_duty_id = None
-            
-            if hasattr(duty, 'id') and str(duty.id).startswith('Grd_'):
-                is_ground_duty = True
-                ground_duty_id = duty.id
-            elif type(duty).__name__ == 'GroundDuty':
-                is_ground_duty = True
-                ground_duty_id = duty.id
-            elif hasattr(duty, 'task') and str(duty.task).startswith('Grd_'):
-                is_ground_duty = True
-                ground_duty_id = duty.task
-            
-            if is_ground_duty and ground_duty_id in self.ground_duty_constraints:
-                # 移除旧约束
-                old_constr = self.ground_duty_constraints[ground_duty_id]
-                self.model.remove(old_constr)
-                
-                # 收集包含该占位任务的所有roster变量
-                covering_vars = []
-                for r, v in self.roster_vars.items():
-                    for d in r.duties:
-                        duty_id = None
-                        if hasattr(d, 'id') and str(d.id).startswith('Grd_'):
-                            duty_id = d.id
-                        elif type(d).__name__ == 'GroundDuty':
-                            duty_id = d.id
-                        elif hasattr(d, 'task') and str(d.task).startswith('Grd_'):
-                            duty_id = d.task
-                        
-                        if duty_id == ground_duty_id:
-                            covering_vars.append(v)
-                            break
-                
-                # 添加新约束：覆盖变量 + 未覆盖变量 = 1
-                self.ground_duty_constraints[ground_duty_id] = self.model.addConstr(
-                    gp.quicksum(covering_vars) + self.uncovered_ground_duty_vars[ground_duty_id] == 1,
-                    name=f"ground_duty_{ground_duty_id}"
-                )
-
     def solve_lp(self, verbose=False) -> tuple[dict, dict, dict, float]:
         """求解LP松弛问题"""
         return self._solve_lp(verbose=verbose)
         
-
     def solve_bip(self, verbose=False):
         """求解二进制整数规划问题"""
         return self._solve_bip(verbose=verbose)
@@ -180,13 +57,6 @@ class MasterProblem:
             var.vtype = GRB.CONTINUOUS
         for var in self.uncovered_vars.values():
             var.vtype = GRB.CONTINUOUS
-        # 航班执行变量也设置为连续变量
-        for var in self.flight_execution_vars.values():
-            var.vtype = GRB.CONTINUOUS
-        # roster-航班执行变量也设置为连续变量
-        for var in self.roster_flight_execution_vars.values():
-            var.vtype = GRB.CONTINUOUS
-        # 未覆盖占位任务变量也设置为连续变量
         for var in self.uncovered_ground_duty_vars.values():
             var.vtype = GRB.CONTINUOUS
         
@@ -202,7 +72,7 @@ class MasterProblem:
             for crew_id, constr in self.crew_constraints.items():
                 sigma_duals[crew_id] = constr.Pi
             
-            # 航班覆盖约束的对偶价格（现在是航班执行约束）
+            # 航班覆盖约束的对偶价格
             for flight_id, constr in self.flight_constraints.items():
                 pi_duals[flight_id] = constr.Pi
             
@@ -216,7 +86,9 @@ class MasterProblem:
                 print(f"\n=== 线性目标函数求解结果 ===")
                 print(f"目标函数值: {obj_val:.2f}")
                 print(f"求解状态: 最优")
-                print(f"航班执行变量数量: {len(self.flight_execution_vars)}")
+                print(f"roster变量数量: {len(self.roster_vars)}")
+                print(f"未覆盖航班变量数量: {len(self.uncovered_vars)}")
+                print(f"未覆盖占位任务变量数量: {len(self.uncovered_ground_duty_vars)}")
             
             return pi_duals, sigma_duals, ground_duty_duals, obj_val
         else:
@@ -234,24 +106,24 @@ class MasterProblem:
             var.vtype = GRB.BINARY
         for var in self.uncovered_vars.values():
             var.vtype = GRB.BINARY
-        # 航班执行变量也设置为二进制
-        for var in self.flight_execution_vars.values():
-            var.vtype = GRB.BINARY
-        # roster-航班执行变量也设置为二进制
-        for var in self.roster_flight_execution_vars.values():
-            var.vtype = GRB.BINARY
-        # 未覆盖占位任务变量也设置为二进制
         for var in self.uncovered_ground_duty_vars.values():
             var.vtype = GRB.BINARY
         
         if verbose:
             print("正在求解最终的BIP模型...")
             print(f"模型包含 {len(self.roster_vars)} 个roster变量")
-            print(f"模型包含 {len(self.flight_execution_vars)} 个航班执行变量")
-            print(f"模型包含 {len(self.roster_flight_execution_vars)} 个roster-航班执行变量")
-            print(f"模型包含 {len(self.uncovered_vars)} 个未覆盖变量")
+            print(f"模型包含 {len(self.uncovered_vars)} 个未覆盖航班变量") 
+            print(f"模型包含 {len(self.uncovered_ground_duty_vars)} 个未覆盖占位任务变量")
+        
+        # 在求解前验证目标函数设置
+        self._validate_objective_function()
         
         self.model.optimize()
+        
+        # 求解后进行详细的目标函数验证
+        if self.model.status == GRB.OPTIMAL and verbose:
+            self._detailed_objective_validation()
+        
         return self.model
     
     def _get_selected_rosters(self):
@@ -297,13 +169,17 @@ class MasterProblem:
                         task_details = []
                         for duty in roster.duties:
                             if hasattr(duty, 'flightNo'):
-                                task_details.append(f"Flight:{duty.flightNo}")
+                                # 区分执行航班和置位航班
+                                if getattr(duty, 'is_positioning', False):
+                                    task_details.append(f"PositioningFlight:{duty.flightNo}")
+                                else:
+                                    task_details.append(f"Flight:{duty.flightNo}")
                             elif hasattr(duty, 'task'):
                                 task_details.append(f"Ground:{duty.task}")
                             elif type(duty).__name__ == 'BusInfo':
-                                task_details.append(f"Bus:{duty.id}")  # 大巴置位任务
+                                task_details.append(f"Bus:{duty.id}")
                             elif type(duty).__name__ == 'GroundDuty':
-                                task_details.append(f"Ground:{duty.id}")  # 占位任务，非置位任务
+                                task_details.append(f"Ground:{duty.id}")
                             else:
                                 task_details.append(f"Other:{type(duty).__name__}")
                         
@@ -362,7 +238,6 @@ class MasterProblem:
             for roster, var in self.roster_vars.items():
                 if var.X > 0.5:
                     selected_rosters.append(roster)
-                    # 计算覆盖的航班数量（替代飞行时间）
                     total_covered_flights += sum(1 for duty in roster.duties if hasattr(duty, 'flightNo'))
                     total_duty_days += len([duty for duty in roster.duties if hasattr(duty, 'flightNo') or hasattr(duty, 'task')])
             
@@ -409,7 +284,82 @@ class MasterProblem:
                 'ground_duty_coverage_rate': 0,
                 'selected_rosters_count': 0
              }
-    
+
+    def _validate_objective_function(self):
+        """验证目标函数设置是否正确"""
+        print("\n=== 目标函数验证 ===")
+        
+        # 检查roster变量的目标函数系数
+        total_roster_coeff = 0
+        for roster, var in self.roster_vars.items():
+            if hasattr(var, 'Obj'):
+                total_roster_coeff += var.Obj
+        
+        # 检查未覆盖变量的目标函数系数
+        total_uncovered_flight_coeff = sum(var.Obj for var in self.uncovered_vars.values() if hasattr(var, 'Obj'))
+        total_uncovered_gd_coeff = sum(var.Obj for var in self.uncovered_ground_duty_vars.values() if hasattr(var, 'Obj'))
+        
+        print(f"Roster变量总目标函数系数: {total_roster_coeff:.2f}")
+        print(f"未覆盖航班变量总目标函数系数: {total_uncovered_flight_coeff:.2f}")
+        print(f"未覆盖占位任务变量总目标函数系数: {total_uncovered_gd_coeff:.2f}")
+        
+        # 预期系数验证
+        expected_flight_coeff = len(self.uncovered_vars) * self.UNCOVERED_FLIGHT_PENALTY
+        expected_gd_coeff = len(self.uncovered_ground_duty_vars) * self.UNCOVERED_GROUND_DUTY_PENALTY
+        
+        print(f"预期未覆盖航班系数: {expected_flight_coeff:.2f}")
+        print(f"预期未覆盖占位任务系数: {expected_gd_coeff:.2f}")
+
+    def _detailed_objective_validation(self):
+        """详细的目标函数验证"""
+        print("\n=== 详细目标函数验证 ===")
+        
+        try:
+            obj_val = self.model.ObjVal
+            print(f"模型目标函数值: {obj_val:.2f}")
+            
+            # 计算各部分贡献
+            roster_contribution = 0
+            uncovered_flight_contribution = 0
+            uncovered_gd_contribution = 0
+            
+            # Roster贡献
+            for roster, var in self.roster_vars.items():
+                if hasattr(var, 'X') and var.X > 0.001:
+                    roster_contribution += roster.cost * var.X
+                    
+            # 未覆盖航班贡献
+            uncovered_flights_count = 0
+            for flight_id, var in self.uncovered_vars.items():
+                if hasattr(var, 'X') and var.X > 0.5:
+                    uncovered_flights_count += 1
+                    uncovered_flight_contribution += self.UNCOVERED_FLIGHT_PENALTY * var.X
+            
+            # 未覆盖占位任务贡献
+            uncovered_gd_count = 0
+            for gd_id, var in self.uncovered_ground_duty_vars.items():
+                if hasattr(var, 'X') and var.X > 0.5:
+                    uncovered_gd_count += 1
+                    uncovered_gd_contribution += self.UNCOVERED_GROUND_DUTY_PENALTY * var.X
+            
+            total_calculated = roster_contribution + uncovered_flight_contribution + uncovered_gd_contribution
+            difference = abs(obj_val - total_calculated)
+            
+            print(f"目标函数组成分析:")
+            print(f"  - 选中Roster成本总和: {roster_contribution:.2f}")
+            print(f"  - 未覆盖航班惩罚 ({uncovered_flights_count}个): {uncovered_flight_contribution:.2f}")
+            print(f"  - 未覆盖占位任务惩罚 ({uncovered_gd_count}个): {uncovered_gd_contribution:.2f}")
+            print(f"  - 计算总和: {total_calculated:.2f}")
+            print(f"  - 与模型值差异: {difference:.6f}")
+            
+            if difference > 1e-3:
+                print(f"⚠️  警告：目标函数计算差异过大！")
+            else:
+                print(f"✅ 目标函数计算一致")
+                
+        except Exception as e:
+            print(f"目标函数验证出错: {e}")
+
     def _setup_model(self):
         """设置线性目标函数的模型"""
         self.model = gp.Model("MasterProblem")
@@ -420,116 +370,147 @@ class MasterProblem:
         self.crew_constraints = {}
         self.flight_constraints = {}
         self.ground_duty_constraints = {}
-        # 新增：航班执行变量（用于区分执行和置位）
-        self.flight_execution_vars = {}
-        # 新增：roster-航班执行变量（精细化模型：每个roster-航班对一个执行变量）
-        self.roster_flight_execution_vars = {}
         
         # 为每个航班创建未覆盖变量
         for flight in self.flights:
             self.uncovered_vars[flight.id] = self.model.addVar(
-                vtype=GRB.CONTINUOUS, lb=0, ub=1, name=f"uncovered_{flight.id}"
-            )
-            # 为每个航班创建执行变量（表示该航班被实际执行，而非置位）
-            self.flight_execution_vars[flight.id] = self.model.addVar(
-                vtype=GRB.CONTINUOUS, lb=0, ub=1, name=f"execute_{flight.id}"
+                vtype=GRB.CONTINUOUS, lb=0, ub=1, 
+                obj=self.UNCOVERED_FLIGHT_PENALTY,  # 直接设置目标函数系数
+                name=f"uncovered_{flight.id}"
             )
         
-        # 为每个机组创建约束：每个机组最多选择一个roster（初始为空约束，添加roster时更新）
+        # 为每个占位任务创建未覆盖变量
+        self.uncovered_ground_duty_vars = {}
+        for ground_duty in self.ground_duties:
+            self.uncovered_ground_duty_vars[ground_duty.id] = self.model.addVar(
+                vtype=GRB.CONTINUOUS, lb=0, ub=1, 
+                obj=self.UNCOVERED_GROUND_DUTY_PENALTY,  # 直接设置目标函数系数
+                name=f"uncovered_gd_{ground_duty.id}"
+            )
+        
+        # 为每个机组创建约束：每个机组最多选择一个roster
         for crew in self.crews:
             self.crew_constraints[crew.crewId] = self.model.addConstr(
-                0 <= 1, name=f"crew_{crew.crewId}"
+                0 <= 0, name=f"crew_{crew.crewId}"
             )
         
-        # 为每个航班创建覆盖约束：航班执行 + 未覆盖 = 1（修改：允许多个机组选择但只有一个执行）
+        # 为每个航班创建覆盖约束：初始为未覆盖 = 1
         for flight in self.flights:
             self.flight_constraints[flight.id] = self.model.addConstr(
-                self.flight_execution_vars[flight.id] + self.uncovered_vars[flight.id] == 1,
+                self.uncovered_vars[flight.id] == 1,
                 name=f"flight_cover_{flight.id}"
             )
         
-        # 为每个占位任务创建未覆盖变量和软约束
-        # 注意：GroundDuty是占位任务，不是置位任务。置位任务包括飞行置位和大巴置位(BusInfo)
-        self.uncovered_ground_duty_vars = {}
+        # 为每个占位任务创建覆盖约束：初始为未覆盖 = 1
         for ground_duty in self.ground_duties:
-            # 为每个占位任务创建未覆盖变量
-            self.uncovered_ground_duty_vars[ground_duty.id] = self.model.addVar(
-                vtype=GRB.CONTINUOUS, lb=0, ub=1, name=f"uncovered_gd_{ground_duty.id}"
-            )
-            # 初始约束：未覆盖 = 1（将在添加roster时更新）
             self.ground_duty_constraints[ground_duty.id] = self.model.addConstr(
                 self.uncovered_ground_duty_vars[ground_duty.id] == 1, 
                 name=f"ground_duty_{ground_duty.id}"
             )
         
-        # 设置初始目标函数（最小化成本：未覆盖航班惩罚 + 未覆盖占位任务惩罚 + roster成本 + 航班执行奖励）
-        # 根据新要求：飞行时间奖励只通过执行变量获得，roster基础成本不包含飞行奖励
-        from unified_config import config
-        optimization_params = config.get_optimization_params()
-        flight_reward = optimization_params['flight_time_reward']  # 负值表示奖励
+        # 设置目标函数为最小化 - 不需要显式设置，Gurobi会自动使用变量的obj系数
+        self.model.ModelSense = GRB.MINIMIZE
+
+    def _add_roster(self, roster, is_initial_roster=False):
+        """向模型添加新的排班方案"""
+        if not hasattr(self, 'model'):
+            self._setup_model()
         
-        obj_expr = gp.quicksum(
-            self.UNCOVERED_FLIGHT_PENALTY * var for var in self.uncovered_vars.values()
-        ) + gp.quicksum(
-            self.UNCOVERED_GROUND_DUTY_PENALTY * var for var in self.uncovered_ground_duty_vars.values()
-        ) - gp.quicksum(
-            flight_reward * self._get_flight_hours(flight_id) * var for flight_id, var in self.flight_execution_vars.items()
+        # 计算roster成本
+        roster_cost = self._calculate_roster_cost(roster)
+        roster.cost = roster_cost
+        
+        # 为初始解设置保护下界
+        lower_bound = 0.1 if is_initial_roster else 0.0
+        
+        # 创建roster变量，直接设置目标函数系数
+        var_name = f"initial_roster_{roster.crew_id}_{len(self.roster_vars)}" if is_initial_roster else f"roster_{roster.crew_id}_{len(self.roster_vars)}"
+        var = self.model.addVar(
+            vtype=GRB.CONTINUOUS, 
+            lb=lower_bound,  # 初始解设置下界保护
+            ub=1, 
+            obj=roster_cost,  # 直接设置目标函数系数，会自动加入目标函数
+            name=var_name
         )
-        self.model.setObjective(obj_expr, GRB.MINIMIZE)
+        self.roster_vars[roster] = var
+        
+        # 更新机组约束
+        if roster.crew_id in self.crew_constraints:
+            old_constr = self.crew_constraints[roster.crew_id]
+            self.model.remove(old_constr)
+            
+            crew_vars = [v for r, v in self.roster_vars.items() if r.crew_id == roster.crew_id]
+            
+            self.crew_constraints[roster.crew_id] = self.model.addConstr(
+                gp.quicksum(crew_vars) <= 1,
+                name=f"crew_{roster.crew_id}"
+            )
+        
+        # 更新航班覆盖约束
+        for duty in roster.duties:
+            if hasattr(duty, 'flightNo'):
+                is_execution = not getattr(duty, 'is_positioning', False)
+                
+                if is_execution and duty.id in self.flight_constraints:
+                    old_constr = self.flight_constraints[duty.id]
+                    self.model.remove(old_constr)
+                    
+                    covering_vars = []
+                    for r, v in self.roster_vars.items():
+                        for d in r.duties:
+                            if (hasattr(d, 'flightNo') and d.id == duty.id and 
+                                not getattr(d, 'is_positioning', False)):
+                                covering_vars.append(v)
+                                break
+                    
+                    self.flight_constraints[duty.id] = self.model.addConstr(
+                        gp.quicksum(covering_vars) + self.uncovered_vars[duty.id] == 1,
+                        name=f"flight_cover_{duty.id}"
+                    )
+        
+        # 更新占位任务约束
+        for duty in roster.duties:
+            is_ground_duty = False
+            ground_duty_id = None
+            
+            if hasattr(duty, 'id') and str(duty.id).startswith('Grd_'):
+                is_ground_duty = True
+                ground_duty_id = duty.id
+            elif type(duty).__name__ == 'GroundDuty':
+                is_ground_duty = True
+                ground_duty_id = duty.id
+            elif hasattr(duty, 'task') and str(duty.task).startswith('Grd_'):
+                is_ground_duty = True
+                ground_duty_id = duty.task
+            
+            if is_ground_duty and ground_duty_id in self.ground_duty_constraints:
+                old_constr = self.ground_duty_constraints[ground_duty_id]
+                self.model.remove(old_constr)
+                
+                covering_vars = []
+                for r, v in self.roster_vars.items():
+                    for d in r.duties:
+                        duty_id = None
+                        if hasattr(d, 'id') and str(d.id).startswith('Grd_'):
+                            duty_id = d.id
+                        elif type(d).__name__ == 'GroundDuty':
+                            duty_id = d.id
+                        elif hasattr(d, 'task') and str(d.task).startswith('Grd_'):
+                            duty_id = d.task
+                        
+                        if duty_id == ground_duty_id:
+                            covering_vars.append(v)
+                            break
+                
+                self.ground_duty_constraints[ground_duty_id] = self.model.addConstr(
+                    gp.quicksum(covering_vars) + self.uncovered_ground_duty_vars[ground_duty_id] == 1,
+                    name=f"ground_duty_{ground_duty_id}"
+                )
     
     def _calculate_roster_cost(self, roster):
         """
-        计算roster成本
+        计算roster成本c_r
         
-        根据新要求：roster基础成本不包含飞行奖励，飞行奖励只通过执行变量获得
+        使用统一的成本计算函数，确保与初始解生成器的计算逻辑一致
         """
-        from scoring_system import ScoringSystem
-        
-        # 创建评分系统实例，传入必需的参数
-        scoring_system = ScoringSystem(self.flights, self.crews, self.layover_stations)
-        
-        # 获取roster对应的机组
-        crew = None
-        for c in self.crews:
-            if c.crewId == roster.crew_id:
-                crew = c
-                break
-        
-        if crew is None:
-            # 如果找不到机组，使用默认计算
-            return 0
-        
-        # 使用scoring_system计算详细成本，传入空的对偶价格（与初始解保持一致）
-        # 注意：现在total_cost不包含飞行奖励，飞行奖励通过执行变量单独计算
-        cost_details = scoring_system.calculate_roster_cost_with_dual_prices(roster, crew, {}, 0.0)
-        
-        # 直接返回total_cost，现在不包含飞行奖励
-        return cost_details['total_cost']
-    
-    def _get_flight_hours(self, flight_id):
-        """获取指定航班的飞行时间（小时）"""
-        for flight in self.flights:
-            if flight.id == flight_id:
-                return flight.flyTime / 60.0  # 分钟转小时
-        return 0.0
-    
-    def _update_objective_function(self):
-        """更新目标函数以包含所有roster变量的成本"""
-        # 构建完整的目标函数表达式
-        # 根据新要求：飞行时间奖励只通过执行变量获得，roster基础成本不包含飞行奖励
-        from unified_config import config
-        optimization_params = config.get_optimization_params()
-        flight_reward = optimization_params['flight_time_reward']  # 负值表示奖励
-        
-        obj_expr = gp.quicksum(
-            self.UNCOVERED_FLIGHT_PENALTY * var for var in self.uncovered_vars.values()
-        ) + gp.quicksum(
-            self.UNCOVERED_GROUND_DUTY_PENALTY * var for var in self.uncovered_ground_duty_vars.values()
-        ) + gp.quicksum(
-            roster.cost * var for roster, var in self.roster_vars.items()
-        ) - gp.quicksum(
-            flight_reward * self._get_flight_hours(flight_id) * var for flight_id, var in self.flight_execution_vars.items()
-        )
-        
-        # 重新设置目标函数
-        self.model.setObjective(obj_expr, GRB.MINIMIZE)
+        return calculate_unified_roster_cost(roster, self.crews)

@@ -1,4 +1,10 @@
-# Python
+# =============================================================================
+# 机组排班优化系统 Git 忽略文件
+# Crew Scheduling Optimization .gitignore
+# =============================================================================
+
+# Python 核心文件 (Python Core Files)
+# ====================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -137,35 +143,71 @@ cython_debug/
 # VS Code
 .vscode/
 
-# Project specific
+# =============================================================================
+# 项目特定文件 (Project Specific Files)
+# =============================================================================
+
+# 调试和输出目录 (Debug & Output Directories)
+# ============================================
 debug/
 output/
+results/
+logs/
 *.log
 
-# Gurobi model files
+# Gurobi 优化求解器文件 (Gurobi Optimizer Files)
+# ===============================================
 *.lp
 *.mps
 *.sol
 *.ilp
+*.rlp
+*.prm
+gurobi.log
 
-# Optimization results
+# 优化结果文件 (Optimization Result Files)
+# =========================================
 rosterResult_*.csv
 crew_detail_*.csv
 test_report.csv
 optimization_*.log
+solution_*.json
+performance_*.csv
 
-# Model checkpoints
+# AI模型文件 (AI Model Files)
+# ============================
 models/*.pth
+models/*.pkl
+models/*.joblib
 !models/best_model.pth
+!models/.gitkeep
+checkpoints/
+tensorboard_logs/
+wandb/
 
-# Temporary files
+# 数据缓存文件 (Data Cache Files)
+# ===============================
+*.cache
+*.pickle
+*.pkl
+data/.cache/
+data/processed/
+data/temp/
+
+# 临时文件 (Temporary Files)
+# ===========================
 *.tmp
 *.temp
 *~
+*.bak
+*.swp
+*.swo
 
-# Submit directories (keep structure but ignore content)
+# 提交目录 (Submit Directories)
+# ==============================
 submit/*/
 !submit/.gitkeep
+!submit/README.md
 
 # OS generated files
 .DS_Store

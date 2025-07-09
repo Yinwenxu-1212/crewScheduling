@@ -1,36 +1,76 @@
-# file: main.py
-# 值勤日平均飞行时间奖励的权重100
-# 未覆盖航班惩罚（从5增加到300）
-# 性能优化功能已整合到attention_guided_subproblem_solver中
-OPTIMIZATION_AVAILABLE = False
-    
-import time
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+机组排班优化系统主程序
+Crew Scheduling Optimization System Main Module
+
+基于列生成算法和注意力机制的机组排班优化解决方案。
+该系统使用线性目标函数进行优化，支持复杂的航空业务约束。
+
+Author: Crew Scheduling Team
+Email: 2151102@tongji.edu.cn
+Version: 2.0.0
+Date: 2025-01-09
+"""
+
 import csv
 import os
+import sys
+import time
 from datetime import datetime
-from coverage_validator import CoverageValidator, print_coverage_summary
+from typing import Dict, List, Optional, Tuple
+
+# 项目模块导入
+from constraint_checker import ConstraintChecker
+from coverage_validator import CoverageValidator
 from data_loader import load_all_data
+from data_models import Flight, Roster
+from ground_duty_validator import GroundDutyValidator
+from initial_solution_generator import generate_initial_rosters_with_heuristic
 from master_problem import MasterProblem
 from results_writer import write_results_to_csv
-from gurobipy import GRB
-from data_models import Roster, Flight
 from scoring_system import ScoringSystem
-from initial_solution_generator import generate_initial_rosters_with_heuristic
-from ground_duty_validator import GroundDutyValidator
 from unified_config import UnifiedConfig
+
+# 第三方库导入
+try:
+    from gurobipy import GRB
+except ImportError:
+    print("警告: Gurobi未安装，某些功能可能不可用")
+    GRB = None
+
+# 可选模块导入
+OPTIMIZATION_AVAILABLE = False
+ATTENTION_AVAILABLE = False
 
 try:
     from attention_guided_subproblem_solver import solve_subproblem_for_crew_with_attention
     ATTENTION_AVAILABLE = True
-    print("Attention guidance successfully imported")
+    print("✅ 注意力引导模块加载成功")
 except ImportError as e:
-    print(f"ImportError details: {e}")
+    print(f"⚠️  注意力引导模块导入失败: {e}")
     ATTENTION_AVAILABLE = False
 except Exception as e:
-    print(f"Other error during import: {e}")
+    print(f"❌ 注意力引导模块加载错误: {e}")
     ATTENTION_AVAILABLE = False
 
-def main():
+def main() -> None:
+    """
+    机组排班优化系统主函数
+    
+    执行完整的机组排班优化流程：
+    1. 数据加载与预处理
+    2. 初始解生成
+    3. 列生成算法优化
+    4. 整数规划求解
+    5. 结果验证与输出
+    
+    Returns:
+        None
+        
+    Raises:
+        SystemExit: 当关键模块不可用或数据加载失败时
+    """
     # --- 0. 算法版本 ---
     print("=== 机组排班优化系统 ===")
     print("使用简化线性目标函数版本")
@@ -103,7 +143,7 @@ def main():
         
     print("将初始解添加至主问题...")
     for roster in initial_rosters:
-        master_problem.add_roster(roster)
+        master_problem.add_roster(roster, is_initial_roster=True)  # 标记为初始解，设置保护
     
     # --- 4. 列生成循环 ---
     print("\n开始列生成过程...")
@@ -216,7 +256,7 @@ def main():
                 new_rosters = solve_subproblem_for_crew_with_attention(
                     crew, flights, bus_info, crew_specific_gds,
                     pi_duals, layover_stations, crew_leg_match_dict,
-                    crew_sigma_dual, ground_duty_duals, iteration_round=i, external_log_func=log_debug
+                    crew_sigma_dual, ground_duty_duals=ground_duty_duals, iteration_round=i, external_log_func=log_debug
                 )
                 
                 if new_rosters:
@@ -236,7 +276,7 @@ def main():
                         log_debug(f"      对偶贡献: {cost_details['dual_contribution']:.6f}")
                         log_debug(f"      任务数: {len(r.duties)}")
                         
-                        if reduced_cost < -1e-6:  # 放宽阈值
+                        if reduced_cost < -0.01:  # 放宽阈值，允许更多潜在有价值的roster
                             valuable_count += 1
                             master_problem.add_roster(r)
                             new_rosters_found_count += 1
@@ -327,42 +367,53 @@ def main():
     print("\n正在评估初始解质量...")
     
     # 计算初始解的目标函数值
-    # 计算初始解的原始问题目标函数值（日均飞时得分）
+    # 使用与主问题一致的线性目标函数值计算方法
     total_flight_hours = 0.0
     total_duty_days = 0.0
-    total_penalties = 0.0
     covered_flights = set()
     
+    # 计算初始解的线性目标函数值（与主问题一致）
+    initial_roster_cost_sum = 0
     for roster in initial_rosters:
-        # 直接从roster.duties计算指标，而不依赖于metrics属性
-        roster_flight_hours = 0.0
-        roster_duty_days = set()
+        # 使用与主问题一致的成本计算方法
+        roster_cost = master_problem._calculate_roster_cost(roster)
+        initial_roster_cost_sum += roster_cost
+        # 同时更新roster.cost以保持一致性
+        roster.cost = roster_cost
         
+        # 统计覆盖的航班（用于显示）
         for duty in roster.duties:
             if isinstance(duty, Flight):
                 covered_flights.add(duty.id)
                 # 计算飞行时间（分钟转小时）
                 if hasattr(duty, 'flyTime') and duty.flyTime:
-                    roster_flight_hours += duty.flyTime / 60.0
+                    total_flight_hours += duty.flyTime / 60.0
                 # 记录值勤日期
                 if hasattr(duty, 'std') and duty.std:
-                    roster_duty_days.add(duty.std.date())
+                    total_duty_days += 1
             elif hasattr(duty, 'startTime') and duty.startTime:
                 # 对于非飞行任务，也记录值勤日期
-                roster_duty_days.add(duty.startTime.date())
-        
-        total_flight_hours += roster_flight_hours
-        total_duty_days += len(roster_duty_days)
-        
-        # 简化惩罚计算，暂时设为0，因为我们主要关注飞行时间和值勤天数
-        # total_penalties += 0  # 暂时忽略详细惩罚计算
+                total_duty_days += 1
     
     uncovered_flights_count = len(flights) - len(covered_flights)
-    total_penalties += uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
     
-    # 计算初始解的原始问题目标函数值（日均飞时得分）
+    # 计算未覆盖地面任务数量
+    covered_ground_duties = set()
+    for roster in initial_rosters:
+        for duty in roster.duties:
+            if hasattr(duty, 'crewId') and hasattr(duty, 'airport'):  # 地面任务特征
+                covered_ground_duties.add(duty.id)
+    uncovered_ground_duties_count = len(ground_duties) - len(covered_ground_duties)
+    
+    # 计算初始解的线性目标函数值（与优化目标一致，包含所有惩罚项）
+    initial_linear_objective = (initial_roster_cost_sum + 
+                               uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY +
+                               uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY)
+    
+    # 为了显示，计算竞赛评分公式的值（仅用于参考）
+    total_penalties = uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
     if total_duty_days > 0:
-        initial_objective_value = (100 * total_flight_hours - total_penalties) / total_duty_days
+        initial_objective_value = (total_flight_hours * 1000) / total_duty_days - total_penalties / total_duty_days
     else:
         initial_objective_value = 0.0
     
@@ -372,12 +423,20 @@ def main():
     print(f"覆盖航班数: {len(covered_flights)}")
     print(f"未覆盖航班数: {uncovered_flights_count}")
     print(f"航班覆盖率: {len(covered_flights)/len(flights)*100:.1f}%")
+    print(f"总地面任务数: {len(ground_duties)}")
+    print(f"覆盖地面任务数: {len(covered_ground_duties)}")
+    print(f"未覆盖地面任务数: {uncovered_ground_duties_count}")
+    print(f"地面任务覆盖率: {len(covered_ground_duties)/len(ground_duties)*100:.1f}%" if ground_duties else "地面任务覆盖率: N/A")
     print(f"排班方案数: {len(initial_rosters)}")
     print(f"总飞行时间: {total_flight_hours:.2f} 小时")
     print(f"总值勤天数: {total_duty_days:.0f} 天")
     print(f"日均飞行时间: {total_flight_hours/total_duty_days if total_duty_days > 0 else 0:.2f} 小时")
-    print(f"总惩罚项: {total_penalties:.2f}")
-    print(f"初始解目标函数值（日均飞时得分）: {initial_objective_value:.2f}")
+    print(f"目标函数组成:")
+    print(f"  - Roster成本总和: {initial_roster_cost_sum:.2f}")
+    print(f"  - 未覆盖航班惩罚: {uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY:.2f}")
+    print(f"  - 未覆盖地面任务惩罚: {uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY:.2f}")
+    print(f"初始解线性目标函数值: {initial_linear_objective:.2f}")
+    print(f"初始解竞赛评分（日均飞时得分）: {initial_objective_value:.2f}")
     
     # 验证初始解航班覆盖率
     print(f"\n=== 初始解航班覆盖率验证 ===")
@@ -416,8 +475,8 @@ def main():
     
     # --- 6. 求解最终整数规划问题 ---
     print("\n列生成结束，正在求解最终的整数规划问题...")
-    final_model = master_problem.solve_bip()
-
+    final_model = master_problem.solve_bip(verbose=True)
+    
     # 调试：显示目标函数值的详细组成
     print(f"\n=== 目标函数调试信息 ===")
     if final_model.SolCount > 0 and final_model.Status == 2:  # 2表示OPTIMAL状态
@@ -425,23 +484,33 @@ def main():
         print(f"最终目标函数值: {obj_val:.2f}")
         
         # 分解目标函数
+
         roster_cost_sum = 0
-        uncovered_penalty_sum = 0
+        uncovered_flights_penalty = 0
+        uncovered_ground_duties_penalty = 0
         
         try:
             for roster, var in master_problem.roster_vars.items():
-                if var.X > 0.5:  # 被选中的roster
+                if var.X > 0.001:  # 被选中的roster（使用小阈值处理LP松弛）
                     roster_cost_sum += roster.cost * var.X
                     
             for flight_id, var in master_problem.uncovered_vars.items():
-                if var.X > 0.5:  # 未覆盖的航班
-                    uncovered_penalty_sum += master_problem.UNCOVERED_FLIGHT_PENALTY * var.X
+                if var.X > 0.001:  # 未覆盖的航班（使用小阈值处理LP松弛）
+                    uncovered_flights_penalty += master_problem.UNCOVERED_FLIGHT_PENALTY * var.X
+            
+            # 计算未覆盖占位任务惩罚
+            for ground_duty_id, var in master_problem.uncovered_ground_duty_vars.items():
+                if var.X > 0.001:  # 未覆盖的占位任务（使用小阈值处理LP松弛）
+                    uncovered_ground_duties_penalty += master_problem.UNCOVERED_GROUND_DUTY_PENALTY * var.X
+            
+            total_calculated = roster_cost_sum + uncovered_flights_penalty + uncovered_ground_duties_penalty
             
             print(f"目标函数组成:")
             print(f"  - 选中Roster成本总和: {roster_cost_sum:.2f}")
-            print(f"  - 未覆盖航班惩罚: {uncovered_penalty_sum:.2f}")
-            print(f"  - 总计: {roster_cost_sum + uncovered_penalty_sum:.2f}")
-            print(f"  - 验证: 与目标函数值差异 = {abs(obj_val - (roster_cost_sum + uncovered_penalty_sum)):.6f}")
+            print(f"  - 未覆盖航班惩罚: {uncovered_flights_penalty:.2f}")
+            print(f"  - 未覆盖占位任务惩罚: {uncovered_ground_duties_penalty:.2f}")
+            print(f"  - 总计: {total_calculated:.2f}")
+            print(f"  - 验证: 与目标函数值差异 = {abs(obj_val - total_calculated):.6f}")
         except Exception as e:
             print(f"访问变量值时出错: {e}")
             print("可能原因：模型求解状态异常或变量索引超出范围")
@@ -479,16 +548,10 @@ def main():
                     print(suggestion)
             
             # 使用线性目标函数值进行比较（与优化目标一致）
-            final_linear_objective = final_cost  # 直接使用模型的目标函数值
+            final_linear_objective = total_calculated  # 使用手动计算的完整目标函数值
             
-            # 计算初始解的线性目标函数值（使用与主问题一致的成本计算方法）
-            initial_roster_cost_sum = 0
-            for roster in initial_rosters:
-                # 重新计算roster成本，确保与主问题使用相同的计算方法
-                roster_cost = master_problem._calculate_roster_cost(roster)
-                initial_roster_cost_sum += roster_cost
-            
-            initial_linear_objective = initial_roster_cost_sum + uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
+            # 初始解的线性目标函数值已在前面计算过，直接使用
+            # initial_linear_objective 变量已经包含了正确的值
             
             print(f"\n=== 最终解目标函数分析 ===")
             print(f"最终解线性目标函数值: {final_linear_objective:.2f}")

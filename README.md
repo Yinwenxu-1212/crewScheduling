@@ -1,15 +1,18 @@
 # 机组排班优化系统 (Crew Scheduling Optimization)
 
-基于列生成算法的机组排班优化系统，用于解决航空公司机组人员的排班问题。
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-## 项目概述
+基于列生成算法和注意力机制的智能机组排班优化系统，专为航空公司机组人员排班问题设计。
 
-本项目实现了一个完整的机组排班优化解决方案，主要特点包括：
+## ✨ 核心特性
 
-- **列生成算法**：高效求解大规模排班问题
-- **线性目标函数**：简化的覆盖率优化目标
-- **注意力机制**：智能引导子问题求解
-- **多约束处理**：支持复杂的航空业务规则
+- 🚀 **列生成算法**：高效求解大规模排班问题
+- 🧠 **注意力机制**：AI引导的智能子问题求解
+- 📊 **线性目标函数**：简化且稳定的覆盖率优化
+- 🔧 **多约束处理**：支持复杂航空业务规则
+- 📈 **实时监控**：详细的求解过程可视化
 
 ## 核心算法
 
@@ -23,140 +26,129 @@
 - Beam Search策略探索解空间
 - 启发式剪枝提高求解效率
 
-## 项目结构
+## 📁 项目结构
 
 ```
 crewSchedule_cg/
-├── main.py                              # 主程序入口
-├── data_loader.py                       # 数据加载模块
-├── data_models.py                       # 数据模型定义
-├── master_problem.py                    # 主问题求解器
-├── subproblem_solver.py                 # 传统子问题求解器
-├── attention_guided_subproblem_solver.py # 注意力引导子问题求解器
-├── scoring_system.py                    # 排班方案评分系统
-├── initial_solution_generator.py        # 初始解生成器
-├── coverage_validator.py                # 覆盖率验证器
-├── results_writer.py                    # 结果输出模块
-├── attention/                           # 注意力模型相关
-│   ├── model.py                        # 神经网络模型
-│   ├── environment.py                  # 强化学习环境
-│   ├── config.py                       # 模型配置
-│   └── utils.py                        # 工具函数
-├── data/                               # 输入数据
-│   ├── flight.csv                     # 航班信息
-│   ├── crew.csv                       # 机组信息
-│   ├── crewLegMatch.csv               # 机组航段匹配
-│   ├── busInfo.csv                    # 班车信息
-│   ├── groundDuty.csv                 # 地面值勤
-│   └── layoverStation.csv             # 过夜站点
-├── models/                             # 预训练模型
-└── requirements.txt                    # 依赖包列表
+├── 🚀 核心模块
+│   ├── main.py                              # 主程序入口
+│   ├── master_problem.py                    # 主问题求解器
+│   └── attention_guided_subproblem_solver.py # AI引导子问题求解器
+├── 📊 数据处理
+│   ├── data_loader.py                       # 数据加载
+│   ├── data_models.py                       # 数据模型
+│   └── unified_config.py                    # 统一配置
+├── 🔍 验证与评估
+│   ├── coverage_validator.py                # 覆盖率验证
+│   ├── ground_duty_validator.py             # 地面值勤验证
+│   └── scoring_system.py                    # 评分系统
+├── 🧠 AI模块
+│   └── attention/                           # 注意力机制
+│       ├── model.py                        # 神经网络模型
+│       ├── environment.py                  # 强化学习环境
+│       └── config.py                       # 模型配置
+├── 📂 数据文件
+│   └── data/                               # CSV数据文件
+└── 📋 配置文件
+    ├── requirements.txt                    # Python依赖
+    └── .gitignore                         # Git忽略规则
 ```
 
-## 安装要求
+## 🚀 快速开始
 
-### Python版本
+### 环境要求
 - Python 3.8+
+- Gurobi Optimizer (需要许可证)
 
-### 依赖包
+### 安装依赖
 ```bash
+# 克隆项目
+git clone https://github.com/Yinwenxu-1212/crewScheduling.git
+cd crewSchedule_cg
+
+# 安装依赖
 pip install -r requirements.txt
 ```
 
-主要依赖：
-- `gurobipy`: 优化求解器
-- `pandas`: 数据处理
-- `numpy`: 数值计算
-- `torch`: 深度学习框架
-- `scikit-learn`: 机器学习工具
-
-## 使用方法
-
-### 1. 数据准备
-将输入数据文件放置在 `data/` 目录下：
-- `flight.csv`: 航班信息
-- `crew.csv`: 机组信息
-- `crewLegMatch.csv`: 机组航段匹配关系
-- 其他辅助数据文件
-
-### 2. 运行优化
+### 运行示例
 ```bash
+# 直接运行（使用默认数据）
 python main.py
+
+# 查看结果
+ls output/  # 查看生成的排班方案
 ```
 
-### 3. 查看结果
-优化结果将保存在 `output/` 目录下：
-- `rosterResult_YYYYMMDD_HHMMSS.csv`: 最终排班方案
-- `initial_solution.csv`: 初始解
+### 输出文件
+- `rosterResult_YYYYMMDD_HHMMSS.csv` - 最终排班方案
+- `initial_solution.csv` - 初始解
+- `optimization_*.log` - 求解日志
 
-## 配置参数
+## ⚙️ 配置参数
 
-### 算法参数
-- `MAX_ITERATIONS`: 最大迭代次数 (默认: 10) *已优化*
-- `CONVERGENCE_THRESHOLD`: 收敛阈值 (默认: 1e-6)
-- `TIME_LIMIT`: 时间限制 (默认: 3600秒)
+### 核心算法参数
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MAX_ITERATIONS` | 10 | 列生成最大迭代次数 |
+| `TIME_LIMIT` | 3600s | 求解时间限制 |
+| `beam_width` | 10 | AI搜索束宽度 |
+| `max_iterations` | 2000 | 子问题最大迭代次数 |
 
-### 子问题搜索参数 *已优化*
-- `max_iterations`: 子问题最大迭代次数 (默认: 2000)
-- `beam_width`: 束搜索宽度 (默认: 10)
-- `max_candidates_per_expansion`: 每次扩展的最大候选数 (默认: 8)
+### 业务约束参数
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MAX_FLIGHT_HOURS` | 100h | 最大飞行小时数 |
+| `MAX_DUTY_DAYS` | 20天 | 最大值勤天数 |
+| `MIN_REST_TIME` | 12h | 最小休息时间 |
 
-### 业务约束
-- `MAX_FLIGHT_HOURS`: 最大飞行小时数 (默认: 100)
-- `MAX_DUTY_DAYS`: 最大值勤天数 (默认: 20)
-- `MIN_REST_TIME`: 最小休息时间 (默认: 12小时)
+### 目标函数系数
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `FLY_TIME_MULTIPLIER` | 50 | 飞行时间奖励系数 |
+| `UNCOVERED_FLIGHT_PENALTY` | -500 | 未覆盖航班惩罚 |
+| `POSITIONING_PENALTY` | -0.5 | 调机惩罚系数 |
 
-### 惩罚系数
-- `FLY_TIME_MULTIPLIER`: 飞行时间奖励系数 (默认: 50) *已优化*
-- `UNCOVERED_FLIGHT_PENALTY`: 未覆盖航班惩罚 (默认: -500) *已优化*
-- `POSITIONING_PENALTY`: 定位惩罚 (默认: -0.5)
-- `AWAY_OVERNIGHT_PENALTY`: 外站过夜惩罚 (默认: -0.5)
-- `NEW_LAYOVER_PENALTY`: 新增过夜站点惩罚 (默认: -10)
-- `VIOLATION_PENALTY`: 违规惩罚 (默认: -10)
+> 💡 **提示**: 所有参数可在 `unified_config.py` 中修改
 
-## 最新优化 (2025年)
+## 🎯 算法特性
 
-### 参数调优
-1. **飞行时间奖励系数优化**: 从1000降至50，提高算法数值稳定性
-2. **未覆盖航班惩罚强化**: 从300提升至500，显著提高航班覆盖率
-3. **搜索空间扩大**: 子问题迭代次数从500增至2000，束搜索宽度从5增至10
-4. **参数统一化**: 消除硬编码数值，提高代码可维护性
+### ✅ 核心优势
+- **🚀 高效性**: 列生成算法处理大规模问题
+- **🧠 智能性**: AI注意力机制提升求解质量  
+- **🔧 灵活性**: 支持多种业务约束和目标
+- **📈 稳定性**: 线性目标函数保证收敛
+- **🛠️ 可维护性**: 模块化设计便于扩展
 
-### 代码质量提升
-1. **错误修复**: 修复了`avg_daily_flight_hours`未定义变量错误
-2. **参数一致性**: 统一了系数设置，提高代码可维护性
-3. **变量引用**: 将硬编码数值替换为类变量引用，提高可配置性
+### 🎯 适用场景
+- ✈️ 航空公司机组排班
+- 👥 大规模人员调度
+- 📊 资源分配优化
+- 🏭 生产计划排程
 
-## 算法特性
-
-### 优势
-1. **高效性**: 列生成算法处理大规模问题
-2. **智能性**: 注意力机制提升求解质量
-3. **灵活性**: 支持多种业务约束和目标
-4. **稳定性**: 线性目标函数保证收敛
-5. **可维护性**: 参数化设计便于调优和扩展
-
-### 适用场景
-- 航空公司机组排班
-- 大规模人员调度
-- 资源分配优化
-
-## 开发说明
+## 🔧 开发指南
 
 ### 代码规范
-- 遵循PEP 8编码规范
-- 使用类型注解提高代码可读性
-- 详细的文档字符串说明
+- 遵循 PEP 8 编码规范
+- 使用类型注解和文档字符串
+- 模块化设计，职责分离
 
 ### 调试功能
-- 详细的日志记录
-- 中间结果保存
-- 性能监控指标
+- 详细的日志记录系统
+- 中间结果自动保存
+- 实时性能监控指标
 
-### 扩展性
-- 模块化设计便于功能扩展
-- 插件式求解器架构
-- 可配置的约束和目标函数
+### 扩展开发
+```bash
+# 安装开发依赖
+pip install -r requirements-dev.txt
+
+# 代码质量检查
+pre-commit install
+python scripts/check_code_quality.py
+
+# 运行测试
+pytest tests/ -v --cov
+```
 
 ## 许可证
 

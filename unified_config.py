@@ -12,13 +12,13 @@ class UnifiedConfig:
     
     # === 核心成本参数 ===
     # 这些参数必须在主问题和子问题中保持完全一致
-    FLIGHT_TIME_REWARD = 100        # 飞行时间奖励（正值，在目标函数中用减号表示奖励）
-    POSITIONING_PENALTY = 0.5       # 占位惩罚（统一使用子问题的值）
-    AWAY_OVERNIGHT_PENALTY = 0.5    # 外站过夜惩罚（统一使用子问题的值）
-    NEW_LAYOVER_PENALTY = 10        # 新停留站点惩罚
-    UNCOVERED_FLIGHT_PENALTY = 500  # 未覆盖航班惩罚（主要覆盖率驱动因子）
-    UNCOVERED_GROUND_DUTY_PENALTY = 10000  # 未覆盖占位任务惩罚（适中值，确保有覆盖动力但不过度影响目标函数）
-    VIOLATION_PENALTY = 10          # 违规惩罚
+    FLIGHT_TIME_REWARD = 50       # 飞行时间奖励（大幅提高，激励执行航班）
+    POSITIONING_PENALTY = 5.0      # 置位惩罚（大幅提高，抑制过度置位）
+    AWAY_OVERNIGHT_PENALTY = 0.5   # 外站过夜惩罚（保持不变）
+    NEW_LAYOVER_PENALTY = 10       # 新停留站点惩罚
+    UNCOVERED_FLIGHT_PENALTY = 200 # 未覆盖航班惩罚（提高，强化航班覆盖优先级）
+    UNCOVERED_GROUND_DUTY_PENALTY = 1000  # 未覆盖占位任务惩罚（降低，平衡航班与占位任务优先级）
+    VIOLATION_PENALTY = 10         # 违规惩罚
     
     # === 评分系统参数 ===
     # 用于最终评价的竞赛标准参数
@@ -42,13 +42,55 @@ class UnifiedConfig:
     MIN_CONNECTION_TIME_BUS_HOURS = 2  # 大巴置位与飞行任务最小间隔2小时
     
     # === 算法参数 ===
-    MAX_SUBPROBLEM_ITERATIONS = 1000  # 子问题求解最大迭代次数
-    BEAM_WIDTH = 10
+    MAX_SUBPROBLEM_ITERATIONS = 2000  # 子问题求解最大迭代次数（增大搜索深度）
+    BEAM_WIDTH = 20  # beam search宽度（增大搜索范围）
+    MAX_CREWS_PER_FLIGHT = 6  # 每个航班最多被分配给的机组数量
+    
+    # === 搜索优化参数 ===
+    MAX_VISITED_STATES = 200000  # 最大访问状态数
+    CLEANUP_INTERVAL = 2000  # 清理间隔
+    CONVERGENCE_THRESHOLD = 1e-4  # 收敛阈值
+    STAGNATION_LIMIT = 5  # 停滞限制
+    MIN_ITERATIONS = 3  # 最小迭代次数
     
     # === 主程序运行参数 ===
     TIME_LIMIT_SECONDS = 1 * 3600 + 55 * 60  # 1小时55分钟
     DATA_PATH = 'data/'
     MAX_COLUMN_GENERATION_ITERATIONS = 3
+    PLANNING_START_DATE = (2025, 4, 29)  # 计划开始日期 (年, 月, 日)
+    
+    # === 机场分类配置 ===
+    # 动态机场分类配置 - 基于数据自动分析
+    try:
+        from dynamic_airport_analyzer import get_dynamic_airport_config
+        
+        # 获取动态分析的机场分类
+        _airport_config = get_dynamic_airport_config()
+        
+        HUB_AIRPORTS = _airport_config.get('HUB_AIRPORTS', set())
+        MAJOR_AIRPORTS = _airport_config.get('MAJOR_AIRPORTS', set())
+        IMPORTANT_AIRPORTS = _airport_config.get('IMPORTANT_AIRPORTS', set())
+        
+        print(f"动态加载机场配置: 枢纽={len(HUB_AIRPORTS)}, 主要={len(MAJOR_AIRPORTS)}, 重要={len(IMPORTANT_AIRPORTS)}")
+        
+    except Exception as e:
+        print(f"动态机场分析失败，使用默认配置: {e}")
+        # 降级到基础配置
+        HUB_AIRPORTS = {'VIOC'}
+        MAJOR_AIRPORTS = {'RRES', 'RTHW'}
+        IMPORTANT_AIRPORTS = {
+            'VIOC', 'RRES', 'RTHW',  # 枢纽机场
+            'ENDP', 'TATC', 'TPWY', 'VWSF', 'XVFW',  # 高频航班机场（200+航班）
+            'JFEE', 'BTTC', 'GDHI', 'RTWL'  # 重要航班机场（130+航班）
+        }
+    
+    # === 置位价值评估权重 ===
+    POSITIONING_VALUE_WEIGHTS = {
+        'base_importance': 0.3,      # 基础重要性权重
+        'connection_value': 0.4,     # 连接价值权重（最重要）
+        'time_urgency': 0.2,         # 时间紧迫性权重
+        'coverage_need': 0.1         # 覆盖需求权重
+    }
     
     @classmethod
     def get_optimization_params(cls):

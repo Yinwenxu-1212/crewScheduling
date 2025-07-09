@@ -9,6 +9,7 @@
 from datetime import datetime, timedelta
 from typing import List, Dict, Set, Optional, Tuple
 from data_models import Flight, Crew, GroundDuty, BusInfo, DutyDay, FlightDutyPeriod, Label
+from unified_config import UnifiedConfig
 
 class UnifiedConstraintChecker:
     """统一的约束检查器，确保生成和评分使用相同的逻辑"""
@@ -16,21 +17,21 @@ class UnifiedConstraintChecker:
     def __init__(self, layover_stations_set: Set[str]):
         self.layover_stations_set = layover_stations_set
         
-        # 约束参数
-        self.MAX_DUTY_DAY_HOURS = 12.0  # 修正：飞行值勤日最大值勤时间不超过12小时
-        self.MIN_REST_HOURS = 12.0
-        self.MAX_FLIGHTS_IN_DUTY = 4
-        self.MAX_TASKS_IN_DUTY = 6
-        self.MAX_FLIGHT_TIME_IN_DUTY_HOURS = 8.0
+        # 从统一配置获取约束参数
+        self.MAX_DUTY_DAY_HOURS = UnifiedConfig.MAX_DUTY_DAY_HOURS
+        self.MIN_REST_HOURS = UnifiedConfig.MIN_REST_HOURS
+        self.MAX_FLIGHTS_IN_DUTY = UnifiedConfig.MAX_FLIGHTS_IN_DUTY
+        self.MAX_TASKS_IN_DUTY = UnifiedConfig.MAX_TASKS_IN_DUTY
+        self.MAX_FLIGHT_TIME_IN_DUTY_HOURS = UnifiedConfig.MAX_FLIGHT_TIME_IN_DUTY_HOURS
         self.MAX_TOTAL_FLIGHT_HOURS = 60.0  # 修正：总飞行值勤时间不超过60小时
         self.MAX_FLIGHT_CYCLE_DAYS = 4
         self.MIN_CYCLE_REST_DAYS = 2
         self.MAX_CONSECUTIVE_DUTY_DAYS = 4
         
-        # 连接时间参数
-        self.MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT = timedelta(minutes=30)
-        self.MIN_CONNECTION_TIME_FLIGHT_DIFF_AIRCRAFT = timedelta(hours=3)  # 修正：不同飞机间隔不小于3小时
-        self.MIN_CONNECTION_TIME_BUS = timedelta(hours=2)  # 修正：大巴置位与飞行任务间隔2小时
+        # 从统一配置获取连接时间参数
+        self.MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT = timedelta(minutes=UnifiedConfig.MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT_MINUTES)
+        self.MIN_CONNECTION_TIME_FLIGHT_DIFF_AIRCRAFT = timedelta(hours=UnifiedConfig.MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT_HOURS)
+        self.MIN_CONNECTION_TIME_BUS = timedelta(hours=UnifiedConfig.MIN_CONNECTION_TIME_BUS_HOURS)
         self.DEFAULT_MIN_CONNECTION_TIME = timedelta(hours=1)
         
     def organize_tasks_into_duty_days(self, tasks: List) -> List[DutyDay]:
@@ -99,28 +100,82 @@ class UnifiedConstraintChecker:
         
         return duty_days
     
-    def can_assign_task_to_label(self, current_label: Label, task: Dict, crew: Crew) -> bool:
+    def can_assign_task_to_label(self, current_label: Label, task: Dict, crew: Crew, crew_leg_match_dict: Dict[str, List[str]] = None) -> bool:
         """
         检查是否可以将任务分配给当前标签
         使用新的DutyDay结构进行约束检查
+        
+        Args:
+            current_label: 当前标签状态
+            task: 待分配的任务
+            crew: 机组信息
+            crew_leg_match_dict: 机组航班资格匹配字典，格式为 {crew_id: [flight_id_list]}
         """
         # 1. 基本时间顺序检查
         if current_label.node and task['startTime'] < current_label.node.time:
             return False
         
         # 2. 地点衔接检查
-        if current_label.node and current_label.node.airport != task['depaAirport']:
+        dep_airport = task.get('depAirport') or task.get('depaAirport')
+        if current_label.node and current_label.node.airport != dep_airport:
             return False
         
         # 3. 资格检查（飞行任务）
         if task['type'] == 'flight':
-            # 这里需要传入crew_leg_matches_set进行检查
-            # 暂时简化处理
-            pass
+            # 获取航班ID（处理执行和置位任务的不同命名）
+            flight_id = task.get('original_flight_id')
+            if not flight_id:
+                # 从taskId中提取原始航班ID
+                task_id = task.get('taskId', '')
+                if '_exec' in task_id:
+                    flight_id = task_id.replace('_exec', '')
+                elif '_pos' in task_id:
+                    flight_id = task_id.replace('_pos', '')
+                else:
+                    flight_id = task_id
+            
+            # 如果是置位任务，通常不需要资格检查（任何机组都可以置位）
+            if task.get('subtype') == 'positioning' or task.get('is_positioning', False):
+                pass  # 置位任务不需要资格检查
+            else:
+                # 执行任务需要资格检查
+                if not flight_id:
+                    return False  # 无法确定航班ID，拒绝分配
+                
+                # 如果提供了资格匹配字典，进行严格的资格检查
+                if crew_leg_match_dict is not None:
+                    eligible_flights = crew_leg_match_dict.get(crew.crewId, [])
+                    if flight_id not in eligible_flights:
+                        return False  # 机组没有执行该航班的资格
+                # 如果没有提供资格匹配字典，假设资格检查在其他地方已完成
+        
+        # 3.5. 占位任务机组匹配检查
+        elif (task['type'] == 'ground_duty' or task['type'] == 'groundDuty' or 
+              str(task.get('taskId', '')).startswith('Grd_')):
+            # 占位任务只能分配给指定的机组
+            task_crew_id = task.get('crewId')
+            if task_crew_id and task_crew_id != crew.crewId:
+                return False  # 占位任务不属于当前机组
         
         # 4. 连接时间检查
         if current_label.node and current_label.node.time:
             connection_time = task['startTime'] - current_label.node.time
+            
+            # 占位任务特殊处理：不受连接时间限制，但需要时间顺序正确
+            if (task['type'] == 'ground_duty' or task['type'] == 'groundDuty' or 
+                str(task.get('id', '')).startswith('Grd_')):
+                # 占位任务只需要保证时间顺序正确
+                if connection_time >= timedelta(0):
+                    # 如果连接时间足够长，可以开始新值勤日
+                    if connection_time >= timedelta(hours=self.MIN_REST_HOURS):
+                        return self._check_new_duty_day_constraints(current_label, task, crew)
+                    else:
+                        # 继续当前值勤日
+                        return self._check_continue_duty_day_constraints(current_label, task, crew)
+                else:
+                    return False
+            
+            # 其他任务的正常连接时间检查
             min_connection = self._get_min_connection_time(current_label, task)
             
             # 如果连接时间足够长，可以开始新值勤日
@@ -189,7 +244,8 @@ class UnifiedConstraintChecker:
         # 如果有路径记录，从第一个非基地任务开始计算
         if hasattr(current_label, 'path') and current_label.path:
             for path_task in current_label.path:
-                if hasattr(path_task, 'depaAirport') and crew_base and path_task.depaAirport != crew_base:
+                dep_airport = getattr(path_task, 'depAirport', None) or getattr(path_task, 'depaAirport', None)
+                if dep_airport and crew_base and dep_airport != crew_base:
                     if hasattr(path_task, 'std'):
                         return path_task.std.date()
                     elif hasattr(path_task, 'startTime'):
@@ -232,7 +288,8 @@ class UnifiedConstraintChecker:
         task_date = task['startTime'].date()
         
         # 如果任务结束在基地，飞行周期结束
-        if task['arriAirport'] == crew.base:
+        arr_airport = task.get('arrAirport') or task.get('arriAirport')
+        if arr_airport == crew.base:
             # 检查飞行周期末尾是否为飞行值勤日
             if hasattr(current_label, 'current_cycle_start') and current_label.current_cycle_start:
                 if not self._is_flight_duty_day_ending_enhanced(current_label, task, is_new_duty):
@@ -282,11 +339,24 @@ class UnifiedConstraintChecker:
         return True
     
     def _check_total_flight_time_constraint(self, current_label: Label, task: Dict) -> bool:
-        """检查总飞行时间约束"""
+        """检查总飞行值勤时间约束 - 修正版"""
+        # 飞行值勤时间 = 飞行值勤日的总时长（从第一个任务开始到最后一个任务结束）
+        # 而不是飞行时间的总和
+        
+        # 如果当前任务是飞行任务，需要检查飞行值勤时间
         if task['type'] == 'flight':
-            potential_total_flight_hours = current_label.total_flight_hours + task.get('flyTime', 0) / 60.0
-            if potential_total_flight_hours > self.MAX_TOTAL_FLIGHT_HOURS:
+            # 计算当前值勤日的飞行值勤时间
+            current_duty_time = 0
+            if hasattr(current_label, 'duty_start_time') and current_label.duty_start_time:
+                current_duty_time = (task['endTime'] - current_label.duty_start_time).total_seconds() / 3600.0
+            
+            # 计算总飞行值勤时间（包括当前值勤日）
+            current_total_flight_duty_hours = getattr(current_label, 'total_flight_duty_hours', 0)
+            potential_total_flight_duty_hours = current_total_flight_duty_hours + current_duty_time
+            
+            if potential_total_flight_duty_hours > self.MAX_TOTAL_FLIGHT_HOURS:
                 return False
+        
         return True
     
     def validate_duty_day(self, duty_day: DutyDay) -> List[str]:
@@ -366,8 +436,14 @@ class UnifiedConstraintChecker:
                 
                 # 检查是否返回基地（飞行周期结束）
                 last_task = duty_day.tasks[-1] if duty_day.tasks else None
-                if last_task and hasattr(last_task, 'arriAirport'):
-                    if last_task.arriAirport == crew.base:
+                if last_task:
+                    last_arr_airport = None
+                    if hasattr(last_task, 'arrAirport'):
+                        last_arr_airport = last_task.arrAirport
+                    elif hasattr(last_task, 'arriAirport'):
+                        last_arr_airport = last_task.arriAirport
+                    
+                    if last_arr_airport == crew.base:
                         # 返回基地，结束当前飞行周期
                         cycle_violations = self._validate_single_flight_cycle(current_cycle_duty_days)
                         violations.extend(cycle_violations)
@@ -600,8 +676,14 @@ class UnifiedConstraintChecker:
                 
                 # 检查是否返回基地（飞行周期结束）
                 last_task = duty_day.tasks[-1] if duty_day.tasks else None
-                if last_task and hasattr(last_task, 'arriAirport'):
-                    if last_task.arriAirport == crew.base:
+                if last_task:
+                    last_arr_airport = None
+                    if hasattr(last_task, 'arrAirport'):
+                        last_arr_airport = last_task.arrAirport
+                    elif hasattr(last_task, 'arriAirport'):
+                        last_arr_airport = last_task.arriAirport
+                    
+                    if last_arr_airport == crew.base:
                         # 返回基地，结束当前飞行周期
                         cycle_violations = self._validate_single_flight_cycle_violations(current_cycle_duty_days)
                         violations += cycle_violations
@@ -719,8 +801,8 @@ class UnifiedConstraintChecker:
             prev_duty = sorted_duties[i-1]
             curr_duty = sorted_duties[i]
             
-            prev_end_airport = getattr(prev_duty, 'arriAirport', None)
-            curr_start_airport = getattr(curr_duty, 'depaAirport', None)
+            prev_end_airport = getattr(prev_duty, 'arrAirport', None) or getattr(prev_duty, 'arriAirport', None)
+            curr_start_airport = getattr(curr_duty, 'depAirport', None) or getattr(curr_duty, 'depaAirport', None)
             
             if prev_end_airport and curr_start_airport:
                 if prev_end_airport != curr_start_airport:

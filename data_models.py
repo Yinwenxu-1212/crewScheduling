@@ -384,7 +384,7 @@ class Label:
     """Label for resource-constrained shortest path algorithm."""
     def __init__(self, cost, path, current_node, duty_start_time=None, 
                  duty_flight_time=0.0, duty_flight_count=0, duty_task_count=0,
-                 total_flight_hours=0.0, total_positioning=0, 
+                 total_flight_hours=0.0, total_flight_duty_hours=0.0, total_positioning=0, 
                  total_away_overnights=0, total_calendar_days=None, 
                  has_flown_in_duty=False, used_task_ids=None, tie_breaker=0,
                  current_cycle_start=None, current_cycle_days=0, last_base_return=None,
@@ -400,6 +400,7 @@ class Label:
         self.duty_flight_count = duty_flight_count
         self.duty_task_count = duty_task_count
         self.total_flight_hours = total_flight_hours
+        self.total_flight_duty_hours = total_flight_duty_hours  # 总飞行值勤时间（飞行值勤日的总时长）
         self.total_positioning = total_positioning
         self.total_away_overnights = total_away_overnights
         self.total_calendar_days = total_calendar_days if total_calendar_days is not None else set()

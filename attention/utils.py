@@ -3,7 +3,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
-import config
+try:
+    from . import config
+except ImportError:
+    import config
 
 class DataHandler:
     """数据加载和预处理"""
@@ -16,14 +19,14 @@ class DataHandler:
         data_files = {
             'flights': 'flight.csv', 'crews': 'crew.csv',
             'crew_leg_match': 'crewLegMatch.csv', 'ground_duties': 'groundDuty.csv',
-            'bus_info': 'businfo.csv', 'layover_stations': 'layoverStation.csv'
+            'bus_info': 'busInfo.csv', 'layover_stations': 'layoverStation.csv'
         }
         data = {}
         for name, filename in data_files.items():
             file_path = os.path.join(self.path, filename)
             data[name] = pd.read_csv(file_path)
         
-        data['ground_duties']['type'] = 'groundDuty'
+        data['ground_duties']['type'] = 'ground_duty'
         time_cols = {'flights': ['std', 'sta'], 'ground_duties': ['startTime', 'endTime'], 'bus_info': ['td', 'ta']}
         for name, cols in time_cols.items():
             for col in cols:
@@ -48,14 +51,89 @@ class DataHandler:
         buses.rename(columns={'id': 'taskId', 'td': 'startTime', 'ta': 'endTime'}, inplace=True)
         buses['type'] = 'positioning_bus'
         
-        unified = pd.concat([flights, buses], ignore_index=True)
-        unified['flyTime'].fillna(0, inplace=True)
+        # 添加占位任务（ground_duties）
+        ground_duties = data['ground_duties'].copy()
+        ground_duties.rename(columns={'id': 'taskId', 'startTime': 'startTime', 'endTime': 'endTime'}, inplace=True)
+        ground_duties['type'] = 'ground_duty'
+        # 占位任务的出发地和到达地都是同一个机场
+        ground_duties['depaAirport'] = ground_duties['airport']
+        ground_duties['arriAirport'] = ground_duties['airport']
+        
+        unified = pd.concat([flights, buses, ground_duties], ignore_index=True)
+        unified = unified.fillna({'flyTime': 0})
         return unified
 
 
-def identify_duties_and_cycles(roster, ground_duties):
+def calculate_complete_calendar_days(end_time, start_time):
+    """
+    计算两个时间点之间的完整日历日数量
+    完整日历日：从end_time的次日00:00到start_time的前日23:59:59
+    """
+    from datetime import timedelta
+    
+    # 获取结束时间的次日和开始时间的前日
+    end_date = end_time.date()
+    start_date = start_time.date()
+    
+    # 计算完整日历日数量
+    # 如果start_date <= end_date，说明没有完整的日历日
+    if start_date <= end_date:
+        return 0
+    
+    # 计算完整日历日数量
+    complete_days = (start_date - end_date).days - 1
+    return max(0, complete_days)
+
+def can_start_new_flight_cycle(last_duty_end_time, last_duty_end_location, 
+                                current_task_start_time, crew_base):
+    """判断是否可以开始新的飞行周期"""
+    
+    # 条件1：必须从基地出发
+    if last_duty_end_location != crew_base:
+        return False, "上一个值勤日未在基地结束，无法开始新飞行周期"
+    
+    # 条件2：必须有2个完整日历日的休息
+    rest_days = calculate_complete_calendar_days(
+        last_duty_end_time, 
+        current_task_start_time
+    )
+    
+    if rest_days < 2:
+        return False, f"休息不足2个完整日历日（只有{rest_days}天）"
+    
+    # 条件3：休息期间必须一直在基地
+    # 由于上一个值勤在基地结束，且中间没有任务，可以认为一直在基地
+    
+    return True, "可以开始新飞行周期"
+
+def is_valid_flight_cycle(cycle_duties):
+    """检查飞行周期是否有效"""
+    if not cycle_duties:
+        return False
+    
+    # 检查是否包含飞行任务
+    has_flight = False
+    for duty in cycle_duties:
+        for task in duty:
+            if task.get('type') == 'flight':
+                has_flight = True
+                break
+        if has_flight:
+            break
+    
+    return has_flight
+
+def flatten_cycle(cycle_duties):
+    """将周期中的值勤日列表扁平化为任务列表"""
+    flattened = []
+    for duty in cycle_duties:
+        flattened.extend(duty)
+    return flattened
+
+def identify_duties_and_cycles(roster, ground_duties, crew_base=None):
     """
     核心辅助函数：从一个机长的完整排班中识别出值勤日和飞行周期。
+    修正版本：正确处理飞行周期的基地休息要求和2个完整日历日休息
     返回:
     - duties: 一个列表，每个元素是一个代表值勤日的任务列表。 e.g., [[t1, t2], [t3]]
     - cycles: 一个列表，每个元素是一个代表飞行周期的任务列表。
@@ -85,24 +163,61 @@ def identify_duties_and_cycles(roster, ground_duties):
     if current_duty:
         duties.append(current_duty)
 
-    # 识别飞行周期 (Flight Cycles)
+    # 识别飞行周期 (Flight Cycles) - 修正版本
     cycles = []
     if not duties: return [], []
-
-    current_cycle = duties[0] # current_cycle现在是一个扁平的任务列表
-    for i in range(1, len(duties)):
-        last_duty_end_time = duties[i-1][-1]['endTime']
-        current_duty_start_time = duties[i][0]['startTime']
+    
+    # 如果没有提供crew_base，尝试从任务中推断
+    if crew_base is None:
+        # 假设第一个任务的出发地是基地（这是一个简化假设）
+        crew_base = duties[0][0].get('depaAirport', 'UNKNOWN')
+    
+    current_cycle = None
+    last_duty_end_location = crew_base  # 假设开始时在基地
+    
+    for i, duty in enumerate(duties):
+        duty_start_location = duty[0].get('depaAirport')
+        duty_end_location = duty[-1].get('arriAirport')
         
-        # 检查两个值勤日之间是否有至少2天的休息
-        # 简化计算：如果休息时间超过48小时，就认为是新周期
-        if (current_duty_start_time - last_duty_end_time) >= timedelta(hours=48):
-             cycles.append(current_cycle)
-             current_cycle = duties[i]
+        # 判断是否包含飞行任务
+        has_flight = any(t.get('type') == 'flight' for t in duty)
+        
+        if i == 0:
+            # 第一个值勤日
+            if crew_base == duty_start_location:
+                # 从基地出发，可以开始飞行周期
+                current_cycle = [duty] if has_flight else []
+            else:
+                # 不从基地出发，不能开始飞行周期
+                current_cycle = []
         else:
-             current_cycle.extend(duties[i]) # 将新值勤日的任务合并进来
-    if current_cycle:
-        cycles.append(current_cycle)
+            prev_duty = duties[i-1]
+            prev_end_time = prev_duty[-1]['endTime']
+            prev_end_location = prev_duty[-1].get('arriAirport')
+            
+            # 检查是否满足新飞行周期条件
+            can_start, reason = can_start_new_flight_cycle(
+                prev_end_time,
+                prev_end_location,
+                duty[0]['startTime'],
+                crew_base
+            )
+            
+            if can_start:
+                # 可以开始新周期
+                if current_cycle and is_valid_flight_cycle(current_cycle):
+                    cycles.append(flatten_cycle(current_cycle))
+                current_cycle = [duty] if has_flight else []
+            else:
+                # 继续当前周期（如果有的话）
+                if current_cycle is not None:
+                    current_cycle.append(duty)
+        
+        last_duty_end_location = duty_end_location
+    
+    # 处理最后的周期
+    if current_cycle and is_valid_flight_cycle(current_cycle):
+        cycles.append(flatten_cycle(current_cycle))
     
     return duties, cycles
 
@@ -122,8 +237,15 @@ class RuleChecker:
         # ground_duties 应该从 data_handler 获取，而不是 roster
         ground_duties = self.dh.crew_ground_duties.get(crew_info['crewId'], [])
         
-        # identify_duties_and_cycles 的输入应该是 assignable_tasks
-        duties, cycles = identify_duties_and_cycles(roster, ground_duties)
+        # 获取机组基地信息
+        crew_base = crew_info.get('base') or crew_info.get('stayStation')
+        
+        # identify_duties_and_cycles 的输入应该是 assignable_tasks，并传入crew_base
+        duties, cycles = identify_duties_and_cycles(roster, ground_duties, crew_base)
+        
+        # Rule 2: 地点衔接规则 - 第一个任务必须从stayStation开始
+        if roster and roster[0].get('depaAirport') != crew_info.get('stayStation'):
+            violations += 1
         
         total_flight_duty_time = 0
 
@@ -132,6 +254,9 @@ class RuleChecker:
             if not flight_duty_tasks:
                 continue
 
+            # 检查是否为飞行值勤日（包含飞行任务）
+            has_flight_task = any(t.get('type') == 'flight' for t in flight_duty_tasks)
+            
             # Rule 1: 置位规则
             pos_indices = [i for i, t in enumerate(flight_duty_tasks) if 'positioning' in t.get('type','')]
             is_pos_in_middle = any(0 < i < len(flight_duty_tasks) - 1 for i in pos_indices)
@@ -154,11 +279,11 @@ class RuleChecker:
             # Rule 5: 最大飞行时间
             if sum(t.get('flyTime', 0) for t in flight_duty_tasks) / 60.0 > 8: violations += 1
 
-            # Rule 6: 最大飞行值勤时间
-            duty_start = flight_duty_tasks[0]['startTime']
-            flight_tasks_in_duty = [t for t in flight_duty_tasks if 'flight' in t.get('type','')]
-            if flight_tasks_in_duty:
-                duty_end = flight_tasks_in_duty[-1]['endTime']
+            # Rule 6: 最大飞行值勤时间（修正版）
+            # 飞行值勤时间 = 飞行值勤日的总时长（从第一个任务开始到最后一个任务结束）
+            if has_flight_task:  # 只有飞行值勤日才计算飞行值勤时间
+                duty_start = flight_duty_tasks[0]['startTime']
+                duty_end = flight_duty_tasks[-1]['endTime']  # 修正：使用最后一个任务的结束时间
                 flight_duty_duration = (duty_end - duty_start).total_seconds() / 3600.0
                 if flight_duty_duration > 12: violations += 1
                 total_flight_duty_time += flight_duty_duration
@@ -176,6 +301,13 @@ class RuleChecker:
                     violations += 1
         # --- 错误修正结束 ---
 
+        # Rule 7: 最小休息时间规则 - 值勤日之间至少12小时休息
+        for i in range(len(duties) - 1):
+            if duties[i] and duties[i+1]:
+                rest_time = duties[i+1][0]['startTime'] - duties[i][-1]['endTime']
+                if rest_time < timedelta(hours=12):
+                    violations += 1
+        
         # Rule 9: 总飞行值勤时间限制
         if total_flight_duty_time > 60: violations += 1
         
@@ -189,13 +321,14 @@ def calculate_final_score(roster_plan, data_handler):
     
     total_fly_hours, total_duty_calendar_days, overnight_stays, positioning_count, total_violations = 0, 0, 0, 0, 0
     
-    # --- 核心修改：只记录被“执飞”的航班 ---
+    # --- 核心修改：只记录被"执飞"的航班 ---
     covered_flight_ids = set()
+    covered_ground_duties = 0  # 新增：统计覆盖的占位任务数量
 
     for crew_id, tasks in roster_plan.items():
         if not tasks: continue
         
-        assignable_tasks = [t for t in tasks if t.get('type') != 'groundDuty']
+        assignable_tasks = [t for t in tasks if t.get('type') != 'ground_duty']
         if not assignable_tasks: continue
 
         sorted_tasks = sorted(assignable_tasks, key=lambda x: x['startTime'])
@@ -223,6 +356,8 @@ def calculate_final_score(roster_plan, data_handler):
                 covered_flight_ids.add(task['taskId'])
             elif 'positioning' in task_type:
                 positioning_count += 1
+            elif task_type == 'ground_duty':
+                covered_ground_duties += 1
                 
         total_violations += rule_checker.check_full_roster(sorted_tasks, crew_info)
 
@@ -231,10 +366,14 @@ def calculate_final_score(roster_plan, data_handler):
     
     avg_daily_fly_time = (total_fly_hours / total_duty_calendar_days) if total_duty_calendar_days > 0 else 0
     
+    # 计算占位任务覆盖奖励
+    ground_duty_bonus = covered_ground_duties * config.GROUND_DUTY_COVERAGE_REWARD
+    
     score = (avg_daily_fly_time * config.SCORE_FLY_TIME_MULTIPLIER +
              uncovered_flights_count * config.PENALTY_UNCOVERED_FLIGHT +
              overnight_stays * config.PENALTY_OVERNIGHT_STAY_AWAY_FROM_BASE +
              positioning_count * config.PENALTY_POSITIONING +
-             total_violations * config.PENALTY_RULE_VIOLATION)
+             total_violations * config.PENALTY_RULE_VIOLATION +
+             ground_duty_bonus)
              
     return score
