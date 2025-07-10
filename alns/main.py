@@ -31,6 +31,10 @@ from data_loader import load_all_data
 from data_models import Flight, Crew, Roster, GroundDuty, BusInfo
 # from results_writer import write_results_to_csv  # 使用自定义的简化版本
 from unified_config import UnifiedConfig
+from scoring_system import ScoringSystem
+
+# traceback
+import traceback
 
 
 class ALNSSolution:
@@ -148,11 +152,14 @@ class DestroyOperator:
 class RepairOperator:
     """修复算子基类"""
 
-    def __init__(self, name: str, weight: float = 1.0):
+    def __init__(self, name: str, weight: float = 1.0, scoring_system: ScoringSystem = None):
         self.name = name
         self.weight = weight
         self.usage_count = 0
         self.success_count = 0
+        self.scoring_system = scoring_system
+        if scoring_system is None:
+            raise ValueError("3. Scoring system must be provided")
 
     def repair(self, solution: ALNSSolution, removed_elements: List[Any]) -> ALNSSolution:
         """
@@ -292,8 +299,8 @@ class GreedyRepair(RepairOperator):
 
     def __init__(self, crews: List[Crew], flights: List[Flight],
                  ground_duties: List[GroundDuty], bus_info: List[BusInfo],
-                 crew_leg_match_dict: Dict, layover_stations: Set[str]):
-        super().__init__("GreedyRepair")
+                 crew_leg_match_dict: Dict, layover_stations: Set[str], scoring_system: ScoringSystem=None):
+        super().__init__("GreedyRepair", scoring_system=scoring_system)
         self.crews = crews
         self.flights = flights
         self.ground_duties = ground_duties
@@ -382,7 +389,11 @@ class GreedyRepair(RepairOperator):
                     break
 
         if selected_tasks:
-            roster = Roster(crew.crewId, selected_tasks)
+            roster = Roster(crew.crewId, selected_tasks, 0.0)
+            cost_details = self.scoring_system.calculate_roster_cost_with_dual_prices(
+                roster, crew, {}, 0.0
+            )
+            roster.cost = cost_details['total_cost']
             return roster
 
         return None
@@ -415,10 +426,10 @@ class RandomRepair(RepairOperator):
 
     def __init__(self, crews: List[Crew], flights: List[Flight],
                  ground_duties: List[GroundDuty], bus_info: List[BusInfo],
-                 crew_leg_match_dict: Dict, layover_stations: Set[str]):
-        super().__init__("RandomRepair")
+                 crew_leg_match_dict: Dict, layover_stations: Set[str], scoring_system: ScoringSystem=None):
+        super().__init__("RandomRepair", scoring_system= scoring_system)
         self.greedy_repair = GreedyRepair(crews, flights, ground_duties, bus_info,
-                                        crew_leg_match_dict, layover_stations)
+                                        crew_leg_match_dict, layover_stations, scoring_system=scoring_system)
 
     def repair(self, solution: ALNSSolution, removed_rosters: List[Roster]) -> ALNSSolution:
         """使用随机策略修复解决方案"""
@@ -522,13 +533,17 @@ class ALNSAlgorithm:
 
     def __init__(self, flights: List[Flight], crews: List[Crew],
                  ground_duties: List[GroundDuty], bus_info: List[BusInfo],
-                 crew_leg_match_dict: Dict, layover_stations: Set[str]):
+                 crew_leg_match_dict: Dict, layover_stations: Set[str], scoring_system:ScoringSystem=None):
         self.flights = flights
         self.crews = crews
         self.ground_duties = ground_duties
         self.bus_info = bus_info
         self.crew_leg_match_dict = crew_leg_match_dict
         self.layover_stations = layover_stations
+        self.scoring_system = scoring_system
+
+        if scoring_system is None:
+            raise ValueError("2. Scoring system must be provided")
 
         # 初始化算子
         self.destroy_operators = [
@@ -539,9 +554,9 @@ class ALNSAlgorithm:
 
         self.repair_operators = [
             GreedyRepair(crews, flights, ground_duties, bus_info,
-                        crew_leg_match_dict, layover_stations),
+                        crew_leg_match_dict, layover_stations, scoring_system=self.scoring_system),
             RandomRepair(crews, flights, ground_duties, bus_info,
-                        crew_leg_match_dict, layover_stations)
+                        crew_leg_match_dict, layover_stations, scoring_system=self.scoring_system)
         ]
 
         # 权重管理器
@@ -549,7 +564,7 @@ class ALNSAlgorithm:
         self.repair_weight_manager = AdaptiveWeightManager(self.repair_operators)
 
         # 算法参数
-        self.max_iterations = 1000
+        self.max_iterations = 1000**3
         self.time_limit = 3600  # 1小时
         self.destroy_size_min = 1
         self.destroy_size_max = 5
@@ -640,6 +655,8 @@ class ALNSAlgorithm:
 
             except Exception as e:
                 print(f"迭代 {iteration} 出错: {e}")
+                # print traceback
+                traceback.print_exc()
                 continue
 
         print(f"ALNS算法完成，总迭代次数: {self.iteration_count + 1}")
@@ -673,7 +690,6 @@ class ALNSAlgorithm:
             success_rate = op.success_count / op.usage_count if op.usage_count > 0 else 0
             print(f"  {op.name}: 权重={op.weight:.3f}, 使用={op.usage_count}, 成功率={success_rate:.3f}")
 
-
 def main():
     """ALNS主函数"""
     print("=== ALNS机组排班优化系统 ===")
@@ -704,11 +720,36 @@ def main():
 
     print(f"数据加载完成: 航班{len(flights)}个, 机组{len(crews)}个, 地面任务{len(ground_duties)}个")
 
-    # 生成初始解
-    print("正在生成初始解...")
-    initial_rosters = generate_initial_rosters_with_heuristic(
-        flights, crews, bus_info, ground_duties, crew_leg_match_dict, layover_stations
-    )
+    import pickle
+    if not os.path.exists('initial_solution'):
+        os.makedirs('initial_solution')
+    # 从文件加载initial_rosters和scoring_system
+    try:
+        with open('initial_solution/initial_rosters.pkl', 'rb') as f:
+            initial_rosters = pickle.load(f)
+        with open('initial_solution/scoring_system.pkl', 'rb') as f:
+            scoring_system = pickle.load(f)
+        print("初始解和评分系统加载成功")
+    except FileNotFoundError:
+        print("初始解和评分系统未找到，将重新生成")
+        # 生成初始解
+        print("正在生成初始解...")
+        initial_rosters = generate_initial_rosters_with_heuristic(
+            flights, crews, bus_info, ground_duties, crew_leg_match_dict, layover_stations
+        )
+        # 定义scoring system
+        scoring_system = ScoringSystem(flights, crews, layover_stations)
+        if scoring_system is None:
+            raise ValueError("1. Scoring system must be provided")
+        try:
+            # 将initial_rosters和scoring_system保存到文件，下次直接加载
+            with open('initial_solution/initial_rosters.pkl', 'wb') as f:
+                pickle.dump(initial_rosters, f)
+            with open('initial_solution/scoring_system.pkl', 'wb') as f:
+                pickle.dump(scoring_system, f)
+        except:
+            pass
+    
 
     if not initial_rosters:
         print("初始解生成失败，程序退出。")
@@ -725,7 +766,7 @@ def main():
 
     # 创建ALNS算法实例
     alns = ALNSAlgorithm(flights, crews, ground_duties, bus_info,
-                        crew_leg_match_dict, layover_stations)
+                        crew_leg_match_dict, layover_stations, scoring_system=scoring_system)
 
     # 执行ALNS算法
     best_solution = alns.solve(initial_solution)
@@ -740,6 +781,15 @@ def main():
     # 保存结果
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = f"output/alns_result_{timestamp}.csv"
+
+    # 更新initial_solution文件夹中的initial_rosters和scoring_system
+    try:
+        with open('initial_solution/initial_rosters.pkl', 'wb') as f:
+            pickle.dump(best_solution.rosters, f)
+        with open('initial_solution/scoring_system.pkl', 'wb') as f:
+            pickle.dump(scoring_system, f)
+    except:
+        pass
 
     # 确保输出目录存在
     os.makedirs("output", exist_ok=True)
