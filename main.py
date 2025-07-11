@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 # 项目模块导入
-from constraint_checker import ConstraintChecker
+from constraint_checker import UnifiedConstraintChecker
 from coverage_validator import CoverageValidator
 from data_loader import load_all_data
 from data_models import Flight, Roster
@@ -122,15 +122,19 @@ def main() -> None:
             crew_leg_match_dict[crew_id] = []
         crew_leg_match_dict[crew_id].append(flight_id)
         
-    # --- 3. 初始化主问题求解器 ---
+    # --- 3. 初始化主问题求解器和评分系统 ---
+    print("正在初始化主问题求解器...")
     master_problem = MasterProblem(flights, crews, ground_duties, layover_stations)
+    print("正在初始化评分系统...")
+    scoring_system = ScoringSystem(flights, crews, layover_stations)
     
     print("\n=== 线性目标函数参数 ===")
     print(f"飞行时间奖励: {master_problem.FLIGHT_TIME_REWARD}")
     print(f"未覆盖航班惩罚: {master_problem.UNCOVERED_FLIGHT_PENALTY}")
-    print(f"占位任务惩罚: {master_problem.POSITIONING_PENALTY}")
+    print(f"置位任务惩罚: {master_problem.POSITIONING_PENALTY}")
     print(f"过夜惩罚: {master_problem.AWAY_OVERNIGHT_PENALTY}")
     print(f"新过站惩罚: {master_problem.NEW_LAYOVER_PENALTY}")
+    print(f"违规惩罚: {master_problem.VIOLATION_PENALTY}")
     
     # --- 4. 调用新的启发式函数生成初始解 ---
     initial_rosters = generate_initial_rosters_with_heuristic(
@@ -147,7 +151,7 @@ def main() -> None:
     
     # --- 4. 列生成循环 ---
     print("\n开始列生成过程...")
-    previous_obj_val = float('inf')  # 最小化问题：初始值为正无穷
+    previous_obj_val = None  # 修正：用None初始化，避免误导性的inf改善显示
     no_improvement_rounds = 0  # 连续无改进轮数计数
     convergence_count = 0  # 目标函数改善微小的连续轮数
     
@@ -159,8 +163,9 @@ def main() -> None:
         duty_ids = sorted([duty.id for duty in roster.duties])
         return f"{roster.crew_id}_{hash(tuple(duty_ids))}"
     
-    # 修改列生成循环
-    for i in range(MAX_ITERATIONS):  # 改为大写的MAX_ITERATIONS
+    # 使用配置文件中的最大迭代次数设置
+    # MAX_ITERATIONS已在第81行从UnifiedConfig.MAX_COLUMN_GENERATION_ITERATIONS获取
+    for i in range(MAX_ITERATIONS):
         iteration_start_time = time.time()
         print(f"\n=== 列生成第 {i+1} 轮 ===")
         log_debug(f"\n=== 列生成第 {i+1} 轮开始 ===\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -273,10 +278,13 @@ def main() -> None:
                         log_debug(f"    机组{crew.crewId} Roster#{idx+1}: reduced_cost={reduced_cost:.6f}")
                         log_debug(f"      总成本: {cost_details['total_cost']:.6f}")
                         log_debug(f"      飞行奖励: {cost_details['flight_reward']:.6f}")
+                        log_debug(f"      置位惩罚: {cost_details['positioning_penalty']:.6f}")
+                        log_debug(f"      过夜惩罚: {cost_details['overnight_penalty']:.6f}")
+                        log_debug(f"      违规惩罚: {cost_details['violation_penalty']:.6f} (违规次数: {cost_details['violation_count']})")
                         log_debug(f"      对偶贡献: {cost_details['dual_contribution']:.6f}")
                         log_debug(f"      任务数: {len(r.duties)}")
                         
-                        if reduced_cost < -0.01:  # 放宽阈值，允许更多潜在有价值的roster
+                        if reduced_cost < -0.0001:  # 大幅放宽阈值，允许更多潜在有价值的roster
                             valuable_count += 1
                             master_problem.add_roster(r)
                             new_rosters_found_count += 1
@@ -322,15 +330,13 @@ def main() -> None:
             print(f"当前主问题最优目标函数值: {current_obj_val:.6f}")
             
             # 跟踪目标函数变化（最小化问题：目标函数值应该递减）
-            if i > 0 and previous_obj_val != float('inf'):
+            if previous_obj_val is not None:
                 obj_change = current_obj_val - previous_obj_val
                 if obj_change > 1e-6:
                     print(f"警告：目标函数增加了 {obj_change:.6f}，不满足列生成的单调性！")
                 else:
                     print(f"目标函数变化：{obj_change:.6f}")
-            
-            # 如果不是第一轮，显示目标函数值的变化
-            if i > 0:
+                
                 improvement = previous_obj_val - current_obj_val  # 最小化问题：改善 = 上轮值 - 当前值
                 print(f"相比上轮的改善: {improvement:.6f}")
                 
@@ -340,8 +346,10 @@ def main() -> None:
                     print(f"目标函数改善微小，连续{convergence_count}轮")
                 else:
                     convergence_count = 0
+            else:
+                print(f"第一轮列生成，建立基准目标函数值")
             
-                previous_obj_val = current_obj_val
+            previous_obj_val = current_obj_val
         else:
             print("当前主问题求解失败")
         
@@ -352,12 +360,12 @@ def main() -> None:
         else:
             no_improvement_rounds = 0
         
-        # 简单收敛判断
-        if no_improvement_rounds >= 3 and i > 0:
-            print(f"\n连续3轮未找到有价值的排班方案，列生成结束。")
+        # 简单收敛判断 - 大幅放宽收敛条件，让程序运行更多轮
+        if no_improvement_rounds >= 20 and i > 10:  # 大幅增加无改进轮数阈值
+            print(f"\n连续20轮未找到有价值的排班方案，列生成结束。")
             break
-        elif convergence_count >= 3 and i > 1:
-            print(f"\n目标函数连续3轮改善微小，列生成收敛。")
+        elif convergence_count >= 15 and i > 15:  # 大幅增加收敛轮数阈值
+            print(f"\n目标函数连续15轮改善微小，列生成收敛。")
             break
         elif i >= MAX_ITERATIONS - 1:
             print("\n达到最大迭代次数，列生成结束。")
@@ -410,6 +418,9 @@ def main() -> None:
                                uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY +
                                uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY)
     
+    # 使用统一评分系统计算完整的竞赛评分
+    initial_total_score = scoring_system.calculate_total_score(initial_rosters)
+    
     # 为了显示，计算竞赛评分公式的值（仅用于参考）
     total_penalties = uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
     if total_duty_days > 0:
@@ -437,10 +448,25 @@ def main() -> None:
     print(f"  - 未覆盖地面任务惩罚: {uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY:.2f}")
     print(f"初始解线性目标函数值: {initial_linear_objective:.2f}")
     print(f"初始解竞赛评分（日均飞时得分）: {initial_objective_value:.2f}")
+    print(f"\n=== 初始解统一评分系统结果 ===")
+    print(f"完整竞赛评分: {initial_total_score['total_score']:.2f}")
+    print(f"  - 值勤日日均飞时得分: {initial_total_score['fly_time_score']:.2f}")
+    print(f"  - 未覆盖航班惩罚: {initial_total_score['uncovered_penalty']:.2f}")
+    print(f"  - 新增过夜站点惩罚: {initial_total_score['new_layover_penalty']:.2f}")
+    print(f"  - 外站过夜惩罚: {initial_total_score['away_overnight_penalty']:.2f}")
+    print(f"  - 置位惩罚: {initial_total_score['positioning_penalty']:.2f}")
+    print(f"  - 违规惩罚: {initial_total_score['violation_penalty']:.2f}")
+    print(f"统计信息:")
+    print(f"  - 总值勤天数: {total_duty_days:.0f}")
+    print(f"  - 总飞行时间: {total_flight_hours:.2f} 小时")
+    print(f"  - 外站过夜天数: {initial_total_score['away_overnight_days']:.0f}")
+    print(f"  - 新增过夜站点数: {initial_total_score['new_layover_stations']:.0f}")
+    print(f"  - 置位任务数: {initial_total_score['positioning_count']:.0f}")
+    print(f"  - 违规次数: {initial_total_score['violation_count']:.0f}")
     
     # 验证初始解航班覆盖率
     print(f"\n=== 初始解航班覆盖率验证 ===")
-    validator = CoverageValidator(min_coverage_rate=0.8)
+    validator = CoverageValidator(min_coverage_rate=0.8)  # 比赛要求80%覆盖率
     initial_coverage_result = validator.validate_coverage(flights, initial_rosters)
     print(validator.get_coverage_report(initial_coverage_result))
     
@@ -527,9 +553,27 @@ def main() -> None:
             final_cost = final_model.ObjVal
             print(f"\n最终解成本: {final_cost:.2f}, 包含 {len(selected_rosters)} 个排班方案。")
             
+            # 使用统一评分系统计算最终解的完整竞赛评分
+            final_total_score = scoring_system.calculate_total_score(selected_rosters)
+            print(f"\n=== 最终解统一评分系统结果 ===")
+            print(f"完整竞赛评分: {final_total_score['total_score']:.2f}")
+            print(f"  - 值勤日日均飞时得分: {final_total_score['fly_time_score']:.2f}")
+            print(f"  - 未覆盖航班惩罚: {final_total_score['uncovered_penalty']:.2f}")
+            print(f"  - 新增过夜站点惩罚: {final_total_score['new_layover_penalty']:.2f}")
+            print(f"  - 外站过夜惩罚: {final_total_score['away_overnight_penalty']:.2f}")
+            print(f"  - 置位惩罚: {final_total_score['positioning_penalty']:.2f}")
+            print(f"  - 违规惩罚: {final_total_score['violation_penalty']:.2f}")
+            print(f"统计信息:")
+            print(f"  - 总值勤天数: {sum(len(set((duty.std.date() if hasattr(duty, 'std') else duty.get('startTime', datetime.min).date()) for duty in roster.duties)) for roster in selected_rosters):.0f}")
+            print(f"  - 总飞行时间: {sum(duty.flyTime/60.0 for roster in selected_rosters for duty in roster.duties if hasattr(duty, 'flyTime')):.2f} 小时")
+            print(f"  - 外站过夜天数: {final_total_score['away_overnight_days']:.0f}")
+            print(f"  - 新增过夜站点数: {final_total_score['new_layover_stations']:.0f}")
+            print(f"  - 置位任务数: {final_total_score['positioning_count']:.0f}")
+            print(f"  - 违规次数: {final_total_score['violation_count']:.0f}")
+            
             # 验证航班覆盖率
             print("\n=== 最终解航班覆盖率验证 ===")
-            validator = CoverageValidator(min_coverage_rate=0.8)
+            validator = CoverageValidator(min_coverage_rate=0.8)  # 比赛要求80%覆盖率
             coverage_result = validator.validate_coverage(flights, selected_rosters)
             print(validator.get_coverage_report(coverage_result))
             
@@ -556,13 +600,16 @@ def main() -> None:
             print(f"\n=== 最终解目标函数分析 ===")
             print(f"最终解线性目标函数值: {final_linear_objective:.2f}")
             print(f"初始解线性目标函数值: {initial_linear_objective:.2f}")
+            print(f"\n=== 竞赛评分比较 ===")
+            print(f"最终解竞赛评分: {final_total_score['total_score']:.2f}")
+            print(f"初始解竞赛评分: {initial_total_score['total_score']:.2f}")
             
-            # 比较解的质量（注意：这是最小化问题，目标函数值越小越好）
+            # 比较解的质量（注意：竞赛评分越高越好）
             # 修改逻辑：即使占位任务没有全部覆盖也可以输出最终解，只要航班覆盖率满足要求
             final_solution_valid = coverage_result['is_valid']  # 只要求航班覆盖率满足要求
             
-            if final_linear_objective < initial_linear_objective and final_solution_valid:
-                print(f"\n✅ 最终解优于初始解且满足航班覆盖率要求 (改善: {initial_linear_objective - final_linear_objective:.2f})")
+            if final_total_score['total_score'] > initial_total_score['total_score'] and final_solution_valid:
+                print(f"\n✅ 最终解优于初始解且满足航班覆盖率要求 (竞赛评分改善: {final_total_score['total_score'] - initial_total_score['total_score']:.2f})")
                 if not ground_duty_result['is_valid']:
                     print(f"⚠️  注意：占位任务覆盖率为 {ground_duty_result['coverage_rate']:.1%}，低于80%建议值，但在软约束结构下仍可输出")
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -571,7 +618,7 @@ def main() -> None:
                 print(f"最终结果已写入文件: {output_file}")
                 final_solution_found = True
             elif final_solution_valid:
-                print(f"\n⚠️  最终解满足航班覆盖率要求但劣于初始解 (恶化: {final_linear_objective - initial_linear_objective:.2f})")
+                print(f"\n⚠️  最终解满足航班覆盖率要求但劣于初始解 (竞赛评分恶化: {final_total_score['total_score'] - initial_total_score['total_score']:.2f})")
                 if not ground_duty_result['is_valid']:
                     print(f"⚠️  注意：占位任务覆盖率为 {ground_duty_result['coverage_rate']:.1%}，低于80%建议值，但在软约束结构下仍可输出")
                 print("将检查初始解的约束满足情况后决定使用哪个解")
@@ -592,7 +639,7 @@ def main() -> None:
         # 修改逻辑：即使占位任务没有全部覆盖也可以输出初始解，只要航班覆盖率满足要求
         initial_solution_valid = initial_coverage_result['is_valid']  # 只要求航班覆盖率满足要求
         if not initial_solution_valid:
-            print(f"\n❌ 警告：初始解不满足航班覆盖率要求！")
+            print(f"\n❌ 警告：初始解不满足80%航班覆盖率要求！")
             print("根据竞赛规则，此解决方案可能被判定为无效。")
         else:
             print("\n✅ 使用满足航班覆盖率要求的初始解作为最终输出")
@@ -603,7 +650,7 @@ def main() -> None:
         output_file = f"output/rosterResult_initial_{timestamp}.csv"
         write_results_to_csv(initial_rosters, output_file, master_problem)
         print(f"初始解已写入文件: {output_file}")
-        print(f"初始解统计: 目标函数值（日均飞时得分） {initial_objective_value:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
+        print(f"初始解统计: 竞赛评分 {initial_total_score['total_score']:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
         print(f"覆盖率: {initial_coverage_result['coverage_rate']:.1%}")
     
     # --- 8. 程序执行总结 ---

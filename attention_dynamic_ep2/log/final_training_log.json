@@ -1,0 +1,54 @@
+{
+  "episode_count": 2,
+  "training_time": 79594.40865945816,
+  "best_reward": -263894.805274888,
+  "metrics": {
+    "episode_rewards": [
+      -263894.805274888,
+      -270817.452885837
+    ],
+    "episode_lengths": [
+      6000,
+      6000
+    ],
+    "actor_losses": [
+      0,
+      0
+    ],
+    "critic_losses": [
+      0,
+      0
+    ],
+    "dual_price_contributions": [
+      1.1567871159582794,
+      1.165868971528242
+    ],
+    "base_score_contributions": [
+      0.2019789614113505,
+      0.20144886455651814
+    ],
+    "adaptive_weights_alpha": [
+      0.49115715079678746,
+      0.4903849806036792
+    ],
+    "adaptive_weights_beta": [
+      0.5088428500027,
+      0.5096150190562299
+    ],
+    "constraint_violations": [
+      0,
+      0
+    ],
+    "solution_quality": [
+      -43.982467545814664,
+      -45.1362421476395
+    ],
+    "coverage_rates": [
+      0.0,
+      0.0
+    ]
+  },
+  "feature_importance": {},
+  "dual_price_stats": {},
+  "timestamp": "2025-07-08T20:30:29.475985"
+}

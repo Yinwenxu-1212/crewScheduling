@@ -96,63 +96,206 @@ class BusInfo:
     def __repr__(self):
         return f"Bus(Dep: {self.depaAirport}, Arr: {self.arriAirport}, Time: {self.startTime} -> {self.endTime})"
 
-class FlightDutyPeriod:
-    """飞行值勤日(FDP) - 必须包含飞行任务的值勤期"""
+class DutyDay:
+    """值勤日 - 一连串值勤任务的集合
+    
+    定义：
+    - 包含一连串值勤任务（飞行、置位、占位）
+    - 跨度不超过24小时
+    - 可以只包含占位任务
+    - 不等同于日历日，可以跨日历日
+    """
     def __init__(self):
-        self.tasks = []  # 飞行和置位任务列表
-        self.start_time = None  # 第一个任务开始时间
-        self.end_time = None    # 最后一个飞行任务结束时间
-        self.total_flight_time = 0  # 累计飞行时间(分钟)
-        self.duty_time = 0      # 值勤时间(分钟)
-        self.has_flight = False # 是否包含飞行任务
-        self.flight_count = 0   # 飞行任务数量
-        self.total_task_count = 0  # 总任务数量
+        self.tasks = []  # 所有类型任务
+        self.start_time = None
+        self.end_time = None
+        self.start_date = None  # 第一个任务开始日期
+        self.end_date = None    # 最后一个任务结束日期
+        self.layover_stations = set()  # 可过夜机场集合
         
     def add_task(self, task):
-        """添加任务到FDP"""
+        """添加任务到值勤日"""
         self.tasks.append(task)
-        self.total_task_count += 1
         
-        # 更新开始时间
+        # 更新时间范围
         task_start = getattr(task, 'std', getattr(task, 'startTime', None))
+        task_end = getattr(task, 'sta', getattr(task, 'endTime', None))
+        
         if self.start_time is None or (task_start and task_start < self.start_time):
             self.start_time = task_start
+            if task_start:
+                self.start_date = task_start.date()
+                
+        if self.end_time is None or (task_end and task_end > self.end_time):
+            self.end_time = task_end
+            if task_end:
+                self.end_date = task_end.date()
+    
+    def set_layover_stations(self, layover_stations_set):
+        """设置可过夜机场集合"""
+        self.layover_stations = layover_stations_set
+    
+    def get_duration_hours(self):
+        """获取值勤日持续时间（小时）"""
+        if self.start_time and self.end_time:
+            return (self.end_time - self.start_time).total_seconds() / 3600.0
+        return 0
+    
+    def spans_calendar_days(self):
+        """检查是否跨日历日"""
+        return self.start_date != self.end_date if (self.start_date and self.end_date) else False
+    
+    def has_flight_tasks(self):
+        """检查是否包含飞行任务"""
+        return any(isinstance(task, Flight) for task in self.tasks)
+    
+    def violates_24_hour_constraint(self):
+        """检查是否违反24小时约束"""
+        return self.get_duration_hours() > 24
+    
+    @property
+    def is_flight_duty_day(self):
+        """判断是否为飞行值勤日"""
+        return self.has_flight_tasks()
+    
+    def get_flight_count(self):
+        """获取飞行任务数量"""
+        return sum(1 for task in self.tasks if isinstance(task, Flight))
+    
+    def get_total_flight_time_minutes(self):
+        """获取总飞行时间（分钟）"""
+        return sum(task.flyTime for task in self.tasks if isinstance(task, Flight))
+    
+    def get_start_airport(self):
+        """获取开始机场"""
+        if not self.tasks:
+            return None
+        first_task = self.tasks[0]
+        return getattr(first_task, 'depaAirport', getattr(first_task, 'airport', None))
+    
+    def get_end_airport(self):
+        """获取结束机场"""
+        if not self.tasks:
+            return None
+        last_task = self.tasks[-1]
+        return getattr(last_task, 'arriAirport', getattr(last_task, 'airport', None))
+
+class FlightDutyPeriod(DutyDay):
+    """飞行值勤日(FDP) - 值勤日的子类，专门处理包含飞行任务的值勤日
+    
+    定义：
+    - 继承自DutyDay，具有值勤日的所有特性
+    - 必须包含执行飞行任务（非置位飞行任务）
+    - 不包含占位任务（GroundDuty）
+    - 只能从可过夜机场出发到可过夜机场结束
+    - 时长不能超过24小时
+    """
+    def __init__(self):
+        super().__init__()  # 调用父类构造函数
+        # FDP特有的统计属性
+        self.has_flight = False
+        self.flight_count = 0
+        self.total_flight_time = 0
+        
+    def add_task(self, task):
+        """添加任务到FDP
+        
+        注意：飞行值勤日不应包含占位任务（GroundDuty）
+        """
+        # 检查是否为占位任务，如果是则不添加
+        if isinstance(task, GroundDuty):
+            return False  # 飞行值勤日不包含占位任务
             
-        # 如果是飞行任务
-        if isinstance(task, Flight):
+        # 调用父类的add_task方法
+        super().add_task(task)
+        
+        # FDP特有的逻辑：统计执行飞行任务（非置位飞行任务）
+        if isinstance(task, Flight) and not getattr(task, 'is_ddh', False) and not getattr(task, 'positioning_flight', False):
             self.has_flight = True
             self.flight_count += 1
             self.total_flight_time += task.flyTime
-            # 更新FDP结束时间为最后一个飞行任务的结束时间
-            if self.end_time is None or task.sta > self.end_time:
-                self.end_time = task.sta
-                
-        # 计算值勤时间(从第一个任务开始到最后一个飞行任务结束)
-        if self.start_time and self.end_time:
-            self.duty_time = int((self.end_time - self.start_time).total_seconds() / 60)
             
-    def is_valid(self):
-        """检查FDP是否有效(必须包含飞行任务)"""
-        return self.has_flight
+        return True  # 成功添加任务
+            
+    def is_valid(self, layover_stations_set=None):
+        """检查FDP是否有效
         
+        条件：
+        1. 必须包含执行飞行任务（非置位）
+        2. 不能包含占位任务（groundDuty）
+        3. 持续时间不能超过24小时
+        4. 必须从可过夜机场出发到可过夜机场结束
+        """
+        # 首先检查基本的值勤日有效性
+        if self.violates_24_hour_constraint():
+            return False
+            
+        # FDP特有的验证：必须包含执行飞行任务
+        if not self.has_flight:
+            return False
+            
+        # 检查是否包含占位任务
+        for task in self.tasks:
+            if isinstance(task, GroundDuty):
+                return False
+                
+        # 如果提供了可过夜机场集合，验证起始和结束机场
+        if layover_stations_set is not None:
+            start_airport = self.get_start_airport()
+            end_airport = self.get_end_airport()
+            start_is_layover = start_airport in layover_stations_set if start_airport else False
+            end_is_layover = end_airport in layover_stations_set if end_airport else False
+            return start_is_layover and end_is_layover
+            
+        return True
+        
+    def get_flight_duty_duration_hours(self):
+        """获取飞行值勤时间（小时）
+        
+        根据规则6：飞行值勤开始时间为第一个任务的开始时间，
+        飞行值勤结束时间为最后一个飞行任务的到达时间
+        """
+        if not self.tasks:
+            return 0
+            
+        # 第一个任务的开始时间
+        first_task = self.tasks[0]
+        start_time = getattr(first_task, 'std', getattr(first_task, 'startTime', None))
+        
+        # 最后一个飞行任务的到达时间
+        end_time = None
+        for task in reversed(self.tasks):
+            if isinstance(task, Flight):
+                end_time = getattr(task, 'sta', getattr(task, 'endTime', None))
+                break
+                
+        if start_time and end_time:
+            return (end_time - start_time).total_seconds() / 3600.0
+        return 0
+    
     def violates_constraints(self):
         """检查FDP是否违反约束"""
         violations = 0
         
-        # 规则5: FDP最大飞行时间8小时
-        if self.total_flight_time > 8 * 60:  # 480分钟
+        # 继承父类的24小时约束检查
+        if self.violates_24_hour_constraint():
             violations += 1
             
-        # 规则6: FDP最大值勤时间12小时  
-        if self.duty_time > 12 * 60:  # 720分钟
+        # FDP特有约束：
+        # 规则5: FDP最大飞行时间8小时
+        if self.get_total_flight_time_minutes() > 8 * 60:  # 480分钟
+            violations += 1
+            
+        # 规则6: FDP最大值勤时间12小时（使用正确的飞行值勤时间计算）
+        if self.get_flight_duty_duration_hours() > 12:
             violations += 1
             
         # 规则: FDP内最多4个飞行任务
-        if self.flight_count > 4:
+        if self.get_flight_count() > 4:
             violations += 1
             
         # 规则: FDP内最多6个总任务
-        if self.total_task_count > 6:
+        if len(self.tasks) > 6:  # 使用父类的tasks列表
             violations += 1
             
         # 额外检查：连接时间约束（规则3）
@@ -197,123 +340,120 @@ class FlightDutyPeriod:
                     if interval < timedelta(hours=2):
                         violations += 1
                 
-                # 其他情况：默认最小连接时间1小时
-                else:
-                    if interval < timedelta(hours=1):
-                        violations += 1
+                # 其他情况：题目约束规则未明确规定，不进行额外约束检查
         
         return violations
         
-class DutyDay:
-    """值勤日 - 一连串值勤任务，不等同于日历日，可以跨日历日但一般不超过24小时"""
+
+class FlightCycle:
+    """飞行周期 - 由值勤日组成的周期
+    
+    定义：
+    - 由值勤日组成，必须包含飞行值勤日
+    - 末尾必须是飞行值勤日
+    - 最多横跨4个日历日
+    - 开始前需连续休息2个完整日历日
+    """
     def __init__(self):
-        self.tasks = []  # 所有类型任务
-        self.start_time = None
-        self.end_time = None
-        self.start_date = None  # 第一个任务开始日期
-        self.end_date = None    # 最后一个任务结束日期
-        self.is_flight_duty_day = False  # 是否为飞行值勤日
-        self.layover_stations = set()  # 可过夜机场集合
-        self.fdps = []  # 飞行值勤期列表
+        self.duty_days = []  # 值勤日列表
+        self.flight_duty_periods = []  # 飞行值勤日列表
+        self.start_date = None  # 周期开始日期
+        self.end_date = None    # 周期结束日期
+        self.start_time = None  # 周期开始时间（停止休息的时间）
+        self.end_time = None    # 周期结束时间（最后一个飞行任务的结束时间）
         
-    def add_task(self, task):
-        """添加任务到值勤日"""
-        self.tasks.append(task)
+    def add_duty_day(self, duty_day):
+        """添加值勤日到飞行周期"""
+        self.duty_days.append(duty_day)
         
         # 更新时间范围
-        task_start = getattr(task, 'std', getattr(task, 'startTime', None))
-        task_end = getattr(task, 'sta', getattr(task, 'endTime', None))
+        if self.start_date is None or (duty_day.start_date and duty_day.start_date < self.start_date):
+            self.start_date = duty_day.start_date
+            self.start_time = duty_day.start_time
+            
+        if self.end_date is None or (duty_day.end_date and duty_day.end_date > self.end_date):
+            self.end_date = duty_day.end_date
+            
+        # 如果是飞行值勤日，更新结束时间为最后一个飞行任务的结束时间
+        if duty_day.has_flight_tasks():
+            for task in reversed(duty_day.tasks):
+                if isinstance(task, Flight):
+                    task_end = getattr(task, 'sta', getattr(task, 'endTime', None))
+                    if self.end_time is None or (task_end and task_end > self.end_time):
+                        self.end_time = task_end
+                    break
+    
+    def add_flight_duty_period(self, fdp):
+        """添加飞行值勤日到飞行周期"""
+        self.flight_duty_periods.append(fdp)
         
-        if self.start_time is None or (task_start and task_start < self.start_time):
-            self.start_time = task_start
-            if task_start:
-                self.start_date = task_start.date()
-                
-        if self.end_time is None or (task_end and task_end > self.end_time):
-            self.end_time = task_end
-            if task_end:
-                self.end_date = task_end.date()
+    def get_calendar_days_span(self):
+        """获取飞行周期跨越的日历日数"""
+        if self.start_date and self.end_date:
+            return (self.end_date - self.start_date).days + 1
+        return 0
         
-        # 检查是否为飞行值勤日：必须包含飞行任务且从可过夜机场开始到可过夜机场结束
-        if isinstance(task, Flight):
-            self._update_flight_duty_status()
-    
-    def _update_flight_duty_status(self, layover_stations_set=None):
-        """更新飞行值勤日状态"""
-        # 检查是否包含飞行任务
-        has_flight = any(isinstance(task, Flight) for task in self.tasks)
-        if not has_flight:
-            self.is_flight_duty_day = False
-            return
+    def has_flight_duty_periods(self):
+        """检查是否包含飞行值勤日"""
+        return len(self.flight_duty_periods) > 0 or any(dd.has_flight_tasks() for dd in self.duty_days)
+        
+    def ends_with_flight_duty_period(self):
+        """检查是否以飞行值勤日结束"""
+        if not self.duty_days:
+            return False
+        return self.duty_days[-1].has_flight_tasks()
+        
+    def violates_constraints(self):
+        """检查是否违反飞行周期约束"""
+        violations = 0
+        
+        # 规则1: 必须包含飞行值勤日
+        if not self.has_flight_duty_periods():
+            violations += 1
             
-        # 检查起始和结束位置是否为可过夜机场
-        if self.tasks:
-            first_task = self.tasks[0]
-            last_task = self.tasks[-1]
+        # 规则2: 末尾必须是飞行值勤日
+        if not self.ends_with_flight_duty_period():
+            violations += 1
             
-            # 获取起始机场
-            start_airport = None
-            if hasattr(first_task, 'depaAirport'):
-                start_airport = first_task.depaAirport
-            elif hasattr(first_task, 'startLocation'):
-                start_airport = first_task.startLocation
-            elif hasattr(first_task, 'airport'):
-                start_airport = first_task.airport
+        # 规则3: 最多横跨4个日历日
+        if self.get_calendar_days_span() > 4:
+            violations += 1
             
-            # 获取结束机场
-            end_airport = None
-            if hasattr(last_task, 'arriAirport'):
-                end_airport = last_task.arriAirport
-            elif hasattr(last_task, 'endLocation'):
-                end_airport = last_task.endLocation
-            elif hasattr(last_task, 'airport'):
-                end_airport = last_task.airport
-                
-            # 如果提供了可过夜机场集合，进行验证
-            if layover_stations_set is not None:
-                start_is_layover = start_airport in layover_stations_set if start_airport else False
-                end_is_layover = end_airport in layover_stations_set if end_airport else False
-                
-                # 飞行值勤日必须从可过夜机场开始到可过夜机场结束
-                self.is_flight_duty_day = has_flight and start_is_layover and end_is_layover
-            else:
-                # 如果没有可过夜机场数据，暂时简化：包含飞行任务就认为是飞行值勤日
-                self.is_flight_duty_day = has_flight
+        return violations
     
-    def set_layover_stations(self, layover_stations_set):
-        """设置可过夜机场集合并重新评估飞行值勤日状态"""
-        self.layover_stations = layover_stations_set
-        self._update_flight_duty_status(layover_stations_set)
-    
-    def get_duration_hours(self):
-        """获取值勤日持续时间（小时）"""
+    def get_cycle_duration_hours(self):
+        """获取飞行周期持续时间（小时）"""
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time).total_seconds() / 3600.0
         return 0
     
-    def spans_calendar_days(self):
-        """检查是否跨日历日"""
-        return self.start_date != self.end_date if (self.start_date and self.end_date) else False
-            
-    def organize_into_fdps(self):
-        """将任务组织成飞行值勤日"""
-        if not self.is_flight_duty_day:
-            return
-            
-        current_fdp = None
-        
-        for task in self.tasks:
-            # 如果是飞行或置位任务，加入FDP
-            if isinstance(task, Flight) or (hasattr(task, 'type') and 'positioning' in str(task.type)):
-                if current_fdp is None:
-                    current_fdp = FlightDutyPeriod()
-                    self.fdps.append(current_fdp)
-                current_fdp.add_task(task)
-            else:
-                # 其他任务(如占位)可能结束当前FDP
-                if current_fdp is not None and current_fdp.has_flight:
-                    current_fdp = None
-                    
+    def get_total_flight_time_minutes(self):
+        """获取周期内总飞行时间（分钟）"""
+        total = 0
+        for duty_day in self.duty_days:
+            total += duty_day.get_total_flight_time_minutes()
+        return total
+    
+    def get_flight_duty_count(self):
+        """获取飞行值勤日数量"""
+        return sum(1 for dd in self.duty_days if dd.is_flight_duty_day)
+    
+    def starts_at_base(self, crew_base):
+        """检查是否在基地开始"""
+        if not self.duty_days:
+            return False
+        first_duty = self.duty_days[0]
+        start_airport = first_duty.get_start_airport()
+        return start_airport == crew_base
+    
+    def ends_at_base(self, crew_base):
+        """检查是否在基地结束"""
+        if not self.duty_days:
+            return False
+        last_duty = self.duty_days[-1]
+        end_airport = last_duty.get_end_airport()
+        return end_airport == crew_base
+
 class LayoverStation:
     """Represents a layover station. Columns from layoverStation.csv."""
     def __init__(self, airport):
