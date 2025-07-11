@@ -12,13 +12,13 @@ class UnifiedConfig:
     
     # === 核心成本参数 ===
     # 这些参数必须在主问题和子问题中保持完全一致
-    FLIGHT_TIME_REWARD = 50       # 飞行时间奖励（大幅提高，激励执行航班）
-    POSITIONING_PENALTY = 5.0      # 置位惩罚（大幅提高，抑制过度置位）
+    FLIGHT_TIME_REWARD = 30       # 飞行时间奖励（降低，减少负成本问题）
+    POSITIONING_PENALTY = 8.0      # 置位惩罚（提高，抑制过度置位）
     AWAY_OVERNIGHT_PENALTY = 0.5   # 外站过夜惩罚（保持不变）
     NEW_LAYOVER_PENALTY = 10       # 新停留站点惩罚
-    UNCOVERED_FLIGHT_PENALTY = 200 # 未覆盖航班惩罚（提高，强化航班覆盖优先级）
-    UNCOVERED_GROUND_DUTY_PENALTY = 1000  # 未覆盖占位任务惩罚（降低，平衡航班与占位任务优先级）
-    VIOLATION_PENALTY = 10         # 违规惩罚
+    UNCOVERED_FLIGHT_PENALTY = 2000 # 未覆盖航班惩罚（大幅提高，强化航班覆盖优先级）
+    UNCOVERED_GROUND_DUTY_PENALTY = 1500  # 未覆盖占位任务惩罚（保持高优先级但低于航班）
+    VIOLATION_PENALTY = 100         # 违规惩罚
     
     # === 评分系统参数 ===
     # 用于最终评价的竞赛标准参数
@@ -29,21 +29,56 @@ class UnifiedConfig:
     POSITIONING_SCORE_PENALTY = -0.5        # 竞赛评分：置位次数 * (-0.5)
     VIOLATION_SCORE_PENALTY = -10           # 竞赛评分：违规次数 * (-10)
     
+    # 任务基础分数参数
+    FLIGHT_BASE_SCORE = 200.0  # 航班任务基础分数（大幅提高以鼓励航班覆盖）
+    GROUND_DUTY_BASE_SCORE = 250.0  # 地面任务基础分数（保持高优先级）
+    BUS_TASK_BASE_SCORE = 10.0  # 大巴任务基础分数（进一步降低）
+    POSITIONING_BASE_SCORE = 5.0  # 置位任务基础分数（大幅降低）
+    
     # === 约束参数 ===
+    # 值勤日约束
     MAX_DUTY_DAY_HOURS = 12.0
     MAX_FLIGHT_TIME_IN_DUTY_HOURS = 8.0
     MIN_REST_HOURS = 12.0
     MAX_FLIGHTS_IN_DUTY = 4
     MAX_TASKS_IN_DUTY = 6
     
+    # 飞行值勤日约束
+    MAX_FDP_HOURS = 12.0  # 飞行值勤日最大12小时
+    MAX_FDP_FLIGHTS = 4   # 飞行值勤日最大4个飞行任务
+    MAX_FDP_TASKS = 6     # 飞行值勤日最大6个任务
+    MAX_FDP_FLIGHT_TIME = 8.0  # 飞行值勤日最大飞行时间8小时
+    
+    # 飞行周期约束
+    MAX_FLIGHT_CYCLE_DAYS = 4  # 最多横跨4个日历日
+    MIN_CYCLE_REST_DAYS = 2    # 开始前需连续休息2个完整日历日
+    MAX_TOTAL_FLIGHT_DUTY_HOURS = 60.0  # 总飞行值勤时间不超过60小时
+    
+    # 休息时间约束
+    MIN_OVERNIGHT_HOURS = 12.0  # 最小过夜时间（规则7）
+    
+    # 工作休息模式约束
+    MAX_CONSECUTIVE_DUTY_DAYS = 4  # 值四休二
+    MIN_REST_AFTER_CONSECUTIVE_DUTY = 48  # 连续工作后需休息48小时
+    
+    # 置位任务约束
+    MAX_POSITIONING_TASKS = 10  # 最大置位任务数量
+    
+    # 新飞行周期约束
+    MIN_REST_DAYS_FOR_NEW_CYCLE = 2  # 开始新飞行周期前的最小休息天数
+    
+    # 总飞行时间约束
+    MAX_TOTAL_FLIGHT_HOURS = 60.0  # 计划期内总飞行时间上限（小时）
+    
     # === 连接时间参数（根据竞赛规则）===
-    MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT_MINUTES = 30  # 同一飞机最小间隔30分钟（实际可能更短）
+    MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT_MINUTES = 0  # 同一飞机最小间隔0分钟
     MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT_HOURS = 3  # 不同飞机最小间隔3小时
     MIN_CONNECTION_TIME_BUS_HOURS = 2  # 大巴置位与飞行任务最小间隔2小时
+    DEFAULT_MIN_CONNECTION_TIME_HOURS = 1  # 默认最小连接时间1小时
     
     # === 算法参数 ===
-    MAX_SUBPROBLEM_ITERATIONS = 2000  # 子问题求解最大迭代次数（增大搜索深度）
-    BEAM_WIDTH = 20  # beam search宽度（增大搜索范围）
+    MAX_SUBPROBLEM_ITERATIONS = 2500  # 子问题求解最大迭代次数（进一步增大搜索深度）
+    BEAM_WIDTH = 25  # beam search宽度（进一步增大搜索范围）
     MAX_CREWS_PER_FLIGHT = 6  # 每个航班最多被分配给的机组数量
     
     # === 搜索优化参数 ===
@@ -53,10 +88,16 @@ class UnifiedConfig:
     STAGNATION_LIMIT = 5  # 停滞限制
     MIN_ITERATIONS = 3  # 最小迭代次数
     
+    # === 路径权重参数 ===
+    FLIGHT_PATH_WEIGHT = 5.0  # 航班路径权重（大幅提高以优先选择航班）
+    GROUND_DUTY_PATH_WEIGHT = 6.0  # 地面任务路径权重（保持高优先级）
+    BUS_PATH_WEIGHT = 0.3  # 大巴任务路径权重（进一步降低）
+    POSITIONING_PATH_WEIGHT = 0.1  # 置位任务路径权重（大幅降低）
+    
     # === 主程序运行参数 ===
     TIME_LIMIT_SECONDS = 1 * 3600 + 55 * 60  # 1小时55分钟
     DATA_PATH = 'data/'
-    MAX_COLUMN_GENERATION_ITERATIONS = 3
+    MAX_COLUMN_GENERATION_ITERATIONS = 35  # 设置为35轮以匹配之前的良好结果
     PLANNING_START_DATE = (2025, 4, 29)  # 计划开始日期 (年, 月, 日)
     
     # === 机场分类配置 ===
@@ -127,11 +168,45 @@ class UnifiedConfig:
         获取约束参数
         """
         return {
+            # 值勤日约束
             'max_duty_day_hours': cls.MAX_DUTY_DAY_HOURS,
             'max_flight_time_in_duty_hours': cls.MAX_FLIGHT_TIME_IN_DUTY_HOURS,
             'min_rest_hours': cls.MIN_REST_HOURS,
             'max_flights_in_duty': cls.MAX_FLIGHTS_IN_DUTY,
-            'max_tasks_in_duty': cls.MAX_TASKS_IN_DUTY
+            'max_tasks_in_duty': cls.MAX_TASKS_IN_DUTY,
+            
+            # 飞行值勤日约束
+            'max_fdp_hours': cls.MAX_FDP_HOURS,
+            'max_fdp_flights': cls.MAX_FDP_FLIGHTS,
+            'max_fdp_tasks': cls.MAX_FDP_TASKS,
+            'max_fdp_flight_time': cls.MAX_FDP_FLIGHT_TIME,
+            
+            # 飞行周期约束
+            'max_flight_cycle_days': cls.MAX_FLIGHT_CYCLE_DAYS,
+            'min_cycle_rest_days': cls.MIN_CYCLE_REST_DAYS,
+            'max_total_flight_duty_hours': cls.MAX_TOTAL_FLIGHT_DUTY_HOURS,
+            
+            # 休息时间约束
+            'min_overnight_hours': cls.MIN_OVERNIGHT_HOURS,
+            
+            # 工作休息模式约束
+            'max_consecutive_duty_days': cls.MAX_CONSECUTIVE_DUTY_DAYS,
+            'min_rest_after_consecutive_duty': cls.MIN_REST_AFTER_CONSECUTIVE_DUTY,
+            
+            # 连接时间约束
+            'min_connection_time_flight_same_aircraft_minutes': cls.MIN_CONNECTION_TIME_FLIGHT_SAME_AIRCRAFT_MINUTES,
+            'min_connection_time_flight_different_aircraft_hours': cls.MIN_CONNECTION_TIME_FLIGHT_DIFFERENT_AIRCRAFT_HOURS,
+            'min_connection_time_bus_hours': cls.MIN_CONNECTION_TIME_BUS_HOURS,
+            'default_min_connection_time_hours': cls.DEFAULT_MIN_CONNECTION_TIME_HOURS,
+            
+            # 置位任务约束
+            'max_positioning_tasks': cls.MAX_POSITIONING_TASKS,
+            
+            # 新飞行周期约束
+            'min_rest_days_for_new_cycle': cls.MIN_REST_DAYS_FOR_NEW_CYCLE,
+            
+            # 总飞行时间约束
+            'max_total_flight_hours': cls.MAX_TOTAL_FLIGHT_HOURS
         }
 
 # 全局配置实例

@@ -564,8 +564,8 @@ class ALNSAlgorithm:
         self.repair_weight_manager = AdaptiveWeightManager(self.repair_operators)
 
         # 算法参数
-        self.max_iterations = 1000**3
-        self.time_limit = 3600  # 1小时
+        self.max_iterations = 10000**3
+        self.time_limit = 36000  # 1小时
         self.destroy_size_min = 1
         self.destroy_size_max = 5
 
@@ -605,8 +605,8 @@ class ALNSAlgorithm:
                 break
 
             # 选择破坏和修复算子
-            destroy_op = self.destroy_weight_manager.select_operator()
-            repair_op = self.repair_weight_manager.select_operator()
+            destroy_op: DestroyOperator = self.destroy_weight_manager.select_operator()
+            repair_op: RepairOperator = self.repair_weight_manager.select_operator()
 
             # 确定破坏大小
             destroy_size = random.randint(self.destroy_size_min,
