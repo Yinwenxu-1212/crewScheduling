@@ -6,7 +6,6 @@ from typing import List
 from datetime import timedelta
 from data_models import Flight, Roster, Crew
 from unified_config import config
-from initial_solution_generator import calculate_unified_roster_cost
 
 class MasterProblem:
     def __init__(self, flights: List[Flight], crews: List[Crew], ground_duties: List = None, layover_stations = None):
@@ -14,6 +13,10 @@ class MasterProblem:
         self.crews = crews
         self.ground_duties = ground_duties or []
         self.layover_stations = layover_stations or []
+        
+        # 初始化统一评分系统
+        from scoring_system import ScoringSystem
+        self.scoring_system = ScoringSystem(flights, crews, layover_stations)
         
         # 使用统一配置的参数
         optimization_params = config.get_optimization_params()
@@ -23,6 +26,7 @@ class MasterProblem:
         self.NEW_LAYOVER_PENALTY = optimization_params['new_layover_penalty']
         self.UNCOVERED_FLIGHT_PENALTY = optimization_params['uncovered_flight_penalty']
         self.UNCOVERED_GROUND_DUTY_PENALTY = optimization_params['uncovered_ground_duty_penalty']
+        self.VIOLATION_PENALTY = optimization_params['violation_penalty']
         
         # 设置线性目标函数
         self.use_simple_objective = True
@@ -83,12 +87,32 @@ class MasterProblem:
             obj_val = self.model.ObjVal
             
             if verbose:
+                # 计算实际的未覆盖数量
+                uncovered_flights_count = 0
+                uncovered_ground_duties_count = 0
+                
+                try:
+                    # 统计未覆盖航班数量
+                    for flight_id, var in self.uncovered_vars.items():
+                        if var.X > 0.5:
+                            uncovered_flights_count += 1
+                    
+                    # 统计未覆盖占位任务数量
+                    for ground_duty_id, var in self.uncovered_ground_duty_vars.items():
+                        if var.X > 0.5:
+                            uncovered_ground_duties_count += 1
+                except Exception as e:
+                    print(f"计算未覆盖数量时出错: {e}")
+                    # 如果计算失败，回退到显示变量数量
+                    uncovered_flights_count = len(self.uncovered_vars)
+                    uncovered_ground_duties_count = len(self.uncovered_ground_duty_vars)
+                
                 print(f"\n=== 线性目标函数求解结果 ===")
                 print(f"目标函数值: {obj_val:.2f}")
                 print(f"求解状态: 最优")
                 print(f"roster变量数量: {len(self.roster_vars)}")
-                print(f"未覆盖航班变量数量: {len(self.uncovered_vars)}")
-                print(f"未覆盖占位任务变量数量: {len(self.uncovered_ground_duty_vars)}")
+                print(f"未覆盖航班数量: {uncovered_flights_count}")
+                print(f"未覆盖占位任务数量: {uncovered_ground_duties_count}")
             
             return pi_duals, sigma_duals, ground_duty_duals, obj_val
         else:
@@ -109,11 +133,17 @@ class MasterProblem:
         for var in self.uncovered_ground_duty_vars.values():
             var.vtype = GRB.BINARY
         
+        # 设置BIP求解参数以提高可行性
+        self.model.setParam('TimeLimit', 1200)  # 20分钟时间限制
+        self.model.setParam('MIPGap', 0.05)     # 5% MIP gap
+        self.model.setParam('MIPFocus', 1)      # 优先找可行解
+        
         if verbose:
             print("正在求解最终的BIP模型...")
             print(f"模型包含 {len(self.roster_vars)} 个roster变量")
             print(f"模型包含 {len(self.uncovered_vars)} 个未覆盖航班变量") 
             print(f"模型包含 {len(self.uncovered_ground_duty_vars)} 个未覆盖占位任务变量")
+            print(f"BIP求解参数: TimeLimit=1200s, MIPGap=0.05, MIPFocus=1")
         
         # 在求解前验证目标函数设置
         self._validate_objective_function()
@@ -420,8 +450,8 @@ class MasterProblem:
         roster_cost = self._calculate_roster_cost(roster)
         roster.cost = roster_cost
         
-        # 为初始解设置保护下界
-        lower_bound = 0.1 if is_initial_roster else 0.0
+        # 为初始解设置保护下界（降低到0.0以提高求解灵活性）
+        lower_bound = 0.0 if is_initial_roster else 0.0
         
         # 创建roster变量，直接设置目标函数系数
         var_name = f"initial_roster_{roster.crew_id}_{len(self.roster_vars)}" if is_initial_roster else f"roster_{roster.crew_id}_{len(self.roster_vars)}"
@@ -507,10 +537,30 @@ class MasterProblem:
                     name=f"ground_duty_{ground_duty_id}"
                 )
     
-    def _calculate_roster_cost(self, roster):
+    def _calculate_roster_cost(self, roster, include_violations=False):
         """
         计算roster成本c_r
         
-        使用统一的成本计算函数，确保与初始解生成器的计算逻辑一致
+        使用统一的评分系统，确保与其他模块的计算逻辑一致
+        
+        Args:
+            roster: 排班方案
+            include_violations: 是否包含违规检查（主问题应该包含）
         """
-        return calculate_unified_roster_cost(roster, self.crews)
+        # 找到对应的机组
+        crew = None
+        for c in self.crews:
+            if c.crewId == roster.crew_id:
+                crew = c
+                break
+        
+        if not crew:
+            return 0.0
+        
+        if include_violations:
+            # 使用包含违规检查的完整成本计算
+            cost_details = self.scoring_system.calculate_roster_cost_with_violations(roster, crew)
+            return cost_details['total_cost']
+        else:
+            # 使用基础成本计算（不包含违规检查）
+            return self.scoring_system.calculate_unified_roster_cost(roster, crew)

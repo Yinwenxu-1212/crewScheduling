@@ -165,8 +165,6 @@ class ScoringSystem:
                 from unified_config import UnifiedConfig
                 PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date()
                 PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date()
-                print(PLAN_START_DATE, PLAN_END_DATE)
-                input()
             
             # 情况1：历史停留机场为外站的过夜天数
             if hasattr(crew, 'stayStation') and crew.stayStation and crew.stayStation != crew_base:
@@ -260,7 +258,6 @@ class ScoringSystem:
         elif hasattr(task, 'arrAirport'):
             return task.arrAirport
         else:
-            # 
             return default_base
         
     def _get_task_start_airport(self, task, default_base):
@@ -501,7 +498,7 @@ class ScoringSystem:
         if last_task_end and last_task_place and last_task_place != base:
             days_after_last_task = (PLAN_END_DATE - last_task_end).days
             overnight_penalty += max(0, days_after_last_task) * away_overnight_penalty_rate
-
+            
         for i in range(len(sorted_duties) - 1):
             current_duty = sorted_duties[i]
             next_duty = sorted_duties[i + 1]

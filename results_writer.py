@@ -46,21 +46,14 @@ def write_results_to_csv(selected_rosters: List[Roster], output_path: str, maste
                             is_ddh = 1  # 默认大巴任务都是置位任务
                     elif isinstance(task, Flight):
                         # For flights, check if this flight is executed (not positioning)
-                        # First check if task has type attribute indicating positioning
-                        if hasattr(task, 'type') and 'positioning' in str(task.type).lower():
+                        # Use the is_positioning attribute directly from the Flight object
+                        if hasattr(task, 'is_positioning') and task.is_positioning:
                             is_ddh = 1
-                        elif master_problem and hasattr(master_problem, 'flight_execution_vars'):
-                            # If the flight execution variable is 0, this flight is used for positioning
-                            exec_var = master_problem.flight_execution_vars.get(task.id)
-                            if exec_var and hasattr(exec_var, 'X'):
-                                # If execution variable is close to 0, this is positioning
-                                is_ddh = 1 if exec_var.X < 0.5 else 0
-                            else:
-                                # Fallback: assume it's execution if no execution variable found
-                                is_ddh = 0
+                        elif hasattr(task, 'type') and 'positioning' in str(task.type).lower():
+                            is_ddh = 1
                         else:
-                            # Fallback: check if flight number starts with "DH" (old logic)
-                            is_ddh = 1 if task.flightNo.startswith("DH") else 0
+                            # Default to execution flight
+                            is_ddh = 0
                     
                     writer.writerow([crew_id, task_id, is_ddh])
         

@@ -114,11 +114,6 @@ class CoverageValidator:
             report.append("✅ 验证通过：满足覆盖率要求")
         else:
             report.append("❌ 验证失败：覆盖率不足")
-            report.append("\n未覆盖航班列表:")
-            for flight in result['uncovered_flights'][:10]:  # 只显示前10个
-                report.append(f"  - {flight.id}: {flight.std} {flight.depaAirport}->{flight.arriAirport}")
-            if len(result['uncovered_flights']) > 10:
-                report.append(f"  ... 还有 {len(result['uncovered_flights']) - 10} 个未覆盖航班")
         
         return "\n".join(report)
     

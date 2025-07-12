@@ -78,7 +78,7 @@ class UnifiedConstraintChecker:
         值勤日定义：
         - 任务的集合，跨度不超过24小时
         - 可包含占位任务，可跨日历日
-        - 任务间休息时间少于12小时则属于同一值勤日 #
+        - 任务间休息时间少于12小时则属于同一值勤日
         """
         if not tasks:
             return []
@@ -466,7 +466,7 @@ class UnifiedConstraintChecker:
                     violations.append(f"连接时间不足: {connection_time} < {min_connection}")
         
         return violations
-    
+      
     def _validate_positioning_rules(self, tasks: List) -> List[str]:
         """验证置位规则：仅允许值勤日的开始或结束进行置位"""
         violations = []
@@ -544,7 +544,7 @@ class UnifiedConstraintChecker:
             result['total_flight_time_violations'].append(
                 f"总飞行值勤时间超限: {total_flight_duty_time:.1f}小时 > {self.constraints.MAX_TOTAL_FLIGHT_DUTY_HOURS}小时"
             )
-
+            
         # 6. 不衔接扣分 con2
         inconsistent_violations = self._validate_inconsistent_locations(crew, sorted_tasks)
         if inconsistent_violations:

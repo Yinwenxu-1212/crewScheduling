@@ -19,20 +19,12 @@ import matplotlib.pyplot as plt
 import gc  # 添加垃圾回收模块
 
 # Import our custom modules
-try:
-    # 相对导入（当作为模块导入时）
-    from . import config
-    from .utils import DataHandler, calculate_final_score
-    from .environment import CrewRosteringEnv
-    from .model import ActorCritic
-    from .training_monitor import TrainingMonitor, FeatureAnalyzer
-except ImportError:
-    # 绝对导入（当直接运行时）
-    import config
-    from utils import DataHandler, calculate_final_score
-    from environment import CrewRosteringEnv
-    from model import ActorCritic
-    from training_monitor import TrainingMonitor, FeatureAnalyzer
+# 使用绝对导入
+import config
+from utils import DataHandler, calculate_final_score
+from environment import CrewRosteringEnv
+from model import ActorCritic
+from training_monitor import TrainingMonitor, FeatureAnalyzer
 
 class ExperienceReplay:
     """经验回放缓冲区"""
@@ -349,7 +341,7 @@ def train():
                     actions = torch.cat(sample_actions).to(config.DEVICE)
                     masks = torch.cat(sample_masks).to(config.DEVICE)
                     
-                    feature_importance = analyzer.analyze_feature_importance(model, (states, actions, masks))
+                    feature_importance = monitor.analyze_feature_importance(model, (states, actions, masks))
                     monitor.log_dual_price_features({
                         'feature_importance': feature_importance,
                         'avg_alpha': np.mean(episode_alpha_weights) if episode_alpha_weights else 0.7,
@@ -455,6 +447,10 @@ def train():
 
 def train_model_with_replay(model, optimizer, experience_replay, episode):
     """改进的PPO训练函数，返回损失值用于监控"""
+    # 初始化梯度累积
+    if hasattr(config, 'GRADIENT_ACCUMULATION_STEPS') and config.GRADIENT_ACCUMULATION_STEPS > 1:
+        optimizer.zero_grad()
+    
     batch_size = min(config.BATCH_SIZE, len(experience_replay))
     experiences = experience_replay.sample(batch_size)
     
@@ -557,18 +553,37 @@ def train_model_with_replay(model, optimizer, experience_replay, episode):
         
         loss = actor_loss + 0.5 * critic_loss - entropy_coef * entropy + 1e-4 * l2_reg
         
-        optimizer.zero_grad()
+        # 梯度累积支持
+        if hasattr(config, 'GRADIENT_ACCUMULATION_STEPS') and config.GRADIENT_ACCUMULATION_STEPS > 1:
+            loss = loss / config.GRADIENT_ACCUMULATION_STEPS
+        
         loss.backward()
         
-        # 梯度裁剪（使用配置参数）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
-        
-        # 检查梯度是否正常
-        grad_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-        if grad_norm > 100:
-            print(f"Warning: Large gradient norm: {grad_norm:.2f}")
-        
-        optimizer.step()
+        # 梯度累积：只在累积步数达到时才更新参数
+        if hasattr(config, 'GRADIENT_ACCUMULATION_STEPS') and config.GRADIENT_ACCUMULATION_STEPS > 1:
+            if (ppo_epoch + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                # 梯度裁剪（使用配置参数）
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+                
+                # 检查梯度是否正常
+                grad_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                if grad_norm > 100:
+                    print(f"Warning: Large gradient norm: {grad_norm:.2f}")
+                
+                optimizer.step()
+                optimizer.zero_grad()
+        else:
+            # 传统的每步更新
+            # 梯度裁剪（使用配置参数）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+            
+            # 检查梯度是否正常
+            grad_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+            if grad_norm > 100:
+                print(f"Warning: Large gradient norm: {grad_norm:.2f}")
+            
+            optimizer.step()
+            optimizer.zero_grad()
     
     return total_actor_loss / config.PPO_EPOCHS, total_critic_loss / config.PPO_EPOCHS
 

@@ -10,14 +10,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-try:
-    from . import config
-    from .utils import RuleChecker, DataHandler, identify_duties_and_cycles, calculate_final_score
-    from .config import PRIORITY_WEIGHTS
-except ImportError:
-    import config
-    from utils import RuleChecker, DataHandler, identify_duties_and_cycles, calculate_final_score
-    from config import PRIORITY_WEIGHTS
+# 使用绝对导入
+import config
+from utils import RuleChecker, DataHandler, identify_duties_and_cycles, calculate_final_score
+from config import PRIORITY_WEIGHTS
 
 class GlobalCoordinator:
     """全局协调器，引导机组向未覆盖的占位任务移动"""
@@ -129,6 +125,14 @@ class CrewRosteringEnv:
         self.unified_tasks_df = self.dh.data['unified_tasks']
         self.planning_start_dt = pd.to_datetime(config.PLANNING_START_DATE)
         self.global_coordinator = None  # 将在reset中初始化
+        
+        # 批量预计算缓存
+        self.task_features_cache = {}
+        self.precomputed_features = {}
+        
+        # 初始化批量预计算
+        if config.ENABLE_BATCH_PRECOMPUTE:
+            self._initialize_batch_precompute()
 
     def reset(self):
         self.roster_plan = collections.defaultdict(list)
@@ -737,11 +741,84 @@ class CrewRosteringEnv:
         valid_actions.sort(key=lambda x: -x['dynamic_priority'])
         relaxed_actions.sort(key=lambda x: (-x.get('violation_penalty', 0), -x['dynamic_priority']))
         
-
+        # 智能动作筛选（性能优化）
+        if config.ENABLE_SMART_ACTION_FILTERING:
+            valid_actions = self._smart_filter_actions(valid_actions, crew_info, crew_state)
+            relaxed_actions = self._smart_filter_actions(relaxed_actions, crew_info, crew_state)
         
         if valid_actions: return valid_actions[:config.MAX_CANDIDATE_ACTIONS], []
         return [], relaxed_actions[:config.MAX_CANDIDATE_ACTIONS]
     
+    def _smart_filter_actions(self, actions, crew_info, crew_state):
+        """
+        智能筛选动作，基于阈值过滤低价值动作以提高性能
+        """
+        if not actions:
+            return actions
+        
+        # 计算动态阈值
+        priorities = [action.get('dynamic_priority', 0) for action in actions]
+        if not priorities:
+            return actions
+        
+        max_priority = max(priorities)
+        min_priority = min(priorities)
+        priority_range = max_priority - min_priority
+        
+        # 动态阈值：保留优先级在前70%的动作
+        threshold = min_priority + priority_range * config.ACTION_FILTER_THRESHOLD
+        
+        # 筛选高价值动作
+        filtered_actions = []
+        for action in actions:
+            priority = action.get('dynamic_priority', 0)
+            
+            # 始终保留高优先级动作
+            if priority >= threshold:
+                filtered_actions.append(action)
+            # 对于占位任务，降低筛选门槛
+            elif action.get('type') == 'ground_duty' and action.get('crewId') == crew_info['crewId']:
+                filtered_actions.append(action)
+            # 对于能帮助到达占位任务的动作，也保留
+            elif action.get('helps_reach_gd', False):
+                filtered_actions.append(action)
+        
+        # 确保至少保留一些动作
+        if not filtered_actions and actions:
+            # 如果筛选后没有动作，保留前5个最高优先级的动作
+            filtered_actions = sorted(actions, key=lambda x: -x.get('dynamic_priority', 0))[:5]
+        
+        return filtered_actions
+    
+    def _initialize_batch_precompute(self):
+        """
+        初始化批量预计算，预计算常用的任务特征
+        """
+        print("Initializing batch precompute...")
+        
+        # 预计算任务基础特征
+        for _, task in self.unified_tasks_df.iterrows():
+            task_dict = task.to_dict()
+            task_id = task_dict['taskId']
+            
+            # 预计算时间特征
+            start_time = task_dict['startTime']
+            self.precomputed_features[task_id] = {
+                'hour_of_day': start_time.hour / 23.0,
+                'day_of_week': start_time.weekday() / 6.0,
+                'is_weekend': 1.0 if start_time.weekday() >= 5 else 0.0,
+                'duration_hours': (task_dict['endTime'] - start_time).total_seconds() / 3600.0,
+                'fly_time_normalized': task_dict.get('flyTime', 0) / 600.0,  # 假设最大飞行时间10小时
+            }
+        
+        print(f"Precomputed features for {len(self.precomputed_features)} tasks")
+    
+    def _get_precomputed_features(self, task_id):
+        """
+        获取预计算的任务特征
+        """
+        return self.precomputed_features.get(task_id, {})
+     
     def _calculate_dynamic_priority(self, task, crew_state, crew_info):
         """计算任务的动态优先级分数，综合考虑时间敏感性、任务特性和机组匹配度"""
         priority_score = 0.0
@@ -881,7 +958,17 @@ class CrewRosteringEnv:
         violated_rules = set()
         if new_task.get('type') == 'flight' and new_task['taskId'] not in self.dh.crew_leg_map.get(crew_info['crewId'], set()): return False, {'hard_violation_qualification'}
         for task in roster:
-            if not (new_task['endTime'] <= task.get('startTime', config.PLANNING_END_DATE) or new_task['startTime'] >= task.get('endTime', config.PLANNING_START_DATE)): return False, {'hard_violation_overlap'}
+            # 根据规则11：占位任务与占位任务之间可以时间重叠，其他任务类型两两之间不能重叠
+            is_new_ground = new_task.get('type') == 'ground_duty'
+            is_existing_ground = task.get('type') == 'ground_duty'
+            
+            # 如果两个都是占位任务，允许重叠
+            if is_new_ground and is_existing_ground:
+                continue
+            
+            # 其他情况检查重叠
+            if not (new_task['endTime'] <= task.get('startTime', config.PLANNING_END_DATE) or new_task['startTime'] >= task.get('endTime', config.PLANNING_START_DATE)): 
+                return False, {'hard_violation_overlap'}
         
         # 检查连接时间约束
         temp_roster = sorted(roster + [new_task], key=lambda x: x['startTime'])
@@ -1342,14 +1429,22 @@ class CrewRosteringEnv:
         features[7] = hash(task['depaAirport']) % 1000
         features[8] = hash(task['arriAirport']) % 1000
         
-        # 时间特征
-        features[9] = task['startTime'].weekday()
-        features[10] = task['startTime'].hour
-        features[11] = task['endTime'].hour
+        # 时间特征 - 使用预计算特征（如果可用）
+        task_id = task.get('taskId')
+        precomputed = self._get_precomputed_features(task_id) if hasattr(self, 'precomputed_features') else {}
         
-        # 任务持续时间
-        duration = (task['endTime'] - task['startTime']).total_seconds() / 3600
-        features[12] = min(duration, 24)
+        if precomputed:
+            features[9] = precomputed.get('day_of_week', task['startTime'].weekday() / 6.0)
+            features[10] = precomputed.get('hour_of_day', task['startTime'].hour / 23.0)
+            features[11] = precomputed.get('is_weekend', 1.0 if task['startTime'].weekday() >= 5 else 0.0)
+            features[12] = precomputed.get('duration_hours', (task['endTime'] - task['startTime']).total_seconds() / 3600.0)
+        else:
+            # 回退到原始计算
+            features[9] = task['startTime'].weekday() / 6.0
+            features[10] = task['startTime'].hour / 23.0
+            features[11] = 1.0 if task['startTime'].weekday() >= 5 else 0.0
+            duration = (task['endTime'] - task['startTime']).total_seconds() / 3600
+            features[12] = min(duration, 24)
         
         # 新增伪对偶价格特征（13-19）
         # 13. 任务稀缺性评分（基于可执行机组数）
@@ -1516,15 +1611,31 @@ class CrewRosteringEnv:
             reward += positioning_reward
         
         elif task_type == 'ground_duty':
-            # 占位任务覆盖奖励（提高优先级）
-            reward += config.GROUND_DUTY_COVERAGE_REWARD
+            # 检查是否为休息占位任务
+            from utils import is_rest_ground_duty, calculate_rest_period, get_rest_quality_bonus
             
-            # 占位任务优先级奖励
-            reward += config.GROUND_DUTY_PRIORITY_BONUS
-            
-            # 额外奖励：如果覆盖了关键时段的占位任务
-            if self._is_critical_ground_duty(task):
-                reward += config.CRITICAL_GROUND_DUTY_BONUS
+            if is_rest_ground_duty(task):
+                # 休息占位任务特殊处理
+                reward += config.REST_GROUND_DUTY_REWARD
+                
+                # 计算休息质量奖励
+                rest_period = calculate_rest_period(crew_state['last_task_end_time'], task['startTime'])
+                rest_bonus = get_rest_quality_bonus(rest_period)
+                reward += rest_bonus
+                
+                # 如果休息时间充足，给予额外奖励
+                if rest_period >= config.MIN_REST_PERIOD_HOURS:
+                    reward += config.REST_PERIOD_BONUS
+            else:
+                # 普通占位任务处理
+                reward += config.GROUND_DUTY_COVERAGE_REWARD
+                
+                # 占位任务优先级奖励
+                reward += config.GROUND_DUTY_PRIORITY_BONUS
+                
+                # 额外奖励：如果覆盖了关键时段的占位任务
+                if self._is_critical_ground_duty(task):
+                    reward += config.CRITICAL_GROUND_DUTY_BONUS
             
             # 如果是分配给当前机组的占位任务，给予更高奖励
             if task.get('crewId') == crew_info['crewId']:

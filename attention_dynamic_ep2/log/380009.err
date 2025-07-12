@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/share/home/u23028/CTS2025/crewSchedule_cg/attention_new/main.py", line 646, in <module>
+    args = parse_args()
+  File "/share/home/u23028/CTS2025/crewSchedule_cg/attention_new/main.py", line 601, in parse_args
+    parser.add_argument('--lr', type=float, default=config.LEARNING_RATE,
+                                                    ^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'config' has no attribute 'LEARNING_RATE'
+srun: error: gpu8004: task 0: Exited with exit code 1

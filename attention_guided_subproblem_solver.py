@@ -515,7 +515,7 @@ class AttentionGuidedSubproblemSolver:
             features[13] = self._calculate_flight_urgency(task, current_label)
             
             # 14. 置位价值
-            features[14] = self._calculate_positioning_value(task, current_label)
+            features[14] = self._calculate_positioning_value(task, current_label, crew)
             
             # 15. 资源利用效率
             features[15] = self._calculate_resource_efficiency(task, current_label)
@@ -692,7 +692,7 @@ class AttentionGuidedSubproblemSolver:
         else:
             return 0.1  # 不紧迫
     
-    def _calculate_positioning_value(self, task, current_label):
+    def _calculate_positioning_value(self, task, current_label, crew):
         """计算置位价值 - 基于实际数据的智能评估"""
         if 'positioning' not in task.get('type', '') and task['type'] != 'positioning_bus':
             return 0.0
@@ -706,7 +706,7 @@ class AttentionGuidedSubproblemSolver:
             base_value = 0.6 if target_airport in important_airports else 0.3
             
             # 2. 后续航班连接价值分析
-            connection_value = self._evaluate_positioning_connections(target_airport, arrival_time, current_label)
+            connection_value = self._evaluate_positioning_connections(target_airport, arrival_time, current_label, crew)
             
             # 3. 时间敏感性评估
             time_urgency = self._calculate_positioning_time_urgency(arrival_time, current_label)
@@ -793,7 +793,7 @@ class AttentionGuidedSubproblemSolver:
         # 如果当前在值勤中且已有任务，则认为是中间置位
         return current_label.duty_start_time is not None and current_label.duty_task_count > 0
     
-    def _evaluate_positioning_connections(self, target_airport, arrival_time, current_label):
+    def _evaluate_positioning_connections(self, target_airport, arrival_time, current_label, crew):
         """评估置位后的航班连接价值
         
         Args:
@@ -811,7 +811,7 @@ class AttentionGuidedSubproblemSolver:
                 return 0.3  # 默认中等价值
             
             # 获取当前机组的资质航班
-            crew_id = getattr(current_label, 'crew_id', None)
+            crew_id = crew.crewId
             if not crew_id:
                 if self.debug:
                     print("Warning: 无法获取机组ID，使用默认连接价值")
@@ -829,15 +829,30 @@ class AttentionGuidedSubproblemSolver:
             # 获取枢纽机场配置
             hub_airports = getattr(config, 'HUB_AIRPORTS', {'PEK', 'SHA', 'CAN', 'SZX'})
             
-            # 模拟查找后续航班（实际实现中应该使用真实的航班数据）
-            # TODO: 在未来版本中，应该基于实际航班时刻表进行精确匹配
+            # 基于实际航班数据查找后续连接航班
             for flight_id in eligible_flights:
-                # 简化实现：基于机场重要性估算连接机会
-                if target_airport in hub_airports:  # 重要枢纽
-                    connection_count += 2
-                    high_value_connections += 1
-                else:
+                # 从flights数据中查找匹配的航班
+                matching_flights = [f for f in getattr(self, 'flights', []) 
+                                  if f.flightId == flight_id and 
+                                     f.deptAirport == target_airport and
+                                     f.deptTime >= arrival_time and
+                                     f.deptTime <= arrival_time + connection_window]
+                
+                for flight in matching_flights:
                     connection_count += 1
+                    # 判断是否为高价值连接（长航线或重要目的地）
+                    if (flight.arriAirport in hub_airports or 
+                        flight.flyTime > 180):  # 3小时以上航班
+                        high_value_connections += 1
+            
+            # 如果没有flights数据，降级到基于机场重要性的估算
+            if not hasattr(self, 'flights') or not self.flights:
+                for flight_id in eligible_flights:
+                    if target_airport in hub_airports:  # 重要枢纽
+                        connection_count += 2
+                        high_value_connections += 1
+                    else:
+                        connection_count += 1
             
             # 计算连接价值
             if connection_count == 0:
@@ -892,18 +907,19 @@ class AttentionGuidedSubproblemSolver:
         except Exception:
             return 0.5
     
-    def _count_available_flights(self, current_label):
+    def _count_available_flights(self, current_label, crew):
         """计算当前状态下可用的航班数量 - 基于实际数据和机组资质
         
         Args:
             current_label: 当前标签状态，包含时间、位置和已使用任务信息
+            crew: 机组对象，用于获取机组资质信息
             
         Returns:
             int: 估算的可用航班数量
             
         Note:
-            这是一个估算方法，实际实现中应该基于真实的航班时刻表数据。
-            当前版本使用机场重要性、时间段和机组资质进行估算。
+            这个方法现在基于真实的航班时刻表数据进行精确计算。
+            当航班数据不可用时，会降级到基于机场重要性、时间段和机组资质的估算。
         """
         try:
             current_time = current_label.node.time
@@ -911,7 +927,7 @@ class AttentionGuidedSubproblemSolver:
             
             # 获取当前机组的资质航班
             if hasattr(self, 'crew_leg_match_dict') and self.crew_leg_match_dict:
-                crew_id = getattr(current_label, 'crew_id', None)
+                crew_id = crew.crewId
                 if crew_id:
                     eligible_flights = self.crew_leg_match_dict.get(crew_id, [])
                     
@@ -921,15 +937,32 @@ class AttentionGuidedSubproblemSolver:
                     # 计算时间窗口内的可用航班
                     time_window = timedelta(hours=24)  # 24小时窗口
                     
-                    # 基于机场的基础航班数量（基于实际数据分析）
-                    # TODO: 这些数据应该从配置文件或数据库中获取
-                    base_flights_per_airport = {
-                        'VIOC': 20, 'RRES': 15, 'RTHW': 12,  # 主要枢纽
-                        'ENDP': 8, 'TATC': 7, 'TPWY': 6, 'VWSF': 6, 'XVFW': 6,  # 高频机场
-                        'JFEE': 5, 'BTTC': 5, 'GDHI': 4, 'RTWL': 4  # 重要机场
-                    }
-                    
-                    base_count = base_flights_per_airport.get(current_airport, 2)
+                    # 基于实际航班数据统计机场的航班数量
+                    if hasattr(self, 'flights') and self.flights:
+                        # 统计当前机场在时间窗口内的实际航班数量
+                        window_start = current_time
+                        window_end = current_time + time_window
+                        
+                        airport_flights = [f for f in self.flights 
+                                         if f.deptAirport == current_airport and
+                                            window_start <= f.deptTime <= window_end and
+                                            f.flightId in eligible_flights]
+                        
+                        base_count = len(airport_flights)
+                        
+                        if self.debug:
+                            print(f"实际统计 {current_airport} 在时间窗口内有 {base_count} 个可用航班")
+                    else:
+                        # 降级到配置化的基础航班数量
+                        base_flights_per_airport = {
+                            'VIOC': 20, 'RRES': 15, 'RTHW': 12,  # 主要枢纽
+                            'ENDP': 8, 'TATC': 7, 'TPWY': 6, 'VWSF': 6, 'XVFW': 6,  # 高频机场
+                            'JFEE': 5, 'BTTC': 5, 'GDHI': 4, 'RTWL': 4  # 重要机场
+                        }
+                        base_count = base_flights_per_airport.get(current_airport, 2)
+                         
+                        if self.debug:
+                             print(f"使用配置数据，{current_airport} 基础航班数量: {base_count}")
                     
                     # 根据时间段调整（反映航班时刻表的实际分布）
                     hour = current_time.hour
@@ -1067,8 +1100,11 @@ class AttentionGuidedSubproblemSolver:
                                       crew_leg_match_dict: Dict[str, List[str]], iteration_round: int = 0, external_log_func=None) -> List[Roster]:
         """使用注意力模型指导的子问题求解"""
         
-        # 保存crew_leg_match_dict到实例变量
+        # 保存数据到实例变量以供其他方法使用
         self.crew_leg_match_dict = crew_leg_match_dict
+        self.flights = flights
+        self.buses = buses
+        self.ground_duties = ground_duties
         
         # 初始化
         found_rosters = []

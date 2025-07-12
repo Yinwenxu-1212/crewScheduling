@@ -176,14 +176,19 @@ performance_*.csv
 
 # AI模型文件 (AI Model Files)
 # ============================
-models/*.pth
-models/*.pkl
-models/*.joblib
-!models/best_model.pth
+# 注释掉模型文件忽略规则，允许上传所有模型文件
+# models/*.pth
+# models/*.pkl
+# models/*.joblib
 !models/.gitkeep
+# 保持训练过程文件的忽略
 checkpoints/
 tensorboard_logs/
 wandb/
+# 忽略大型临时模型文件
+models/temp_*.pth
+models/checkpoint_*.pth
+models/*_backup.pth
 
 # 数据缓存文件 (Data Cache Files)
 # ===============================
