@@ -316,7 +316,7 @@ class RuleChecker:
             if len(flight_duty_tasks) > 6: violations += 1
 
             # Rule 5: 最大飞行时间
-            if sum(t.get('flyTime', 0) for t in flight_duty_tasks) / 60.0 > 8: violations += 1
+            if sum(t.get('flyTime', 0) for t in flight_duty_tasks if t.get('type') == 'flight' and not t.get('is_positioning', False)) / 60.0 > 8: violations += 1
 
             # Rule 6: 最大飞行值勤时间（修正版）
             # 飞行值勤时间 = 飞行值勤日的总时长（从第一个任务开始到最后一个任务结束）
@@ -389,7 +389,7 @@ def calculate_final_score(roster_plan, data_handler):
         
         for task in sorted_tasks:
             task_type = task.get('type', '')
-            if task_type == 'flight':
+            if task_type == 'flight' and not task.get('is_positioning', False):
                 # 只有执飞任务才累加飞行小时和计入覆盖
                 total_fly_hours += task.get('flyTime', 0) / 60.0
                 covered_flight_ids.add(task['taskId'])

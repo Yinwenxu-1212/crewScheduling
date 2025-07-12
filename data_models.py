@@ -164,7 +164,7 @@ class DutyDay:
     
     def get_total_flight_time_minutes(self):
         """获取总飞行时间（分钟）"""
-        return sum(task.flyTime for task in self.tasks if isinstance(task, Flight))
+        return sum(task.flyTime for task in self.tasks if isinstance(task, Flight) and not getattr(task, 'is_positioning', False))
     
     def get_start_airport(self):
         """获取开始机场"""
@@ -210,7 +210,7 @@ class FlightDutyPeriod(DutyDay):
         super().add_task(task)
         
         # FDP特有的逻辑：统计执行飞行任务（非置位飞行任务）
-        if isinstance(task, Flight) and not getattr(task, 'is_ddh', False) and not getattr(task, 'positioning_flight', False):
+        if isinstance(task, Flight) and not getattr(task, 'is_positioning', False):
             self.has_flight = True
             self.flight_count += 1
             self.total_flight_time += task.flyTime
@@ -320,10 +320,10 @@ class FlightDutyPeriod(DutyDay):
                 interval = next_start - curr_end
                 
                 # 判断任务类型
-                is_curr_flight = hasattr(curr_task, 'flightNumber')
-                is_next_flight = hasattr(next_task, 'flightNumber')
-                is_curr_bus = hasattr(curr_task, 'type') and 'bus' in str(curr_task.type).lower()
-                is_next_bus = hasattr(next_task, 'type') and 'bus' in str(next_task.type).lower()
+                is_curr_flight = isinstance(curr_task, Flight)
+                is_next_flight = isinstance(next_task, Flight)
+                is_curr_bus = isinstance(curr_task, BusInfo)
+                is_next_bus = isinstance(next_task, BusInfo)
                 
                 # 航班飞行任务及飞行置位任务：不同机型间隔不小于3小时
                 if (is_curr_flight or is_next_flight) and not (is_curr_bus or is_next_bus):

@@ -222,7 +222,7 @@ class ConstraintViolationDetector:
                 self.violation_stats['flight_count_violations'] += 1
             
             # 检查飞行时间
-            total_flight_time = sum(task.get('flyTime', 0) for task in duty_day['tasks'] if task['type'] == 'flight') / 60.0
+            total_flight_time = sum(task.get('flyTime', 0) for task in duty_day['tasks'] if task['type'] == 'flight' and not task.get('is_positioning', False)) / 60.0
             if total_flight_time > UnifiedConfig.MAX_FLIGHT_TIME_IN_DUTY_HOURS:
                 violations.append(f"飞行时间超限: {total_flight_time:.1f}h > {UnifiedConfig.MAX_FLIGHT_TIME_IN_DUTY_HOURS}h")
                 self.violation_stats['flight_time_violations'] += 1
@@ -306,12 +306,26 @@ class ConstraintViolationDetector:
             self.violation_stats['flight_cycle_violations'] += violations
     
     def _check_total_flight_time_violations(self, crew_id: str, tasks: List[Dict]):
-        """检查总飞行时间违规"""
-        total_flight_time = sum(task.get('flyTime', 0) for task in tasks if task['type'] == 'flight') / 60.0
+        """检查总飞行值勤时间违规"""
+        # 修正：计算飞行值勤时间而不是飞行时间
+        # 飞行值勤时间 = 飞行值勤日的总时长（从第一个任务开始到最后一个飞行任务结束）
         
-        if total_flight_time > self.constraint_checker.MAX_TOTAL_FLIGHT_HOURS:
+        duty_days = self._organize_tasks_into_duty_days(tasks)
+        total_flight_duty_time = 0.0
+        
+        for duty_day in duty_days:
+            # 检查是否包含飞行任务
+            flight_tasks = [task for task in duty_day['tasks'] if task['type'] == 'flight']
+            if flight_tasks:
+                # 飞行值勤日：从第一个任务开始到最后一个飞行任务结束
+                first_task_start = duty_day['start_time']
+                last_flight_end = max(task['endTime'] for task in flight_tasks)
+                flight_duty_duration = (last_flight_end - first_task_start).total_seconds() / 3600.0
+                total_flight_duty_time += flight_duty_duration
+        
+        if total_flight_duty_time > self.constraint_checker.MAX_TOTAL_FLIGHT_HOURS:
             self.violation_stats['total_flight_duty_time_violations'] += 1
-            print(f"  机组 {crew_id}: 总飞行时间超限 {total_flight_time:.1f}h > {self.constraint_checker.MAX_TOTAL_FLIGHT_HOURS}h")
+            print(f"  机组 {crew_id}: 总飞行值勤时间超限 {total_flight_duty_time:.1f}h > {self.constraint_checker.MAX_TOTAL_FLIGHT_HOURS}h")
     
     def _analyze_theoretical_constraints(self):
         """分析理论约束（无排班数据时）"""

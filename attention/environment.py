@@ -989,7 +989,7 @@ class CrewRosteringEnv:
             flight_duty_tasks = [t for t in last_duty if t.get('type') in ['flight', 'positioning_flight', 'positioning_bus']]
             if flight_duty_tasks:
                 # 计算飞行时间：只包括实际飞行任务的飞行时间，不包括飞行置位
-                total_flight_time = sum(t.get('flyTime', 0) for t in flight_duty_tasks if t.get('type') == 'flight') / 60.0
+                total_flight_time = sum(t.get('flyTime', 0) for t in flight_duty_tasks if t.get('type') == 'flight' and not t.get('is_positioning', False)) / 60.0
                 if total_flight_time > 8: violated_rules.add('minor_violation_fly_time')
                 duty_start = flight_duty_tasks[0]['startTime']
                 flight_tasks_in_duty = [t for t in flight_duty_tasks if 'flight' in t.get('type','')]
@@ -1532,7 +1532,7 @@ class CrewRosteringEnv:
                 crew_state['duty_positioning'] = 0  # 重置值勤内置位计数
             
             crew_state['duty_task_count'] += 1
-            if task_type == 'flight':
+            if task_type == 'flight' and not task.get('is_positioning', False):
                 crew_state['duty_flight_count'] += 1
                 crew_state['duty_flight_time'] += task.get('flyTime', 0) / 60.0
                 crew_state['total_flight_hours'] += task.get('flyTime', 0) / 60.0

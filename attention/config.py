@@ -143,9 +143,9 @@ try:
     # 动态获取规划时间范围
     PLANNING_START_DATE, PLANNING_END_DATE = get_planning_dates_from_data()
     
-    # 打印数据摘要（可选）
-    data_config = get_data_config()
-    data_config.print_data_summary()
+    # 注释掉自动打印数据摘要，避免在导入时输出
+    # data_config = get_data_config()
+    # data_config.print_data_summary()
     
 except ImportError as e:
     print(f"Warning: Could not import data_config module: {e}")

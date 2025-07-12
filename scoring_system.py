@@ -145,26 +145,15 @@ class ScoringSystem:
             away_overnight_days = 0
             crew_base = crew.base
             
-            # 计划期边界定义（从数据中动态获取）
-            try:
-                # 尝试从attention模块的data_config动态获取
-                import sys
-                import os
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                attention_path = os.path.join(current_dir, 'attention')
-                if attention_path not in sys.path:
-                    sys.path.append(attention_path)
-                
-                from data_config import get_data_config
-                data_config = get_data_config()
-                plan_start_time, plan_end_time = data_config.get_planning_time_range()
-                PLAN_START_DATE = plan_start_time.date()
-                PLAN_END_DATE = plan_end_time.date()
-            except Exception as e:
-                # 降级到配置文件
-                from unified_config import UnifiedConfig
-                PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date()
-                PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date()
+            # 计划期边界定义（统一使用UnifiedConfig）
+            from unified_config import UnifiedConfig
+            
+            # 确保规划日期已初始化
+            if UnifiedConfig.PLANNING_START_DATE is None or UnifiedConfig.PLANNING_END_DATE is None:
+                UnifiedConfig.initialize_planning_dates()
+            
+            PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date()
+            PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date()
             
             # 情况1：历史停留机场为外站的过夜天数
             if hasattr(crew, 'stayStation') and crew.stayStation and crew.stayStation != crew_base:
@@ -260,10 +249,23 @@ class ScoringSystem:
         else:
             return default_base
     
+    def _get_task_start_airport(self, task, default_base):
+        """获取任务开始机场"""
+        if isinstance(task, Flight):
+            return task.depaAirport
+        elif hasattr(task, 'depaAirport'):
+            return task.depaAirport
+        elif hasattr(task, 'depAirport'):
+            return task.depAirport
+        else:
+            return default_base
+    
     def _get_task_end_time(self, task):
         """获取任务结束时间"""
         if isinstance(task, Flight):
             return task.sta
+        elif isinstance(task, BusInfo):
+            return task.ta
         elif hasattr(task, 'endTime'):
             return task.endTime
         else:
@@ -273,6 +275,8 @@ class ScoringSystem:
         """获取任务开始时间"""
         if isinstance(task, Flight):
             return task.std
+        elif isinstance(task, BusInfo):
+            return task.td
         elif hasattr(task, 'startTime'):
             return task.startTime
         else:
@@ -306,7 +310,7 @@ class ScoringSystem:
                 continue
 
             # 按时间排序任务
-            sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
+            sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
 
             # 检查违规情况
             roster_violations = self._check_roster_violations(roster, crew)
@@ -314,13 +318,18 @@ class ScoringSystem:
 
             # 统计每个roster的贡献
             for duty in sorted_duties:
-                if isinstance(duty, Flight):
+                if isinstance(duty, Flight) and not getattr(duty, 'is_positioning', False):
                     covered_flight_ids.add(duty.id)
                     total_flight_hours += duty.flyTime / 60.0
                     
                     # 计算值勤日历日（跨零点时记为两个日历日）
-                    start_date = duty.std.date()
-                    end_date = duty.sta.date()
+                    start_time = self._get_task_start_time(duty)
+                    end_time = self._get_task_end_time(duty)
+                    if start_time and end_time:
+                        start_date = start_time.date()
+                        end_date = end_time.date()
+                    else:
+                        continue  # 跳过无效的任务
                     current_date = start_date
                     while current_date <= end_date:
                         all_duty_calendar_days.add(current_date)
@@ -456,11 +465,39 @@ class ScoringSystem:
         统一的外站过夜惩罚计算方法
         替代各模块中不一致的外站过夜计算逻辑
         """
+        from unified_config import UnifiedConfig
         optimization_params = UnifiedConfig.get_optimization_params()
         away_overnight_penalty_rate = optimization_params['away_overnight_penalty']
         
         overnight_penalty = 0.0
-        sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
+        sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
+        
+        # 首尾任务的逻辑
+        if len(sorted_duties) == 0:
+            return overnight_penalty
+        first_task = sorted_duties[0]
+        last_task = sorted_duties[-1]
+
+        base = crew.base
+        
+        # 从配置中获取计划期开始和结束日期
+        UnifiedConfig.initialize_planning_dates()
+        PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE)
+        # 结束日期设置为当天的23:59:59
+        end_date_tuple = UnifiedConfig.PLANNING_END_DATE
+        PLAN_END_DATE = datetime(end_date_tuple[0], end_date_tuple[1], end_date_tuple[2], 23, 59, 59)
+
+        first_task_start = self._get_task_start_time(first_task)
+        first_task_place = self._get_task_start_airport(first_task, crew.base)
+        if first_task_start and first_task_place and first_task_place != base:
+            days_before_first_task = (first_task_start - PLAN_START_DATE).days
+            overnight_penalty += max(1, days_before_first_task) * away_overnight_penalty_rate
+
+        last_task_end = self._get_task_end_time(last_task)
+        last_task_place = self._get_task_end_airport(last_task, crew.base)
+        if last_task_end and last_task_place and last_task_place != base:
+            days_after_last_task = (PLAN_END_DATE - last_task_end).days
+            overnight_penalty += max(0, days_after_last_task) * away_overnight_penalty_rate
         
         for i in range(len(sorted_duties) - 1):
             current_duty = sorted_duties[i]
@@ -573,20 +610,25 @@ class ScoringSystem:
         flight_count = 0
         
         # 按时间排序任务
-        sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
+        sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
         
         for duty in sorted_duties:
-            if isinstance(duty, Flight):
+            if isinstance(duty, Flight) and not getattr(duty, 'is_positioning', False):
                 total_flight_hours += duty.flyTime / 60.0
                 flight_count += 1
                 
-                # 计算值勤日历日（跨零点时记为两个日历日）
-                start_date = duty.std.date()
-                end_date = duty.sta.date()
-                current_date = start_date
-                while current_date <= end_date:
-                    duty_calendar_days.add(current_date)
-                    current_date += timedelta(days=1)
+            # 计算值勤日历日（跨零点时记为两个日历日）
+            start_time = self._get_task_start_time(duty)
+            end_time = self._get_task_end_time(duty)
+            if start_time and end_time:
+                start_date = start_time.date()
+                end_date = end_time.date()
+            else:
+                continue  # 跳过无效的任务
+            current_date = start_date
+            while current_date <= end_date:
+                duty_calendar_days.add(current_date)
+                current_date += timedelta(days=1)
         
         # 根据新要求：分母直接为该roster的值勤天数，不再考虑不重复日历天数
         total_duty_days = len(duty_calendar_days)  # 这个roster的值勤天数

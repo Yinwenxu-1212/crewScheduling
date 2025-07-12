@@ -80,6 +80,10 @@ def main() -> None:
     
     # --- 1. 设置 ---
     start_time = time.time()
+    
+    # 初始化配置，确保PLANNING_START_DATE基于航班数据动态设置
+    UnifiedConfig.initialize_planning_dates(UnifiedConfig.DATA_PATH)
+    
     TIME_LIMIT_SECONDS = UnifiedConfig.TIME_LIMIT_SECONDS
     data_path = UnifiedConfig.DATA_PATH
     MAX_ITERATIONS = UnifiedConfig.MAX_COLUMN_GENERATION_ITERATIONS
@@ -113,6 +117,7 @@ def main() -> None:
     ground_duties = all_data["ground_duties"]
     crew_leg_match_list = all_data["crew_leg_matches"]
     layover_stations = all_data["layover_stations"]
+    UnifiedConfig.GDS = ground_duties # 便于类传参
     
     print("正在预处理机长-航班资质数据...")
     crew_leg_match_dict = {}
@@ -163,174 +168,262 @@ def main() -> None:
         duty_ids = sorted([duty.id for duty in roster.duties])
         return f"{roster.crew_id}_{hash(tuple(duty_ids))}"
     
-    # 使用配置文件中的最大迭代次数设置
-    # MAX_ITERATIONS已在第81行从UnifiedConfig.MAX_COLUMN_GENERATION_ITERATIONS获取
-    for i in range(MAX_ITERATIONS):
-        iteration_start_time = time.time()
-        print(f"\n=== 列生成第 {i+1} 轮 ===")
-        log_debug(f"\n=== 列生成第 {i+1} 轮开始 ===\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # --- 4. 选择算法：分支定价 vs 原方法 ---
+    USE_BRANCH_AND_PRICE = UnifiedConfig.USE_BRANCH_AND_PRICE  # 从配置文件读取
+    selected_rosters = None
+    final_objective = None
+    
+    if USE_BRANCH_AND_PRICE:
+        print("\n=== 使用分支定价算法求解 ===")
         
-        # 求解主问题LP松弛（不输出详细调试信息）
-        pi_duals, sigma_duals, ground_duty_duals, current_obj = master_problem.solve_lp(verbose=False)
+        # 导入分支定价模块
+        try:
+            from branch_and_price import BranchAndPriceAlgorithm
+            
+            # 获取分支定价参数
+            bap_params = UnifiedConfig.get_bap_params()
+            
+            # 创建分支定价算法实例
+            bap_algorithm = BranchAndPriceAlgorithm(
+                flights=flights,
+                crews=crews,
+                ground_duties=ground_duties,
+                initial_rosters=initial_rosters,
+                crew_leg_match_dict=crew_leg_match_dict,
+                layover_stations=layover_stations,
+                bus_info=bus_info,
+                **bap_params  # 传入分支定价参数
+            )
+            
+            # 设置子问题求解器
+            if ATTENTION_AVAILABLE:
+                # 包装attention求解器以适配分支定价接口
+                def bap_subproblem_wrapper(crew, pi_duals, sigma_duals, ground_duty_duals,
+                                         flights, ground_duties, bus_info, 
+                                         crew_leg_match_dict, layover_stations, branching_constraints=None):
+                    try:
+                        return solve_subproblem_for_crew_with_attention(
+                            crew, flights, bus_info, ground_duties,
+                            pi_duals, layover_stations, crew_leg_match_dict,
+                            sigma_duals.get(crew.crewId, 0), ground_duty_duals=ground_duty_duals,
+                            branching_constraints=branching_constraints
+                        )
+                    except Exception as e:
+                        print(f"子问题求解失败 (crew {crew.crewId}): {e}")
+                        return []
+                
+                bap_algorithm.set_subproblem_solver(bap_subproblem_wrapper)
+                print("✓ 使用注意力引导的子问题求解器")
+            else:
+                print("警告：注意力模块不可用，使用简化的子问题求解器")
+                try:
+                    from simple_subproblem_solver import solve_subproblem_simple
+                    bap_algorithm.set_subproblem_solver(solve_subproblem_simple)
+                    print("✓ 使用简化的子问题求解器")
+                except ImportError:
+                    print("错误：无法导入简化子问题求解器，回退到原方法...")
+                    USE_BRANCH_AND_PRICE = False
+            
+            if USE_BRANCH_AND_PRICE:
+                # 执行分支定价算法
+                selected_rosters, final_objective = bap_algorithm.solve(verbose=True)
+                
+                if selected_rosters:
+                    print(f"\n分支定价算法完成！")
+                    print(f"最终目标函数值: {final_objective:.2f}")
+                    print(f"选中的排班方案数: {len(selected_rosters)}")
+                    
+                    # 创建一个虚拟的final_model对象以兼容后续代码
+                    class MockModel:
+                        def __init__(self, obj_val, sol_count=1, status=2):
+                            self.ObjVal = obj_val
+                            self.SolCount = sol_count
+                            self.Status = status
+                    
+                    final_model = MockModel(final_objective)
+                    final_solution_found = True
+                    
+                else:
+                    print("\n分支定价算法未找到可行解，回退到原方法...")
+                    USE_BRANCH_AND_PRICE = False
+                    
+        except ImportError as e:
+            print(f"\n无法导入分支定价模块: {e}")
+            print("回退到原方法...")
+            USE_BRANCH_AND_PRICE = False
+        except Exception as e:
+            print(f"\n分支定价算法执行出错: {e}")
+            print("回退到原方法...")
+            USE_BRANCH_AND_PRICE = False
+    
+    if not USE_BRANCH_AND_PRICE:
+        print("\n=== 使用原方法（列生成+最终MIP）===")
         
-        if pi_duals is None:
-            print("主问题求解失败，退出列生成。")
-            break
-        
-        # 简要显示列生成轮次信息
-        print(f"第{i+1}轮列生成: 目标函数值={current_obj:.2f}")
-        
-        # 详细分析对偶价格（记录到日志文件）
-        log_debug(f"第{i+1}轮列生成详细信息:")
-        log_debug(f"  当前目标函数值: {current_obj:.2f}")
-        log_debug(f"  航班对偶价格数量: {len(pi_duals)}")
-        log_debug(f"  机组对偶价格数量: {len(sigma_duals)}")
-        
-        # 分析对偶价格分布
-        flight_dual_values = list(pi_duals.values())
-        crew_dual_values = list(sigma_duals.values())
-        
-        if flight_dual_values:
-            log_debug(f"  航班对偶价格: min={min(flight_dual_values):.6f}, max={max(flight_dual_values):.6f}, avg={sum(flight_dual_values)/len(flight_dual_values):.6f}")
-            positive_flight_duals = [d for d in flight_dual_values if d > 1e-6]
-            log_debug(f"  正航班对偶价格数量: {len(positive_flight_duals)}/{len(flight_dual_values)}")
-        
-        if crew_dual_values:
-            log_debug(f"  机组对偶价格: min={min(crew_dual_values):.6f}, max={max(crew_dual_values):.6f}, avg={sum(crew_dual_values)/len(crew_dual_values):.6f}")
-        
-        print("为所有机组人员求解子问题...")
-        new_rosters_found_count = 0
-        
-        # 初始化进度条
-        import sys
-        def print_progress_bar(current, total, bar_length=50):
-            progress = current / total
-            filled_length = int(bar_length * progress)
-            bar = '█' * filled_length + '░' * (bar_length - filled_length)
-            percent = progress * 100
-            sys.stdout.write(f'\r  进度: [{bar}] {percent:.1f}% ({current}/{total})')
-            sys.stdout.flush()
-        
-        # 显示初始进度条
-        print_progress_bar(0, len(crews))
-        
-        # 创建评分系统用于详细成本分析
+        # 创建评分系统用于详细成本分析（移到循环外，避免重复实例化）
         scoring_system = ScoringSystem(flights, crews, layover_stations)
         
-        # 添加总体调试信息
-        log_debug(f"\n=== 第 {i+1} 轮列生成调试信息 ===")
-        log_debug(f"使用最大化线性目标函数")
+        # 主问题首次求解（移到循环外）
+        print("\n初始化主问题...")
+        pi_duals, sigma_duals, ground_duty_duals, previous_obj_val = master_problem.solve_lp(verbose=False)
+        if pi_duals is None:
+            print("主问题初始求解失败，退出列生成。")
+            return
+        print(f"初始主问题目标函数值: {previous_obj_val:.2f}")
         
-        # 分析对偶价格分布
-        dual_values = list(pi_duals.values())
-        if dual_values:
-            log_debug(f"航班对偶价格统计: 最小={min(dual_values):.3f}, 最大={max(dual_values):.3f}, 平均={sum(dual_values)/len(dual_values):.3f}")
-            positive_duals = [d for d in dual_values if d > 0]
-            log_debug(f"正对偶价格数量: {len(positive_duals)}/{len(dual_values)}")
+        # 初始化收敛计数器
+        convergence_count = 0
+        no_improvement_rounds = 0
         
-        # 分析机组对偶价格
-        sigma_values = list(sigma_duals.values())
-        if sigma_values:
-            log_debug(f"机组对偶价格统计: 最小={min(sigma_values):.3f}, 最大={max(sigma_values):.3f}, 平均={sum(sigma_values)/len(sigma_values):.3f}")
+        # 定义对偶价格分析函数（避免重复代码）
+        def analyze_dual_prices(pi_duals, sigma_duals, iteration_num):
+            """分析并记录对偶价格分布"""
+            log_debug(f"第{iteration_num}轮列生成详细信息:")
+            log_debug(f"  航班对偶价格数量: {len(pi_duals)}")
+            log_debug(f"  机组对偶价格数量: {len(sigma_duals)}")
+            
+            # 分析航班对偶价格分布
+            flight_dual_values = list(pi_duals.values())
+            if flight_dual_values:
+                log_debug(f"  航班对偶价格: min={min(flight_dual_values):.6f}, max={max(flight_dual_values):.6f}, avg={sum(flight_dual_values)/len(flight_dual_values):.6f}")
+                positive_flight_duals = [d for d in flight_dual_values if d > 1e-6]
+                log_debug(f"  正航班对偶价格数量: {len(positive_flight_duals)}/{len(flight_dual_values)}")
+            
+            # 分析机组对偶价格分布
+            crew_dual_values = list(sigma_duals.values())
+            if crew_dual_values:
+                log_debug(f"  机组对偶价格: min={min(crew_dual_values):.6f}, max={max(crew_dual_values):.6f}, avg={sum(crew_dual_values)/len(crew_dual_values):.6f}")
         
-        crew_processed = 0
+        # 使用配置文件中的最大迭代次数设置
+        # MAX_ITERATIONS已在第81行从UnifiedConfig.MAX_COLUMN_GENERATION_ITERATIONS获取
+        for i in range(MAX_ITERATIONS):
+            iteration_start_time = time.time()
+            print(f"\n=== 列生成第 {i+1} 轮 ===")
+            log_debug(f"\n=== 列生成第 {i+1} 轮开始 ===\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 简要显示列生成轮次信息
+            print(f"第{i+1}轮列生成: 目标函数值={previous_obj_val:.2f}")
         
-        for crew in crews:
-            crew_processed += 1
-            crew_specific_gds = [gd for gd in ground_duties if gd.crewId == crew.crewId]
-            crew_sigma_dual = sigma_duals.get(crew.crewId, 0.0)
+            # 使用统一的对偶价格分析函数
+            analyze_dual_prices(pi_duals, sigma_duals, i+1)
+            log_debug(f"  当前目标函数值: {previous_obj_val:.2f}")
             
-            # 检查该机组是否有可执行的航班
-            eligible_flights = crew_leg_match_dict.get(crew.crewId, [])
-            # 将详细信息记录到日志文件
-            log_debug(f"  机组{crew.crewId}: 可执行航班{len(eligible_flights)}个, 对偶价格{crew_sigma_dual:.6f}")
+            print("为所有机组人员求解子问题...")
+            new_rosters_found_count = 0
+        
+            # 初始化进度条
+            import sys
+            def print_progress_bar(current, total, bar_length=50):
+                progress = current / total
+                filled_length = int(bar_length * progress)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                percent = progress * 100
+                sys.stdout.write(f'\r  进度: [{bar}] {percent:.1f}% ({current}/{total})')
+                sys.stdout.flush()
             
-            if not eligible_flights:
-                log_debug(f"    跳过：无可执行航班")
-                continue
+            # 显示初始进度条
+            print_progress_bar(0, len(crews))
             
-            # 计算该机组可执行航班的对偶价格统计
-            crew_flight_duals = [pi_duals.get(fid, 0.0) for fid in eligible_flights]
-            if crew_flight_duals:
-                log_debug(f"    可执行航班对偶价格: min={min(crew_flight_duals):.6f}, max={max(crew_flight_duals):.6f}")
-                positive_crew_flight_duals = [d for d in crew_flight_duals if d > 1e-6]
-                log_debug(f"    正对偶价格航班: {len(positive_crew_flight_duals)}/{len(crew_flight_duals)}")
+            # 添加总体调试信息
+            log_debug(f"\n=== 第 {i+1} 轮列生成调试信息 ===")
+            log_debug(f"使用最大化线性目标函数")
             
-            # 调用子问题求解 - 确保参数顺序正确
-            try:
-                new_rosters = solve_subproblem_for_crew_with_attention(
-                    crew, flights, bus_info, crew_specific_gds,
-                    pi_duals, layover_stations, crew_leg_match_dict,
-                    crew_sigma_dual, ground_duty_duals=ground_duty_duals, iteration_round=i, external_log_func=log_debug
-                )
+            crew_processed = 0
+        
+            for crew in crews:
+                crew_processed += 1
+                crew_specific_gds = [gd for gd in ground_duties if gd.crewId == crew.crewId]
+                crew_sigma_dual = sigma_duals.get(crew.crewId, 0.0)
                 
-                if new_rosters:
-                    valuable_count = 0
-                    for idx, r in enumerate(new_rosters):
-                        # 获取详细的成本分解
-                        cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                            r, crew, pi_duals, crew_sigma_dual
-                        )
-                        
-                        reduced_cost = cost_details['reduced_cost']
-                        
-                        # 详细记录每个roster的信息到日志文件
-                        log_debug(f"    机组{crew.crewId} Roster#{idx+1}: reduced_cost={reduced_cost:.6f}")
-                        log_debug(f"      总成本: {cost_details['total_cost']:.6f}")
-                        log_debug(f"      飞行奖励: {cost_details['flight_reward']:.6f}")
-                        log_debug(f"      置位惩罚: {cost_details['positioning_penalty']:.6f}")
-                        log_debug(f"      过夜惩罚: {cost_details['overnight_penalty']:.6f}")
-                        log_debug(f"      违规惩罚: {cost_details['violation_penalty']:.6f} (违规次数: {cost_details['violation_count']})")
-                        log_debug(f"      对偶贡献: {cost_details['dual_contribution']:.6f}")
-                        log_debug(f"      任务数: {len(r.duties)}")
-                        
-                        if reduced_cost < -0.0001:  # 大幅放宽阈值，允许更多潜在有价值的roster
-                            valuable_count += 1
-                            master_problem.add_roster(r)
-                            new_rosters_found_count += 1
-                            log_debug(f"      ✓ 有价值，已添加到主问题")
-                        else:
-                            log_debug(f"      ✗ 无价值，不添加")
-                    
-                    # 记录到日志文件
-                    log_debug(f"    机组{crew.crewId}: 生成{len(new_rosters)}个，有价值{valuable_count}个")
-                else:
-                    log_debug(f"    机组{crew.crewId}: 未生成任何roster")
-                        
-            except Exception as e:
-                # 将详细错误信息记录到日志文件
-                log_debug(f"    机组{crew.crewId}: 子问题求解出错 - {e}")
-                import traceback
-                log_debug(f"    错误堆栈: {traceback.format_exc()}")
-                # 控制台只显示简要错误信息
-                print(f"    机组{crew.crewId}: 子问题求解出错")
+                # 检查该机组是否有可执行的航班
+                eligible_flights = crew_leg_match_dict.get(crew.crewId, [])
+                # 将详细信息记录到日志文件
+                log_debug(f"  机组{crew.crewId}: 可执行航班{len(eligible_flights)}个, 对偶价格{crew_sigma_dual:.6f}")
+                
+                if not eligible_flights:
+                    log_debug(f"    跳过：无可执行航班")
+                    continue
             
-            # 更新进度条
-            if crew_processed % 10 == 0 or crew_processed == len(crews):
-                print_progress_bar(crew_processed, len(crews))
+                # 计算该机组可执行航班的对偶价格统计
+                crew_flight_duals = [pi_duals.get(fid, 0.0) for fid in eligible_flights]
+                if crew_flight_duals:
+                    log_debug(f"    可执行航班对偶价格: min={min(crew_flight_duals):.6f}, max={max(crew_flight_duals):.6f}")
+                    positive_crew_flight_duals = [d for d in crew_flight_duals if d > 1e-6]
+                    log_debug(f"    正对偶价格航班: {len(positive_crew_flight_duals)}/{len(crew_flight_duals)}")
+                
+                # 调用子问题求解 - 确保参数顺序正确
+                try:
+                    new_rosters = solve_subproblem_for_crew_with_attention(
+                        crew, flights, bus_info, crew_specific_gds,
+                        pi_duals, layover_stations, crew_leg_match_dict,
+                        crew_sigma_dual, ground_duty_duals=ground_duty_duals, iteration_round=i, external_log_func=log_debug
+                    )
+                
+                    if new_rosters:
+                        valuable_count = 0
+                        for idx, r in enumerate(new_rosters):
+                            # 获取详细的成本分解
+                            cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
+                                r, crew, pi_duals, crew_sigma_dual
+                            )
+                            
+                            reduced_cost = cost_details['reduced_cost']
+                            
+                            # 详细记录每个roster的信息到日志文件
+                            log_debug(f"    机组{crew.crewId} Roster#{idx+1}: reduced_cost={reduced_cost:.6f}")
+                            log_debug(f"      总成本: {cost_details['total_cost']:.6f}")
+                            log_debug(f"      飞行奖励: {cost_details['flight_reward']:.6f}")
+                            log_debug(f"      置位惩罚: {cost_details['positioning_penalty']:.6f}")
+                            log_debug(f"      过夜惩罚: {cost_details['overnight_penalty']:.6f}")
+                            log_debug(f"      违规惩罚: {cost_details['violation_penalty']:.6f} (违规次数: {cost_details['violation_count']})")
+                            log_debug(f"      对偶贡献: {cost_details['dual_contribution']:.6f}")
+                            log_debug(f"      任务数: {len(r.duties)}")
+                            
+                            if reduced_cost < -0.0001:  # 大幅放宽阈值，允许更多潜在有价值的roster
+                                valuable_count += 1
+                                master_problem.add_roster(r)
+                                new_rosters_found_count += 1
+                                log_debug(f"      ✓ 有价值，已添加到主问题")
+                            else:
+                                log_debug(f"      ✗ 无价值，不添加")
+                        
+                        # 记录到日志文件
+                        log_debug(f"    机组{crew.crewId}: 生成{len(new_rosters)}个，有价值{valuable_count}个")
+                    else:
+                        log_debug(f"    机组{crew.crewId}: 未生成任何roster")
+                        
+                except Exception as e:
+                    # 将详细错误信息记录到日志文件
+                    log_debug(f"    机组{crew.crewId}: 子问题求解出错 - {e}")
+                    import traceback
+                    log_debug(f"    错误堆栈: {traceback.format_exc()}")
+                    # 控制台只显示简要错误信息
+                    print(f"    机组{crew.crewId}: 子问题求解出错")
+                
+                # 更新进度条
+                if crew_processed % 10 == 0 or crew_processed == len(crews):
+                    print_progress_bar(crew_processed, len(crews))
                     
-        # 确保进度条完成后换行
-        print()  # 换行
-        
-        # 显示每轮列生成后的最优解变化
-        print(f"\n=== 第 {i+1} 轮列生成结果 ===")
-        print(f"本轮新增有价值roster数量: {new_rosters_found_count}")
-        
-        if new_rosters_found_count == 0:
-            print("❌ 本轮未找到任何有价值的roster！")
-            print("可能原因：")
-            print("1. 对偶价格不合理")
-            print("2. 约束过于严格")
-            print("3. 搜索空间不足")
-            print("4. reduced cost计算错误")
-        
-        # 求解当前主问题获取最优解
-        pi_duals, sigma_duals, ground_duty_duals, current_obj_val = master_problem.solve_lp(verbose=True)
-        if current_obj_val is not None:  # 求解成功
-            print(f"当前主问题最优目标函数值: {current_obj_val:.6f}")
+            # 确保进度条完成后换行
+            print()  # 换行
             
-            # 跟踪目标函数变化（最小化问题：目标函数值应该递减）
-            if previous_obj_val is not None:
+            # 显示每轮列生成后的最优解变化
+            print(f"\n=== 第 {i+1} 轮列生成结果 ===")
+            print(f"本轮新增有价值roster数量: {new_rosters_found_count}")
+            
+            if new_rosters_found_count == 0:
+                print("❌ 本轮未找到任何有价值的roster！")
+                print("可能原因：")
+                print("1. 对偶价格不合理")
+                print("2. 约束过于严格")
+                print("3. 搜索空间不足")
+                print("4. reduced cost计算错误")
+            
+            # 求解主问题获取下一轮的对偶价格和目标函数值
+            new_pi_duals, new_sigma_duals, new_ground_duty_duals, current_obj_val = master_problem.solve_lp(verbose=True)
+            if current_obj_val is not None:  # 求解成功
+                print(f"当前主问题最优目标函数值: {current_obj_val:.6f}")
+            
+                # 跟踪目标函数变化（最小化问题：目标函数值应该递减）
                 obj_change = current_obj_val - previous_obj_val
                 if obj_change > 1e-6:
                     print(f"警告：目标函数增加了 {obj_change:.6f}，不满足列生成的单调性！")
@@ -346,30 +439,76 @@ def main() -> None:
                     print(f"目标函数改善微小，连续{convergence_count}轮")
                 else:
                     convergence_count = 0
+                
+                # 更新对偶价格和目标函数值供下一轮使用
+                pi_duals, sigma_duals, ground_duty_duals = new_pi_duals, new_sigma_duals, new_ground_duty_duals
+                previous_obj_val = current_obj_val
             else:
-                print(f"第一轮列生成，建立基准目标函数值")
+                print("当前主问题求解失败")
+                break
             
-            previous_obj_val = current_obj_val
-        else:
-            print("当前主问题求解失败")
+            # 基本收敛条件
+            if new_rosters_found_count == 0:
+                no_improvement_rounds += 1
+                print(f"本轮未找到有价值roster，连续{no_improvement_rounds}轮无改进")
+            else:
+                no_improvement_rounds = 0
+            
+            # 简单收敛判断 - 大幅放宽收敛条件，让程序运行更多轮
+            if no_improvement_rounds >= 20 and i > 10:  # 大幅增加无改进轮数阈值
+                print(f"\n连续20轮未找到有价值的排班方案，列生成结束。")
+                break
+            elif convergence_count >= 15 and i > 15:  # 大幅增加收敛轮数阈值
+                print(f"\n目标函数连续15轮改善微小，列生成收敛。")
+                break
+            elif i >= MAX_ITERATIONS - 1:
+                print("\n达到最大迭代次数，列生成结束。")
+                break
         
-        # 基本收敛条件
-        if new_rosters_found_count == 0:
-            no_improvement_rounds += 1
-            print(f"本轮未找到有价值roster，连续{no_improvement_rounds}轮无改进")
-        else:
-            no_improvement_rounds = 0
+        # 原方法：列生成结束后求解最终的整数规划问题
+        print("列生成结束，正在求解最终的整数规划问题...")
+        final_model = master_problem.solve_bip(verbose=True)
         
-        # 简单收敛判断 - 大幅放宽收敛条件，让程序运行更多轮
-        if no_improvement_rounds >= 20 and i > 10:  # 大幅增加无改进轮数阈值
-            print(f"\n连续20轮未找到有价值的排班方案，列生成结束。")
-            break
-        elif convergence_count >= 15 and i > 15:  # 大幅增加收敛轮数阈值
-            print(f"\n目标函数连续15轮改善微小，列生成收敛。")
-            break
-        elif i >= MAX_ITERATIONS - 1:
-            print("\n达到最大迭代次数，列生成结束。")
-            break
+        # 调试：显示目标函数值的详细组成
+        print(f"\n=== 目标函数调试信息 ===")
+        if final_model.SolCount > 0 and final_model.Status == 2:  # 2表示OPTIMAL状态
+            obj_val = final_model.ObjVal
+            print(f"最终目标函数值: {obj_val:.2f}")
+            
+            # 分解目标函数
+            roster_cost_sum = 0
+            uncovered_flights_penalty = 0
+            uncovered_ground_duties_penalty = 0
+            
+            try:
+                for roster, var in master_problem.roster_vars.items():
+                    if var.X > 0.001:  # 被选中的roster（使用小阈值处理LP松弛）
+                        roster_cost_sum += roster.cost * var.X
+                        
+                for flight_id, var in master_problem.uncovered_vars.items():
+                    if var.X > 0.001:  # 未覆盖的航班（使用小阈值处理LP松弛）
+                        uncovered_flights_penalty += master_problem.UNCOVERED_FLIGHT_PENALTY * var.X
+                
+                # 计算未覆盖占位任务惩罚
+                for ground_duty_id, var in master_problem.uncovered_ground_duty_vars.items():
+                    if var.X > 0.001:  # 未覆盖的占位任务（使用小阈值处理LP松弛）
+                        uncovered_ground_duties_penalty += master_problem.UNCOVERED_GROUND_DUTY_PENALTY * var.X
+                
+                total_calculated = roster_cost_sum + uncovered_flights_penalty + uncovered_ground_duties_penalty
+                
+                print(f"目标函数组成:")
+                print(f"  - 选中Roster成本总和: {roster_cost_sum:.2f}")
+                print(f"  - 未覆盖航班惩罚: {uncovered_flights_penalty:.2f}")
+                print(f"  - 未覆盖占位任务惩罚: {uncovered_ground_duties_penalty:.2f}")
+                print(f"  - 总计: {total_calculated:.2f}")
+                print(f"  - 验证: 与目标函数值差异 = {abs(obj_val - total_calculated):.6f}")
+            except Exception as e:
+                print(f"访问变量值时出错: {e}")
+                print("可能原因：模型求解状态异常或变量索引超出范围")
+        else:
+            print(f"未找到可行解，模型状态: {final_model.Status}")
+            if hasattr(final_model, 'SolCount'):
+                print(f"解的数量: {final_model.SolCount}")
 
     # --- 5. 计算初始解质量 ---
     print("\n正在评估初始解质量...")
@@ -393,8 +532,8 @@ def main() -> None:
         for duty in roster.duties:
             if isinstance(duty, Flight):
                 covered_flights.add(duty.id)
-                # 计算飞行时间（分钟转小时）
-                if hasattr(duty, 'flyTime') and duty.flyTime:
+                # 计算飞行时间（分钟转小时），排除置位航班
+                if hasattr(duty, 'flyTime') and duty.flyTime and not getattr(duty, 'is_positioning', False):
                     total_flight_hours += duty.flyTime / 60.0
                 # 记录值勤日期
                 if hasattr(duty, 'std') and duty.std:
@@ -418,16 +557,6 @@ def main() -> None:
                                uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY +
                                uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY)
     
-    # 使用统一评分系统计算完整的竞赛评分
-    initial_total_score = scoring_system.calculate_total_score(initial_rosters)
-    
-    # 为了显示，计算竞赛评分公式的值（仅用于参考）
-    total_penalties = uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY
-    if total_duty_days > 0:
-        initial_objective_value = (total_flight_hours * 1000) / total_duty_days - total_penalties / total_duty_days
-    else:
-        initial_objective_value = 0.0
-    
     # 输出初始解的目标函数值信息
     print(f"=== 初始解目标函数分析 ===")
     print(f"总航班数: {len(flights)}")
@@ -447,22 +576,6 @@ def main() -> None:
     print(f"  - 未覆盖航班惩罚: {uncovered_flights_count * master_problem.UNCOVERED_FLIGHT_PENALTY:.2f}")
     print(f"  - 未覆盖地面任务惩罚: {uncovered_ground_duties_count * master_problem.UNCOVERED_GROUND_DUTY_PENALTY:.2f}")
     print(f"初始解线性目标函数值: {initial_linear_objective:.2f}")
-    print(f"初始解竞赛评分（日均飞时得分）: {initial_objective_value:.2f}")
-    print(f"\n=== 初始解统一评分系统结果 ===")
-    print(f"完整竞赛评分: {initial_total_score['total_score']:.2f}")
-    print(f"  - 值勤日日均飞时得分: {initial_total_score['fly_time_score']:.2f}")
-    print(f"  - 未覆盖航班惩罚: {initial_total_score['uncovered_penalty']:.2f}")
-    print(f"  - 新增过夜站点惩罚: {initial_total_score['new_layover_penalty']:.2f}")
-    print(f"  - 外站过夜惩罚: {initial_total_score['away_overnight_penalty']:.2f}")
-    print(f"  - 置位惩罚: {initial_total_score['positioning_penalty']:.2f}")
-    print(f"  - 违规惩罚: {initial_total_score['violation_penalty']:.2f}")
-    print(f"统计信息:")
-    print(f"  - 总值勤天数: {total_duty_days:.0f}")
-    print(f"  - 总飞行时间: {total_flight_hours:.2f} 小时")
-    print(f"  - 外站过夜天数: {initial_total_score['away_overnight_days']:.0f}")
-    print(f"  - 新增过夜站点数: {initial_total_score['new_layover_stations']:.0f}")
-    print(f"  - 置位任务数: {initial_total_score['positioning_count']:.0f}")
-    print(f"  - 违规次数: {initial_total_score['violation_count']:.0f}")
     
     # 验证初始解航班覆盖率
     print(f"\n=== 初始解航班覆盖率验证 ===")
@@ -498,78 +611,42 @@ def main() -> None:
     if negative_costs:
         print(f"负成本原因: 飞时奖励(100*飞行时间) > 各种惩罚")
     print(f"总Roster成本: {sum(roster_costs):.2f}")
-    
-    # --- 6. 求解最终整数规划问题 ---
-    print("\n列生成结束，正在求解最终的整数规划问题...")
-    final_model = master_problem.solve_bip(verbose=True)
-    
-    # 调试：显示目标函数值的详细组成
-    print(f"\n=== 目标函数调试信息 ===")
-    if final_model.SolCount > 0 and final_model.Status == 2:  # 2表示OPTIMAL状态
-        obj_val = final_model.ObjVal
-        print(f"最终目标函数值: {obj_val:.2f}")
-        
-        # 分解目标函数
-
-        roster_cost_sum = 0
-        uncovered_flights_penalty = 0
-        uncovered_ground_duties_penalty = 0
-        
-        try:
-            for roster, var in master_problem.roster_vars.items():
-                if var.X > 0.001:  # 被选中的roster（使用小阈值处理LP松弛）
-                    roster_cost_sum += roster.cost * var.X
-                    
-            for flight_id, var in master_problem.uncovered_vars.items():
-                if var.X > 0.001:  # 未覆盖的航班（使用小阈值处理LP松弛）
-                    uncovered_flights_penalty += master_problem.UNCOVERED_FLIGHT_PENALTY * var.X
-            
-            # 计算未覆盖占位任务惩罚
-            for ground_duty_id, var in master_problem.uncovered_ground_duty_vars.items():
-                if var.X > 0.001:  # 未覆盖的占位任务（使用小阈值处理LP松弛）
-                    uncovered_ground_duties_penalty += master_problem.UNCOVERED_GROUND_DUTY_PENALTY * var.X
-            
-            total_calculated = roster_cost_sum + uncovered_flights_penalty + uncovered_ground_duties_penalty
-            
-            print(f"目标函数组成:")
-            print(f"  - 选中Roster成本总和: {roster_cost_sum:.2f}")
-            print(f"  - 未覆盖航班惩罚: {uncovered_flights_penalty:.2f}")
-            print(f"  - 未覆盖占位任务惩罚: {uncovered_ground_duties_penalty:.2f}")
-            print(f"  - 总计: {total_calculated:.2f}")
-            print(f"  - 验证: 与目标函数值差异 = {abs(obj_val - total_calculated):.6f}")
-        except Exception as e:
-            print(f"访问变量值时出错: {e}")
-            print("可能原因：模型求解状态异常或变量索引超出范围")
-    else:
-        print(f"未找到可行解，模型状态: {final_model.Status}")
-        if hasattr(final_model, 'SolCount'):
-            print(f"解的数量: {final_model.SolCount}")
 
     # 使用 SolCount > 0 来检查是否找到了解
-    final_solution_found = False
-    if final_model.SolCount > 0:
-        selected_rosters = master_problem.get_selected_rosters()
+    if not 'final_solution_found' in locals():
+        final_solution_found = False
+    
+    # 检查是否有可用的解
+    has_solution = False
+    if USE_BRANCH_AND_PRICE:
+        # 分支定价算法：检查是否找到了解
+        has_solution = selected_rosters is not None and len(selected_rosters) > 0
+    else:
+        # 原方法：检查final_model是否有解
+        has_solution = 'final_model' in locals() and final_model.SolCount > 0
+    
+    if has_solution:
+        # 根据使用的算法获取selected_rosters
+        if not USE_BRANCH_AND_PRICE:
+            # 原方法：从master_problem获取
+            selected_rosters = master_problem.get_selected_rosters()
+        # 如果使用分支定价，selected_rosters已经在上面设置了
         if selected_rosters:  # 确保选择了方案
-            final_cost = final_model.ObjVal
+            # 获取最终成本
+            if USE_BRANCH_AND_PRICE:
+                final_cost = final_objective
+            else:
+                final_cost = final_model.ObjVal
             print(f"\n最终解成本: {final_cost:.2f}, 包含 {len(selected_rosters)} 个排班方案。")
             
-            # 使用统一评分系统计算最终解的完整竞赛评分
-            final_total_score = scoring_system.calculate_total_score(selected_rosters)
-            print(f"\n=== 最终解统一评分系统结果 ===")
-            print(f"完整竞赛评分: {final_total_score['total_score']:.2f}")
-            print(f"  - 值勤日日均飞时得分: {final_total_score['fly_time_score']:.2f}")
-            print(f"  - 未覆盖航班惩罚: {final_total_score['uncovered_penalty']:.2f}")
-            print(f"  - 新增过夜站点惩罚: {final_total_score['new_layover_penalty']:.2f}")
-            print(f"  - 外站过夜惩罚: {final_total_score['away_overnight_penalty']:.2f}")
-            print(f"  - 置位惩罚: {final_total_score['positioning_penalty']:.2f}")
-            print(f"  - 违规惩罚: {final_total_score['violation_penalty']:.2f}")
-            print(f"统计信息:")
-            print(f"  - 总值勤天数: {sum(len(set((duty.std.date() if hasattr(duty, 'std') else duty.get('startTime', datetime.min).date()) for duty in roster.duties)) for roster in selected_rosters):.0f}")
-            print(f"  - 总飞行时间: {sum(duty.flyTime/60.0 for roster in selected_rosters for duty in roster.duties if hasattr(duty, 'flyTime')):.2f} 小时")
-            print(f"  - 外站过夜天数: {final_total_score['away_overnight_days']:.0f}")
-            print(f"  - 新增过夜站点数: {final_total_score['new_layover_stations']:.0f}")
-            print(f"  - 置位任务数: {final_total_score['positioning_count']:.0f}")
-            print(f"  - 违规次数: {final_total_score['violation_count']:.0f}")
+            # 计算最终解的基本统计信息
+            total_duty_days = sum(len(set((duty.std.date() if hasattr(duty, 'std') else duty.startTime.date()) for duty in roster.duties)) for roster in selected_rosters)
+            total_flight_hours = sum(duty.flyTime/60.0 for roster in selected_rosters for duty in roster.duties if hasattr(duty, 'flyTime'))
+            
+            print(f"\n=== 最终解统计信息 ===")
+            print(f"  - 总值勤天数: {total_duty_days:.0f}")
+            print(f"  - 总飞行时间: {total_flight_hours:.2f} 小时")
+            print(f"  - 排班方案数量: {len(selected_rosters)}")
             
             # 验证航班覆盖率
             print("\n=== 最终解航班覆盖率验证 ===")
@@ -592,7 +669,10 @@ def main() -> None:
                     print(suggestion)
             
             # 使用线性目标函数值进行比较（与优化目标一致）
-            final_linear_objective = total_calculated  # 使用手动计算的完整目标函数值
+            if USE_BRANCH_AND_PRICE:
+                final_linear_objective = final_objective
+            else:
+                final_linear_objective = total_calculated  # 使用手动计算的完整目标函数值
             
             # 初始解的线性目标函数值已在前面计算过，直接使用
             # initial_linear_objective 变量已经包含了正确的值
@@ -600,16 +680,17 @@ def main() -> None:
             print(f"\n=== 最终解目标函数分析 ===")
             print(f"最终解线性目标函数值: {final_linear_objective:.2f}")
             print(f"初始解线性目标函数值: {initial_linear_objective:.2f}")
-            print(f"\n=== 竞赛评分比较 ===")
-            print(f"最终解竞赛评分: {final_total_score['total_score']:.2f}")
-            print(f"初始解竞赛评分: {initial_total_score['total_score']:.2f}")
             
-            # 比较解的质量（注意：竞赛评分越高越好）
+            # 计算目标函数改善（最小化问题：初始值 - 最终值）
+            objective_improvement = initial_linear_objective - final_linear_objective
+            print(f"目标函数改善: {objective_improvement:.2f}")
+            
+            # 比较解的质量（基于线性目标函数值，最小化问题）
             # 修改逻辑：即使占位任务没有全部覆盖也可以输出最终解，只要航班覆盖率满足要求
             final_solution_valid = coverage_result['is_valid']  # 只要求航班覆盖率满足要求
             
-            if final_total_score['total_score'] > initial_total_score['total_score'] and final_solution_valid:
-                print(f"\n✅ 最终解优于初始解且满足航班覆盖率要求 (竞赛评分改善: {final_total_score['total_score'] - initial_total_score['total_score']:.2f})")
+            if objective_improvement > 0 and final_solution_valid:
+                print(f"\n✅ 最终解优于初始解且满足航班覆盖率要求 (目标函数改善: {objective_improvement:.2f})")
                 if not ground_duty_result['is_valid']:
                     print(f"⚠️  注意：占位任务覆盖率为 {ground_duty_result['coverage_rate']:.1%}，低于80%建议值，但在软约束结构下仍可输出")
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -618,10 +699,10 @@ def main() -> None:
                 print(f"最终结果已写入文件: {output_file}")
                 final_solution_found = True
             elif final_solution_valid:
-                print(f"\n⚠️  最终解满足航班覆盖率要求但劣于初始解 (竞赛评分恶化: {final_total_score['total_score'] - initial_total_score['total_score']:.2f})")
+                print(f"\n⚠️  最终解满足航班覆盖率要求但目标函数值未改善 (变化: {objective_improvement:.2f})")
                 if not ground_duty_result['is_valid']:
                     print(f"⚠️  注意：占位任务覆盖率为 {ground_duty_result['coverage_rate']:.1%}，低于80%建议值，但在软约束结构下仍可输出")
-                print("将检查初始解的约束满足情况后决定使用哪个解")
+                print("将使用初始解作为最终输出")
             else:
                 print(f"\n❌ 最终解不满足航班覆盖率要求，将使用初始解")
                 if not ground_duty_result['is_valid']:
@@ -650,7 +731,7 @@ def main() -> None:
         output_file = f"output/rosterResult_initial_{timestamp}.csv"
         write_results_to_csv(initial_rosters, output_file, master_problem)
         print(f"初始解已写入文件: {output_file}")
-        print(f"初始解统计: 竞赛评分 {initial_total_score['total_score']:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
+        print(f"初始解统计: 线性目标函数值 {initial_linear_objective:.2f}, 未覆盖航班 {uncovered_flights_count} 个")
         print(f"覆盖率: {initial_coverage_result['coverage_rate']:.1%}")
     
     # --- 8. 程序执行总结 ---
@@ -659,9 +740,13 @@ def main() -> None:
     
     print(f"\n=== 程序执行总结 ===")
     print(f"总执行时间: {total_time:.2f} 秒")
-    print(f"列生成轮数: {i+1}")
+    # 修复变量i未定义的问题
+    if 'i' in locals():
+        print(f"列生成轮数: {i+1}")
+    else:
+        print(f"列生成轮数: 使用分支定价算法")
     print(f"最终解状态: {'找到满足要求的解' if final_solution_found else '使用初始解'}")
-    algorithm_name = "简化线性目标函数算法"
+    algorithm_name = "分支定价算法" if USE_BRANCH_AND_PRICE else "简化线性目标函数算法"
     print(f"使用算法: {algorithm_name}")
     
     # 关闭日志文件
@@ -671,7 +756,4 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    if not ATTENTION_AVAILABLE:
-        print("Error: Attention module not available!")
-        exit(1)
     main()

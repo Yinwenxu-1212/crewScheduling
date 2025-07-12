@@ -909,8 +909,15 @@ def generate_initial_rosters_with_heuristic(
     print(f"大巴任务数量: {len(bus_info)}")
     print(f"机组-航班匹配关系数量: {sum(len(flight_ids) for flight_ids in crew_leg_match_dict.values())}")
     
-    # 设置开始日期 - 修改为覆盖所有数据文件的最早日期
-    start_date = datetime(2025, 4, 29).date()
+    # 设置开始日期 - 使用配置中的规划开始日期
+    from unified_config import UnifiedConfig
+    start_year, start_month, start_day = UnifiedConfig.PLANNING_START_DATE
+    start_date = datetime(start_year, start_month, start_day).date()
+    
+    # 如果用户希望从5月1日开始分配任务，过滤掉5月1日之前的任务
+    planning_start_dt = datetime(2025, 5, 1)  # 用户期望的任务分配开始时间
+    print(f"规划开始日期: {start_date}")
+    print(f"任务分配开始时间: {planning_start_dt.date()}")
     
     # 构建crew_leg_matches_set
     crew_leg_matches_set = set()
@@ -925,27 +932,34 @@ def generate_initial_rosters_with_heuristic(
     
     initial_rosters = []
     all_tasks = []
+    
+    # 过滤任务：只包含任务分配开始时间及之后的任务
     for f in flights: 
-        # 飞行任务优先级最高
-        all_tasks.append({'task_obj': f, 'type': 'flight', 'start_time': f.std, 'id': f.id, 'priority': 3})
+        if f.std >= planning_start_dt:
+            # 飞行任务优先级最高
+            all_tasks.append({'task_obj': f, 'type': 'flight', 'start_time': f.std, 'id': f.id, 'priority': 3})
     
     for gd in ground_duties: 
-        # 地面任务，区分isDuty以优化休息期计算
-        if hasattr(gd, 'isDuty'):
-            if gd.isDuty == 0:
-                # 休息占位任务优先级较高，有助于休息期计算
-                priority = 1
+        if gd.startTime >= planning_start_dt:
+            # 地面任务，区分isDuty以优化休息期计算
+            if hasattr(gd, 'isDuty'):
+                if gd.isDuty == 0:
+                    # 休息占位任务优先级较高，有助于休息期计算
+                    priority = 1
+                else:
+                    # 值勤占位任务优先级中等
+                    priority = 2
             else:
-                # 值勤占位任务优先级中等
-                priority = 2
-        else:
-            # 未知类型地面任务优先级较低
-            priority = 4
-        all_tasks.append({'task_obj': gd, 'type': 'ground_duty', 'start_time': gd.startTime, 'id': ('gd', gd.id), 'priority': priority})
+                # 未知类型地面任务优先级较低
+                priority = 4
+            all_tasks.append({'task_obj': gd, 'type': 'ground_duty', 'start_time': gd.startTime, 'id': ('gd', gd.id), 'priority': priority})
     
     for bi in bus_info: 
-        # 大巴任务优先级较低，但在需要时应该被优先考虑
-        all_tasks.append({'task_obj': bi, 'type': 'bus', 'start_time': bi.startTime, 'id': ('bus', bi.id), 'priority': 5})
+        if bi.startTime >= planning_start_dt:
+            # 大巴任务优先级较低，但在需要时应该被优先考虑
+            all_tasks.append({'task_obj': bi, 'type': 'bus', 'start_time': bi.startTime, 'id': ('bus', bi.id), 'priority': 5})
+    
+    print(f"过滤后的任务数量: {len(all_tasks)} (原始任务数量: {len(flights) + len(ground_duties) + len(bus_info)})")
     
 
     # 智能任务排序函数

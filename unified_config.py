@@ -12,13 +12,13 @@ class UnifiedConfig:
     
     # === 核心成本参数 ===
     # 这些参数必须在主问题和子问题中保持完全一致
-    FLIGHT_TIME_REWARD = 30       # 飞行时间奖励（降低，减少负成本问题）
-    POSITIONING_PENALTY = 8.0      # 置位惩罚（提高，抑制过度置位）
+    FLIGHT_TIME_REWARD = 50       # 飞行时间奖励（降低，减少负成本问题）
+    POSITIONING_PENALTY = 0.5      # 置位惩罚（提高，抑制过度置位）
     AWAY_OVERNIGHT_PENALTY = 0.5   # 外站过夜惩罚（保持不变）
     NEW_LAYOVER_PENALTY = 10       # 新停留站点惩罚
-    UNCOVERED_FLIGHT_PENALTY = 2000 # 未覆盖航班惩罚（大幅提高，强化航班覆盖优先级）
-    UNCOVERED_GROUND_DUTY_PENALTY = 1500  # 未覆盖占位任务惩罚（保持高优先级但低于航班）
-    VIOLATION_PENALTY = 100         # 违规惩罚
+    UNCOVERED_FLIGHT_PENALTY = 5 # 未覆盖航班惩罚（大幅提高，强化航班覆盖优先级）
+    UNCOVERED_GROUND_DUTY_PENALTY = 20  # 未覆盖占位任务惩罚（保持高优先级但低于航班）
+    VIOLATION_PENALTY = 10         # 违规惩罚
     
     # === 评分系统参数 ===
     # 用于最终评价的竞赛标准参数
@@ -97,9 +97,69 @@ class UnifiedConfig:
     # === 主程序运行参数 ===
     TIME_LIMIT_SECONDS = 1 * 3600 + 55 * 60  # 1小时55分钟
     DATA_PATH = 'data/'
-    MAX_COLUMN_GENERATION_ITERATIONS = 35  # 设置为35轮以匹配之前的良好结果
-    PLANNING_START_DATE = (2025, 4, 29)  # 计划开始日期 (年, 月, 日)
+    MAX_COLUMN_GENERATION_ITERATIONS = 5  # 根节点列生成限制为20轮
     
+    # 动态获取航班开始时间作为计划开始日期
+    @classmethod
+    def get_flight_start_date(cls, data_path='data/'):
+        """从航班数据中获取最早的航班开始时间"""
+        import pandas as pd
+        import os
+        from datetime import datetime
+        
+        try:
+            flight_file = os.path.join(data_path, 'flight.csv')
+            if os.path.exists(flight_file):
+                flights_df = pd.read_csv(flight_file)
+                flights_df['std'] = pd.to_datetime(flights_df['std'])
+                earliest_flight = flights_df['std'].min()
+                return (earliest_flight.year, earliest_flight.month, earliest_flight.day)
+            else:
+                print(f"警告: 未找到航班文件 {flight_file}，使用默认开始日期")
+                return (2025, 5, 1)
+        except Exception as e:
+            print(f"警告: 获取航班开始时间失败 {e}，使用默认开始日期")
+            return (2025, 5, 1)
+    
+    @classmethod
+    def get_flight_end_date(cls, data_path='data/'):
+        """从航班数据中获取最晚的航班结束时间"""
+        import pandas as pd
+        import os
+        from datetime import datetime
+        
+        try:
+            flight_file = os.path.join(data_path, 'flight.csv')
+            if os.path.exists(flight_file):
+                flights_df = pd.read_csv(flight_file)
+                flights_df['sta'] = pd.to_datetime(flights_df['sta'])
+                latest_flight = flights_df['sta'].max()
+                return (latest_flight.year, latest_flight.month, latest_flight.day)
+            else:
+                print(f"警告: 未找到航班文件 {flight_file}，使用默认结束日期")
+                return (2025, 5, 7)
+        except Exception as e:
+            print(f"警告: 获取航班结束时间失败 {e}，使用默认结束日期")
+            return (2025, 5, 7)
+    
+    # 使用动态获取的航班时间，如果失败则使用默认值
+    PLANNING_START_DATE = None  # 将在类初始化时设置
+    PLANNING_END_DATE = None    # 将在类初始化时设置
+    
+    @classmethod
+    def initialize_planning_dates(cls, data_path='data/'):
+        """初始化计划日期"""
+        if cls.PLANNING_START_DATE is None:
+            cls.PLANNING_START_DATE = cls.get_flight_start_date(data_path)
+            print(f"计划开始日期设置为: {cls.PLANNING_START_DATE}")
+        
+        if cls.PLANNING_END_DATE is None:
+            cls.PLANNING_END_DATE = cls.get_flight_end_date(data_path)
+            print(f"计划结束日期设置为: {cls.PLANNING_END_DATE}")
+    
+    # === 其他全局变量 ===
+    GDS = None # ground_duties
+
     # === 机场分类配置 ===
     # 动态机场分类配置 - 基于数据自动分析
     try:
@@ -132,6 +192,30 @@ class UnifiedConfig:
         'time_urgency': 0.2,         # 时间紧迫性权重
         'coverage_need': 0.1         # 覆盖需求权重
     }
+    
+    # === 分支定价算法配置 ===
+    USE_BRANCH_AND_PRICE = False  # 是否使用分支定价算法
+    
+    # 分支定价参数
+    MAX_BAP_NODES = 100  # 最大探索节点数（根据问题规模调整）
+    BAP_TIME_LIMIT = 1800  # 分支定价时间限制（秒）
+    BAP_OPTIMALITY_GAP = 0.01  # 最优性间隙
+    
+    # 分支策略
+    BRANCHING_STRATEGY = 'most_fractional'  # 'most_fractional', 'strong_branching'
+    NODE_SELECTION = 'best_bound'  # 'best_bound', 'depth_first', 'best_estimate'
+    
+    # 列生成在每个节点的配置
+    NODE_CG_MAX_ITER = 20  # 每个节点的列生成最大迭代次数（减少以提高效率）
+    NODE_CG_TIME_LIMIT = 60  # 每个节点的列生成时间限制（秒）
+    
+    # 剪枝参数
+    PRUNING_TOLERANCE = 1e-6  # 剪枝容差
+    INTEGER_TOLERANCE = 1e-6  # 整数容差
+    
+    # 并行化配置（未来扩展）
+    BAP_PARALLEL = False  # 是否并行探索多个节点
+    BAP_THREADS = 4  # 并行线程数
     
     @classmethod
     def get_optimization_params(cls):
@@ -207,6 +291,21 @@ class UnifiedConfig:
             
             # 总飞行时间约束
             'max_total_flight_hours': cls.MAX_TOTAL_FLIGHT_HOURS
+        }
+    
+    @classmethod
+    def get_bap_params(cls):
+        """获取分支定价参数"""
+        return {
+            'max_nodes': cls.MAX_BAP_NODES,
+            'time_limit': cls.BAP_TIME_LIMIT,
+            'optimality_gap': cls.BAP_OPTIMALITY_GAP,
+            'branching_strategy': cls.BRANCHING_STRATEGY,
+            'node_selection': cls.NODE_SELECTION,
+            'node_cg_max_iter': cls.NODE_CG_MAX_ITER,
+            'node_cg_time_limit': cls.NODE_CG_TIME_LIMIT,
+            'pruning_tolerance': cls.PRUNING_TOLERANCE,
+            'integer_tolerance': cls.INTEGER_TOLERANCE
         }
 
 # 全局配置实例

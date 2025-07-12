@@ -5,7 +5,7 @@ from gurobipy import GRB
 from typing import List
 from datetime import timedelta
 from data_models import Flight, Roster, Crew
-from unified_config import config
+from unified_config import UnifiedConfig
 
 class MasterProblem:
     def __init__(self, flights: List[Flight], crews: List[Crew], ground_duties: List = None, layover_stations = None):
@@ -19,7 +19,7 @@ class MasterProblem:
         self.scoring_system = ScoringSystem(flights, crews, layover_stations)
         
         # 使用统一配置的参数
-        optimization_params = config.get_optimization_params()
+        optimization_params = UnifiedConfig.get_optimization_params()
         self.FLIGHT_TIME_REWARD = optimization_params['flight_time_reward']
         self.POSITIONING_PENALTY = optimization_params['positioning_penalty']
         self.AWAY_OVERNIGHT_PENALTY = optimization_params['away_overnight_penalty']
@@ -30,6 +30,10 @@ class MasterProblem:
         
         # 设置线性目标函数
         self.use_simple_objective = True
+        
+        # 新增：分支约束管理（用于分支定价）
+        self.branching_constraints = {}  # (crew_id, roster_id) -> value
+        self.fixed_variables = {}  # var -> (lb, ub)
 
     def add_roster(self, roster, is_initial_roster=False):
         """向主问题添加新的排班方案"""
@@ -564,3 +568,64 @@ class MasterProblem:
         else:
             # 使用基础成本计算（不包含违规检查）
             return self.scoring_system.calculate_unified_roster_cost(roster, crew)
+    
+    # === 分支定价相关方法 ===
+    
+    def fix_variable(self, roster, value):
+        """固定一个roster变量的值（用于分支定价）"""
+        if roster in self.roster_vars:
+            var = self.roster_vars[roster]
+            self.fixed_variables[var] = (value, value)
+            var.lb = value
+            var.ub = value
+            
+    def add_branching_constraint(self, crew_id: str, roster, value: int):
+        """添加分支约束"""
+        key = (crew_id, id(roster))
+        self.branching_constraints[key] = value
+        
+        # 如果变量已存在，立即应用约束
+        if roster in self.roster_vars:
+            self.fix_variable(roster, value)
+    
+    def get_lp_solution_details(self):
+        """获取LP解的详细信息（供分支定价使用）"""
+        solution = {}
+        fractional_vars = []
+        
+        for roster, var in self.roster_vars.items():
+            if var.X > 1e-6:
+                solution[roster] = var.X
+                
+                # 检查是否为分数解
+                if 1e-6 < var.X < 1 - 1e-6:
+                    fractional_vars.append({
+                        'roster': roster,
+                        'var': var,
+                        'value': var.X,
+                        'crew_id': roster.crew_id,
+                        'distance_to_half': abs(var.X - 0.5)
+                    })
+        
+        # 按距离0.5的远近排序（用于分支变量选择）
+        fractional_vars.sort(key=lambda x: x['distance_to_half'])
+        
+        return {
+            'solution': solution,
+            'fractional_vars': fractional_vars,
+            'is_integer': len(fractional_vars) == 0,
+            'objective_value': self.model.ObjVal if hasattr(self.model, 'ObjVal') else None
+        }
+    
+    def clone_for_branching(self):
+        """创建用于分支的副本"""
+        new_mp = MasterProblem(self.flights, self.crews, self.ground_duties, self.layover_stations)
+        
+        # 复制所有roster
+        for roster in self.roster_vars.keys():
+            new_mp.add_roster(roster)
+        
+        # 复制分支约束
+        new_mp.branching_constraints = self.branching_constraints.copy()
+        
+        return new_mp
