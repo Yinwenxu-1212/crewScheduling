@@ -1,0 +1,29 @@
+=== 训练配置 ===
+训练轮数: 10
+学习率: 0.0003
+批次大小: 32
+经验回放缓冲区大小: 2000
+探索阶段比例: 0.3
+后期探索概率: 0.05
+课程学习更新间隔: 3
+成功阈值: -1000
+模型保存路径: models/
+==================
+
+Using device: cpu
+Loading and preprocessing data...
+Data loaded and preprocessed.
+
+=== 大规模机组训练配置 ===
+机组数量: 730
+每个机组最大步数: 6
+每个Episode最大步数: 5000
+Step输出间隔: 1
+========================
+
+--- Starting Enhanced Training with Dual-Head Architecture Monitoring ---
+模型参数数量: 2114374
+双头架构特征维度: 基础13维 + 对偶价格7维 = 总计20维
+开始训练循环...
+
+开始Episode 1/10

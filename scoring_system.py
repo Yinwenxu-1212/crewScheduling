@@ -165,8 +165,6 @@ class ScoringSystem:
                 from unified_config import UnifiedConfig
                 PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date()
                 PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date()
-                print(PLAN_START_DATE, PLAN_END_DATE)
-                input()
             
             # 情况1：历史停留机场为外站的过夜天数
             if hasattr(crew, 'stayStation') and crew.stayStation and crew.stayStation != crew_base:
@@ -260,7 +258,6 @@ class ScoringSystem:
         elif hasattr(task, 'arrAirport'):
             return task.arrAirport
         else:
-            # 
             return default_base
         
     def _get_task_start_airport(self, task, default_base):
@@ -477,7 +474,7 @@ class ScoringSystem:
         overnight_penalty = 0.0
         sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
         
-        # 需要添加首尾任务的逻辑
+        # 首尾任务的逻辑
         if len(sorted_duties) == 0:
             return overnight_penalty
         first_task = sorted_duties[0]
@@ -671,7 +668,7 @@ class ScoringSystem:
         
         # 4. 计算外站过夜惩罚（使用统一方法）
         overnight_penalty = self._calculate_unified_overnight_penalty(roster, crew)
-        
+
         # 5. 计算违规惩罚（新增）
         violation_count = self._check_roster_violations(roster, crew)
         violation_penalty_rate = optimization_params['violation_penalty']

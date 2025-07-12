@@ -78,7 +78,7 @@ class UnifiedConstraintChecker:
         值勤日定义：
         - 任务的集合，跨度不超过24小时
         - 可包含占位任务，可跨日历日
-        - 任务间休息时间少于12小时则属于同一值勤日 #
+        - 任务间休息时间少于12小时则属于同一值勤日
         """
         if not tasks:
             return []
@@ -112,7 +112,6 @@ class UnifiedConstraintChecker:
         # 添加最后一个值勤日
         if current_day.tasks:
             duty_days.append(current_day)
-        
         return duty_days, sorted_tasks
     
     def _should_start_new_duty_day(self, current_day: DutyDay, task, prev_task) -> bool:
@@ -216,7 +215,7 @@ class UnifiedConstraintChecker:
                         # 休息时间过长，当前飞行周期异常结束
                         self.logger.warning(f"飞行周期异常结束：末尾不是飞行值勤日")
                         current_cycle = None
-        
+
         # 检查最后一个未完成的周期
         if current_cycle is not None:
             if current_cycle.ends_with_flight_duty_period():
@@ -1073,6 +1072,7 @@ class UnifiedConstraintChecker:
         violations += len(validation_result['flight_cycle_violations'])
         violations += len(validation_result['total_flight_time_violations'])
         violations += len(validation_result['inconsistent_location_violations'])
+
         
         return violations
     

@@ -8,6 +8,35 @@ try:
 except ImportError:
     import config
 
+# 休息占位任务处理函数
+def is_rest_ground_duty(task):
+    """
+    判断是否为休息占位任务
+    根据isDuty字段判断：isDuty=0表示休息占位任务，isDuty=1表示工作占位任务
+    """
+    if task.get('type') != 'ground_duty':
+        return False
+    
+    # 根据isDuty字段判断：0表示休息，1表示工作
+    return task.get('isDuty', 1) == 0
+
+def calculate_rest_period(prev_task_end, next_task_start):
+    """
+    计算两个任务之间的休息时间（小时）
+    """
+    if prev_task_end and next_task_start:
+        rest_duration = next_task_start - prev_task_end
+        return rest_duration.total_seconds() / 3600.0
+    return 0
+
+def get_rest_quality_bonus(rest_hours):
+    """
+    根据休息时间长度给予奖励
+    """
+    if rest_hours >= config.MIN_REST_PERIOD_HOURS:
+        return config.REST_PERIOD_BONUS
+    return 0
+
 class DataHandler:
     """数据加载和预处理"""
     def __init__(self, path=config.DATA_PATH):
@@ -133,7 +162,7 @@ def flatten_cycle(cycle_duties):
 def identify_duties_and_cycles(roster, ground_duties, crew_base=None):
     """
     核心辅助函数：从一个机长的完整排班中识别出值勤日和飞行周期。
-    修正版本：正确处理飞行周期的基地休息要求和2个完整日历日休息
+    修正版本：正确处理飞行周期的基地休息要求和2个完整日历日休息，考虑休息占位任务
     返回:
     - duties: 一个列表，每个元素是一个代表值勤日的任务列表。 e.g., [[t1, t2], [t3]]
     - cycles: 一个列表，每个元素是一个代表飞行周期的任务列表。
@@ -143,7 +172,7 @@ def identify_duties_and_cycles(roster, ground_duties, crew_base=None):
         
     all_tasks = sorted(roster + ground_duties, key=lambda x: x['startTime'])
     
-    # 识别值勤日 (Duties)
+    # 识别值勤日 (Duties) - 修正版本
     duties = []
     if not all_tasks: return [], []
     
@@ -151,15 +180,25 @@ def identify_duties_and_cycles(roster, ground_duties, crew_base=None):
     for i in range(1, len(all_tasks)):
         prev_task, curr_task = all_tasks[i-1], all_tasks[i]
         
-        # 休息占位会断开值勤日
-        is_rest_duty = prev_task.get('isDuty', 1) == 0 or curr_task.get('isDuty', 1) == 0
-        rest_time = curr_task['startTime'] - prev_task['endTime']
-
-        if rest_time < timedelta(hours=12) and not is_rest_duty:
-            current_duty.append(curr_task)
-        else:
+        # 计算任务间隔时间
+        interval = curr_task['startTime'] - prev_task['endTime']
+        
+        # 值勤日断开条件：
+        # 1. 间隔超过12小时
+        # 2. 当前任务是休息占位任务
+        should_break_duty = False
+        
+        if interval >= timedelta(hours=12):
+            should_break_duty = True
+        elif is_rest_ground_duty(curr_task):
+            should_break_duty = True
+        
+        if should_break_duty:
             duties.append(current_duty)
             current_duty = [curr_task]
+        else:
+            current_duty.append(curr_task)
+    
     if current_duty:
         duties.append(current_duty)
 
@@ -241,7 +280,7 @@ class RuleChecker:
         crew_base = crew_info.get('base') or crew_info.get('stayStation')
         
         # identify_duties_and_cycles 的输入应该是 assignable_tasks，并传入crew_base
-        duties, cycles = identify_duties_and_cycles(roster, ground_duties, crew_base)
+        duties, cycles = identify_duties_and_cycles(sorted_tasks, ground_duties, crew_base)
         
         # Rule 2: 地点衔接规则 - 第一个任务必须从stayStation开始
         if roster and roster[0].get('depaAirport') != crew_info.get('stayStation'):
