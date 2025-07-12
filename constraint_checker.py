@@ -71,14 +71,14 @@ class UnifiedConstraintChecker:
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
         
-    def organize_tasks_into_duty_days(self, tasks: List) -> List[DutyDay]:
+    def organize_tasks_into_duty_days(self, tasks: List) -> tuple[List[DutyDay], List]:
         """
         将任务组织为值勤日
         
         值勤日定义：
         - 任务的集合，跨度不超过24小时
         - 可包含占位任务，可跨日历日
-        - 任务间休息时间少于12小时则属于同一值勤日
+        - 任务间休息时间少于12小时则属于同一值勤日 #
         """
         if not tasks:
             return []
@@ -113,7 +113,7 @@ class UnifiedConstraintChecker:
         if current_day.tasks:
             duty_days.append(current_day)
         
-        return duty_days
+        return duty_days, sorted_tasks
     
     def _should_start_new_duty_day(self, current_day: DutyDay, task, prev_task) -> bool:
         """判断是否应该开始新的值勤日"""
@@ -268,21 +268,21 @@ class UnifiedConstraintChecker:
         if duty_day.violates_24_hour_constraint():
             violations.append(f"值勤时间超限: {duty_day.get_duration_hours():.1f}小时 > {self.constraints.MAX_DUTY_DAY_HOURS}小时")
         
-        # 2. 检查任务数量限制
+        # 2. 检查任务数量限制 con7.1
         if len(duty_day.tasks) > self.constraints.MAX_TASKS_IN_DUTY:
             violations.append(f"值勤任务数超限: {len(duty_day.tasks)} > {self.constraints.MAX_TASKS_IN_DUTY}")
         
-        # 3. 检查飞行任务数量限制
+        # 3. 检查飞行任务数量限制 con7.2
         flight_count = sum(1 for task in duty_day.tasks if isinstance(task, Flight))
         if flight_count > self.constraints.MAX_FLIGHTS_IN_DUTY:
             violations.append(f"值勤飞行数超限: {flight_count} > {self.constraints.MAX_FLIGHTS_IN_DUTY}")
         
-        # 4. 检查值勤内飞行时间限制
+        # 4. 检查值勤内飞行时间限制 con8
         total_flight_time = sum(getattr(task, 'flyTime', 0) / 60.0 for task in duty_day.tasks if isinstance(task, Flight))
         if total_flight_time > self.constraints.MAX_FLIGHT_TIME_IN_DUTY_HOURS:
             violations.append(f"值勤飞行时间超限: {total_flight_time:.1f}小时 > {self.constraints.MAX_FLIGHT_TIME_IN_DUTY_HOURS}小时")
         
-        # 5. 检查连接时间
+        # 5. 检查连接时间 con6
         violations.extend(self._validate_connection_times(duty_day.tasks))
         
         return violations
@@ -291,37 +291,38 @@ class UnifiedConstraintChecker:
         """验证飞行值勤日约束"""
         violations = []
         
-        # 1. 检查是否包含执行飞行任务
+        # 1. 检查是否包含执行飞行任务 内部统计不触发扣分且应该避免
         if not fdp.has_flight:
-            violations.append("飞行值勤日必须包含执行飞行任务")
+            # violations.append("飞行值勤日必须包含执行飞行任务")
+            logging.warning("飞行值勤日必须包含执行飞行任务")
         
-        # 2. 检查飞行值勤日时间限制（12小时）
+        # 2. 检查飞行值勤日时间限制（12小时） con9
         # 根据规则6：飞行值勤开始时间为第一个任务的开始时间，飞行值勤结束时间为最后一个飞行任务的到达时间
         if fdp.get_flight_duty_duration_hours() > self.constraints.MAX_FDP_HOURS:
             violations.append(f"飞行值勤日时间超限: {fdp.get_flight_duty_duration_hours():.1f}小时 > {self.constraints.MAX_FDP_HOURS}小时")
         
-        # 3. 检查飞行任务数量限制
-        if fdp.get_flight_count() > self.constraints.MAX_FDP_FLIGHTS:
-            violations.append(f"飞行值勤日飞行数超限: {fdp.get_flight_count()} > {self.constraints.MAX_FDP_FLIGHTS}")
+        # # 3. 检查飞行任务数量限制 con7
+        # if fdp.get_flight_count() > self.constraints.MAX_FDP_FLIGHTS:
+        #     violations.append(f"飞行值勤日飞行数超限: {fdp.get_flight_count()} > {self.constraints.MAX_FDP_FLIGHTS}")
         
-        # 4. 检查总任务数量限制
-        if len(fdp.tasks) > self.constraints.MAX_FDP_TASKS:
-            violations.append(f"飞行值勤日任务数超限: {len(fdp.tasks)} > {self.constraints.MAX_FDP_TASKS}")
+        # # 4. 检查总任务数量限制 con7
+        # if len(fdp.tasks) > self.constraints.MAX_FDP_TASKS:
+        #     violations.append(f"飞行值勤日任务数超限: {len(fdp.tasks)} > {self.constraints.MAX_FDP_TASKS}")
         
-        # 5. 检查飞行时间限制
-        flight_time_hours = fdp.get_total_flight_time_minutes() / 60.0
-        if flight_time_hours > self.constraints.MAX_FDP_FLIGHT_TIME:
-            violations.append(f"飞行值勤日飞行时间超限: {flight_time_hours:.1f}小时 > {self.constraints.MAX_FDP_FLIGHT_TIME}小时")
+        # # 5. 检查飞行时间限制 con8
+        # flight_time_hours = fdp.get_total_flight_time_minutes() / 60.0
+        # if flight_time_hours > self.constraints.MAX_FDP_FLIGHT_TIME:
+        #     violations.append(f"飞行值勤日飞行时间超限: {flight_time_hours:.1f}小时 > {self.constraints.MAX_FDP_FLIGHT_TIME}小时")
         
         # 6. 检查可过夜机场约束
         if not fdp.is_valid(self.layover_stations_set):
             violations.append("飞行值勤日必须从可过夜机场出发到可过夜机场结束")
         
-        # 7. 检查连接时间约束
-        connection_violations = self._validate_connection_times(fdp.tasks)
-        violations.extend(connection_violations)
+        # # 7. 检查连接时间约束 con6
+        # connection_violations = self._validate_connection_times(fdp.tasks)
+        # violations.extend(connection_violations)
         
-        # 8. 检查置位规则（规则1：仅允许值勤日的开始或结束进行置位）
+        # 8. 检查置位规则（规则1：仅允许值勤日的开始或结束进行置位） con1
         positioning_violations = self._validate_positioning_rules(fdp.tasks)
         violations.extend(positioning_violations)
         
@@ -331,17 +332,20 @@ class UnifiedConstraintChecker:
         """验证飞行周期约束"""
         violations = []
         
-        # 1. 检查是否包含飞行值勤日
+        # # 1. 检查是否包含飞行值勤日 内部统计不触发扣分且应该避免
         if not cycle.has_flight_duty_periods():
-            violations.append("飞行周期必须包含飞行值勤日")
+            # violations.append("飞行周期必须包含飞行值勤日")
+            logging.warning("飞行周期必须包含飞行值勤日")
         
-        # 2. 检查末尾是否为飞行值勤日
+        # # 2. 检查末尾是否为飞行值勤日 内部统计不触发扣分且应该避免
         if not cycle.ends_with_flight_duty_period():
-            violations.append("飞行周期末尾必须是飞行值勤日")
+            # violations.append("飞行周期末尾必须是飞行值勤日")
+            logging.warning("飞行周期末尾必须是飞行值勤日")
         
-        # 3. 检查日历日跨度限制
+        # 3. 检查日历日跨度限制 con12 ps: 天数
         if cycle.get_calendar_days_span() > self.constraints.MAX_FLIGHT_CYCLE_DAYS:
-            violations.append(f"飞行周期跨度超限: {cycle.get_calendar_days_span()}天 > {self.constraints.MAX_FLIGHT_CYCLE_DAYS}天")
+            for i in range(cycle.get_calendar_days_span()):
+                violations.append(f"飞行周期跨度超限: {cycle.get_calendar_days_span()}天 > {self.constraints.MAX_FLIGHT_CYCLE_DAYS}天, 第{i+1}天违规")
         
         # 4. 检查是否在基地开始（如果有基地信息）
         if crew and crew.base and not cycle.starts_at_base(crew.base):
@@ -352,6 +356,96 @@ class UnifiedConstraintChecker:
             violations.append("飞行周期应返回基地结束")
         
         return violations
+    
+    def _validate_inconsistent_locations(self, crew: Crew, sorted_tasks: List) -> List[str]:
+        """验证地点不衔接次数"""
+        inconsistents = []
+        # 按时间排序任务
+        sorted_schedule: List[GroundDuty|Flight|BusInfo] = sorted_tasks
+        # 转换成具有start_place, end_place, start_time, end_time的Object dict对象
+        for task in sorted_schedule:
+            # 对于Flight depaAirport, arriAirport, std, sta
+            if isinstance(task, Flight):
+                task.start_place = task.depaAirport
+                task.end_place = task.arriAirport
+                task.start_time = task.std
+                task.end_time = task.sta
+            # 对于GroundDuty airport, isDuty, startTime, endTime
+            elif isinstance(task, GroundDuty):
+                task.start_place = task.airport
+                task.end_place = task.airport
+                task.start_time = task.startTime
+                task.end_time = task.endTime
+            # 对于BusInfo depaAirport, arriAirport, td, ta
+            elif isinstance(task, BusInfo):
+                task.start_place = task.depaAirport
+                task.end_place = task.arriAirport
+                task.start_time = task.td
+                task.end_time = task.ta
+            else:
+                logging.error("任务类型不支持: %s", type(task))
+        # 定义一个接口，后续支持语法高亮
+        class TaskInterface:
+            id: str
+            start_place: str
+            end_place: str
+            start_time: datetime
+            end_time: datetime
+        sorted_schedule: List[TaskInterface]
+
+        if not sorted_schedule:
+            return inconsistents
+        
+        # 从UnifiedConfig里读GDS: List[GroundDuty]
+        ground_duty_periods: List[GroundDuty] = UnifiedConfig.GDS
+        if not ground_duty_periods:
+            logging.error("未读取到GDS")
+            return inconsistents
+        crew_ground_duty_periods = [gd for gd in ground_duty_periods if gd.crewId == crew.crewId]
+        for gd in crew_ground_duty_periods:
+            gd.start_time = gd.startTime
+            gd.end_time = gd.endTime
+            gd.start_place = gd.airport
+            gd.end_place = gd.airport
+        crew_ground_duty_periods: List[TaskInterface]
+        crew_ground_duty_periods = sorted(crew_ground_duty_periods, key=lambda x: getattr(x, 'start_time', datetime.min))
+
+        # 检查第一个任务的开始地点是否与历史停留机场一致
+        first_task = sorted_schedule[0]
+        crew_stay_station = crew.stayStation
+        if first_task.start_place != crew_stay_station:
+            inconsistents.append(f"第一个任务地点不匹配: {crew.crewId} - 历史停留:{crew_stay_station}, 第一个任务开始:{first_task.start_place}")
+
+        # 检查任务之间的地点衔接
+        for i in range(len(sorted_schedule) - 1):
+            current_task = sorted_schedule[i]
+            next_task = sorted_schedule[i + 1]
+            # 地点衔接规则：同一名机长安排的所有任务必须地点衔接
+            if current_task.end_place != next_task.start_place:
+                inconsistents.append(f"{crew.crewId} - {current_task.id}({current_task.end_place}) -> {next_task.id}({next_task.start_place})")
+
+        # sorted_schedule copy
+        temp_schedule = sorted_schedule.copy()
+        temp = set()
+
+        for period in crew_ground_duty_periods:
+            cand = [task for task in temp_schedule if task.id != period.id and (task.start_time <= period.end_time and task.end_time >= period.start_time)]
+            if len(cand) > 0:
+                inconsistents.append(f"{crew.crewId} - 未在GroundDuty指定位置: {period.id} - {period.start_time} - {period.end_time} - {period.start_place}")
+            else:
+                task_before = [task for task in temp_schedule if task.end_time < period.start_time]
+                if len(task_before)>0 and task_before[-1].end_place != period.start_place:
+                    inconsistents.append(f"{crew.crewId} - 未在GroundDuty指定位置: {period.id} - {period.start_time} - {period.end_time} - {period.start_place}")
+                    temp_schedule.insert(len(task_before), period)
+                elif len(task_before)==0 and period.start_place != crew.stayStation:
+                    inconsistents.append(f"{crew.crewId} - 未在GroundDuty指定位置: {period.id} - {period.start_time} - {period.end_time} - {period.start_place}")
+                    temp_schedule.insert(0, period)
+                task_after = [task for task in temp_schedule if task.start_time > period.end_time]
+                if len(task_after)>0 and task_after[0].start_place != period.end_place and task_after[0] not in temp:
+                    inconsistents.append(f"{crew.crewId} - 未在GroundDuty指定位置: {period.id} - {period.start_time} - {period.end_time} - {period.start_place}")
+                    temp.add(task_after[0])
+        print(f"{crew.crewId} - 地点不衔接次数: {len(inconsistents)}")
+        return inconsistents
      
     def _validate_connection_times(self, tasks: List) -> List[str]:
         """验证任务间连接时间"""
@@ -417,39 +511,59 @@ class UnifiedConstraintChecker:
             'duty_day_violations': [],
             'flight_duty_period_violations': [],
             'flight_cycle_violations': [],
-            'total_flight_time_violations': []
+            'total_flight_time_violations': [],
+            'inconsistent_location_violations': [],
         }
         
         # 1. 组织任务为值勤日
-        duty_days = self.organize_tasks_into_duty_days(tasks)
+        duty_days, sorted_tasks = self.organize_tasks_into_duty_days(tasks)
         
-        # 2. 验证每个值勤日
+        # 2. 验证每个值勤日 6,7,8 # 需要添加判断：非飞行执勤日
         for i, duty_day in enumerate(duty_days):
             violations = self.validate_duty_day(duty_day)
             if violations:
                 result['duty_day_violations'].extend([f"值勤日{i+1}: {v}" for v in violations])
         
-        # 3. 组织和验证飞行值勤日
+        # 3. 组织和验证飞行值勤日 1,(6,7,8),9
         flight_duty_periods = self.organize_flight_duty_periods(duty_days)
         for i, fdp in enumerate(flight_duty_periods):
             violations = self.validate_flight_duty_period(fdp)
             if violations:
                 result['flight_duty_period_violations'].extend([f"飞行值勤日{i+1}: {v}" for v in violations])
          
-        # 4. 组织和验证飞行周期
+        # 4. 组织和验证飞行周期 12
         flight_cycles = self.organize_flight_cycles(duty_days, crew)
         for i, cycle in enumerate(flight_cycles):
             violations = self.validate_flight_cycle(cycle, crew)
             if violations:
                 result['flight_cycle_violations'].extend([f"飞行周期{i+1}: {v}" for v in violations])
         
-        # 5. 验证总飞行值勤时间
+        # 5. 验证总飞行值勤时间 con10
         total_flight_duty_time = sum(fdp.get_duration_hours() for fdp in flight_duty_periods)  # 使用方法获取小时数
         if total_flight_duty_time > self.constraints.MAX_TOTAL_FLIGHT_DUTY_HOURS:
             result['total_flight_time_violations'].append(
                 f"总飞行值勤时间超限: {total_flight_duty_time:.1f}小时 > {self.constraints.MAX_TOTAL_FLIGHT_DUTY_HOURS}小时"
             )
+
+        # 6. 不衔接扣分 con2
+        inconsistent_violations = self._validate_inconsistent_locations(crew, sorted_tasks)
+        if inconsistent_violations:
+            result['inconsistent_location_violations'].extend([f"地点未衔接: {v}" for v in inconsistent_violations])
         
+        '''
+        1:  1 deadhead_position_count 置位位置不合规次数
+        2:  1 inconsistent_location_count 地点不衔接
+        3:  0 unqualified_crew_count 机长无资质次数
+                4,5 任务不重叠，机长唯一
+        6:  1 insufficient_transfer_count 大巴置位/飞行置位间隔
+        7:  1 flight_task_limit 飞行值勤日飞行任务数量限制->执勤日4个
+        7:  1 duty_task_limit 飞行值勤日值勤任务数量限制->执勤日6个
+        8:  1 flight_time_limit 飞行值勤日最大飞行时间限制->执勤日8h
+        9:  1 duty_time_limit 飞行值勤日最大飞行值勤时间限制 -> 12h
+        10: 1 total_duty_time_limit 总飞行值勤时间限制 -> 计划期60h ok
+        11: 1 rest_time_limit 飞行值勤日最小休息时间限制->执勤日前12h
+        12: 1 cycle_rule_count 飞行周期违规天数 -> 飞4休2
+        '''
         return result
      
     def can_assign_task_to_label(self, current_label: Label, task: Dict, crew: Crew, crew_leg_match_dict: Dict[str, List[str]] = None) -> bool:
@@ -958,6 +1072,7 @@ class UnifiedConstraintChecker:
         violations += len(validation_result['flight_duty_period_violations'])
         violations += len(validation_result['flight_cycle_violations'])
         violations += len(validation_result['total_flight_time_violations'])
+        violations += len(validation_result['inconsistent_location_violations'])
         
         return violations
     

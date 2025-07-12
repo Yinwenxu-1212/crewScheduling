@@ -220,3 +220,6 @@ Thumbs.db
 
 # serena
 .serena/
+new_scoring_process.py
+stat_util.py
+data/result/crew_statistics.csv

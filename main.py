@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 # 项目模块导入
-from constraint_checker import ConstraintChecker
+from constraint_checker import UnifiedConstraintChecker
 from coverage_validator import CoverageValidator
 from data_loader import load_all_data
 from data_models import Flight, Roster
@@ -113,6 +113,7 @@ def main() -> None:
     ground_duties = all_data["ground_duties"]
     crew_leg_match_list = all_data["crew_leg_matches"]
     layover_stations = all_data["layover_stations"]
+    UnifiedConfig.GDS = ground_duties # 便于类传参
     
     print("正在预处理机长-航班资质数据...")
     crew_leg_match_dict = {}
