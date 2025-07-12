@@ -99,6 +99,9 @@ class UnifiedConfig:
     DATA_PATH = 'data/'
     MAX_COLUMN_GENERATION_ITERATIONS = 35  # 设置为35轮以匹配之前的良好结果
     PLANNING_START_DATE = (2025, 4, 29)  # 计划开始日期 (年, 月, 日)
+
+    # === 其他全局变量 ===
+    GDS = None # ground_duties
     
     # === 机场分类配置 ===
     # 动态机场分类配置 - 基于数据自动分析

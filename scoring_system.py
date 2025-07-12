@@ -259,6 +259,18 @@ class ScoringSystem:
             return task.arrAirport
         else:
             return default_base
+        
+    def _get_task_start_airport(self, task, default_base):
+        """获取任务开始机场"""
+        if isinstance(task, Flight):
+            return task.depaAirport
+        elif hasattr(task, 'depaAirport'):
+            return task.depaAirport
+        elif hasattr(task, 'depAirport'):
+            return task.depAirport
+        else:
+            # 
+            return default_base
     
     def _get_task_end_time(self, task):
         """获取任务结束时间"""
@@ -462,6 +474,31 @@ class ScoringSystem:
         overnight_penalty = 0.0
         sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
         
+        # 首尾任务的逻辑
+        if len(sorted_duties) == 0:
+            return overnight_penalty
+        first_task = sorted_duties[0]
+        last_task = sorted_duties[-1]
+
+        base = crew.base
+        
+        PLAN_START_DATE = datetime.strptime("2025-05-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        PLAN_END_DATE = datetime.strptime("2025-05-07 23:59:59", "%Y-%m-%d %H:%M:%S")
+        # PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date() # 这里的逻辑可能需要更改
+        # PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date() # 这里的逻辑可能需要更改
+
+        first_task_start = self._get_task_start_time(first_task)
+        fist_task_place = self._get_task_start_airport(first_task, crew.base)
+        if first_task_start and fist_task_place and fist_task_place != base:
+            days_before_first_task = (first_task_start - PLAN_START_DATE).days
+            overnight_penalty += max(1, days_before_first_task) * away_overnight_penalty_rate
+
+        last_task_end = self._get_task_end_time(last_task)
+        last_task_place = self._get_task_end_airport(last_task, crew.base)
+        if last_task_end and last_task_place and last_task_place != base:
+            days_after_last_task = (PLAN_END_DATE - last_task_end).days
+            overnight_penalty += max(0, days_after_last_task) * away_overnight_penalty_rate
+
         for i in range(len(sorted_duties) - 1):
             current_duty = sorted_duties[i]
             next_duty = sorted_duties[i + 1]
@@ -631,7 +668,7 @@ class ScoringSystem:
         
         # 4. 计算外站过夜惩罚（使用统一方法）
         overnight_penalty = self._calculate_unified_overnight_penalty(roster, crew)
-        
+
         # 5. 计算违规惩罚（新增）
         violation_count = self._check_roster_violations(roster, crew)
         violation_penalty_rate = optimization_params['violation_penalty']
