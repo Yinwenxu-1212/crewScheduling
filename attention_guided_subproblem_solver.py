@@ -627,8 +627,8 @@ class AttentionGuidedSubproblemSolver:
     def _adjust_candidates_priority_intelligent(self, scored_candidates: List[Tuple[float, int]], 
                                               candidates: List[Dict], crew: Crew, 
                                               current_label: Label) -> List[Tuple[float, int]]:
-        """修正后的智能优先级调整策略：根据上下文动态决策"""
-        # 1. 任务分组
+        """【最终修正版】优先级调整：精确区分第一个和后续飞行周期"""
+        # 1. 任务分组 (逻辑保持不变)
         mandatory_ground_duties = []
         execution_flights = []
         positioning_tasks = []
@@ -642,77 +642,96 @@ class AttentionGuidedSubproblemSolver:
             elif 'positioning' in task.get('type', '') or task['type'] == 'positioning_bus':
                 positioning_tasks.append((score, idx))
         
-        # 2. 上下文判断：判断当前所处的状态
-        # 判断是否为第一个飞行周期：如果没有飞行周期开始记录且没有返回基地记录，则为第一个周期
-        is_first_cycle = (current_label.current_cycle_start is None and current_label.last_base_return is None)
-        
-        # 根据飞行周期次数确定起始位置：第一个周期从stayStation开始，后续周期从base开始
-        expected_start_location = crew.stayStation if is_first_cycle else crew.base
-        is_at_start_location = (current_label.node.airport == expected_start_location)
-        
-        # 简单的判断是否处于休息状态：如果duty_start_time为空，说明不在一个值勤日内
+        # 2. 上下文判断
         is_rested = (current_label.duty_start_time is None)
-        
-        # 定义"新飞行周期开始"状态：在正确的起始位置，且处于休息状态
-        is_new_cycle_start = is_at_start_location and is_rested
         
         # 3. 根据不同的上下文，应用不同的优先级策略
         result = []
         
-        # 策略一：如果处于"新飞行周期开始"状态
-        if is_new_cycle_start:
-            cycle_type = "第一个" if is_first_cycle else "后续"
-            start_location = "stayStation" if is_first_cycle else "base"
-            self._log_debug(f"  [决策策略]: {cycle_type}飞行周期开始，从{start_location}({expected_start_location})出发，航班优先。")
+        # 检查是否处于可以开始一个新周期的状态（在某个地方休息）
+        if is_rested:
+            expected_start_location = None
+            log_message = ""
             
-            # a. 最高优先级：从正确起始位置出发的执行航班，按模型分数排序
-            start_execution_flights = [t for t in execution_flights if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(start_execution_flights, key=lambda x: x[0], reverse=True))
+            # 策略一：如果第一个周期还没完成，且当前在stayStation，则准备开始第一个周期
+            if not current_label.is_first_cycle_done and current_label.node.airport == crew.stayStation:
+                expected_start_location = crew.stayStation
+                log_message = f"  [决策策略]: 第一个飞行周期开始，从stayStation({crew.stayStation})出发，航班优先。"
+
+            # 策略二：如果第一个周期已完成，且当前在base，则准备开始后续周期
+            elif current_label.is_first_cycle_done and current_label.node.airport == crew.base:
+                expected_start_location = crew.base
+                log_message = f"  [决策策略]: 后续飞行周期开始，从base({crew.base})出发，航班优先。"
             
-            # b. 中等优先级：在起始位置的占位任务（可以作为一天的独立工作，但不是首选）
-            start_ground_duties = [t for t in mandatory_ground_duties if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(start_ground_duties, key=lambda x: x[0], reverse=True))
-            
-            # c. 最低优先级：从起始位置出发的置位任务（通常不希望以置位开始一个周期）
-            start_positioning = [t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(start_positioning, key=lambda x: x[0], reverse=True))
+            # 如果处于一个可以开始新周期的状态
+            if expected_start_location:
+                self._log_debug(log_message)
+                # a. 最高优先级：从正确起始位置出发的执行航班
+                result.extend(sorted([t for t in execution_flights if candidates[t[1]]['depaAirport'] == expected_start_location], key=lambda x: x[0], reverse=True))
+                # b. 中等优先级：在起始位置的占位任务
+                result.extend(sorted([t for t in mandatory_ground_duties if candidates[t[1]]['depaAirport'] == expected_start_location], key=lambda x: x[0], reverse=True))
+                # c. 最低优先级：从起始位置出发的置位任务
+                result.extend(sorted([t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == expected_start_location], key=lambda x: x[0], reverse=True))
+                return result[:self.max_candidates_per_expansion]
         
-        # 策略二：如果在基地但不是新飞行周期开始（值勤中或短时衔接）
-        elif is_at_start_location and not is_rested:
-            self._log_debug(f"  [决策策略]: 在基地({expected_start_location})值勤中，优先航班和置位。")
-            # a. 最高优先级：从基地出发的执行航班
-            base_execution_flights = [t for t in execution_flights if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(base_execution_flights, key=lambda x: x[0], reverse=True))
-            
-            # b. 中等优先级：从基地出发的置位任务（可能是为了连接更好的航班序列）
-            base_positioning = [t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(base_positioning, key=lambda x: x[0], reverse=True))
-            
-            # c. 较低优先级：在基地的占位任务（值勤中的占位通常不是首选）
-            base_ground_duties = [t for t in mandatory_ground_duties if candidates[t[1]]['depaAirport'] == expected_start_location]
-            result.extend(sorted(base_ground_duties, key=lambda x: x[0], reverse=True))
+        # 如果不处于"新周期开始"状态，则根据具体情况采用智能策略
+        current_airport = current_label.node.airport
         
-        # 策略三：如果在外站
-        elif not is_at_start_location:
-            self._log_debug("  [决策策略]: 在外站，优先考虑连接或返回。")
-            # a. 最高优先级：从当前外站出发的执行航班
-            outstation_execution_flights = [t for t in execution_flights if candidates[t[1]]['depaAirport'] == current_label.node.airport]
-            result.extend(sorted(outstation_execution_flights, key=lambda x: x[0], reverse=True))
+        # 策略三：值勤中状态 - 优先高价值连接
+        if not is_rested:  # 值勤中
+            self._log_debug(f"  [决策策略]: 值勤中状态，在{current_airport}，优先高价值连接。")
             
-            # b. 同等高优先级：从当前外站出发的置位（可能是为了返回基地或连接更好的序列）
-            outstation_positioning = [t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == current_label.node.airport]
-            result.extend(sorted(outstation_positioning, key=lambda x: x[0], reverse=True))
+            # a. 最高优先级：从当前位置出发的执行航班
+            current_execution_flights = [t for t in execution_flights if candidates[t[1]]['depaAirport'] == current_airport]
+            result.extend(sorted(current_execution_flights, key=lambda x: x[0], reverse=True))
             
-            # c. 其他占位任务（如果恰好在外站有占位）
+            # b. 高优先级：高价值置位任务（用于优化后续连接）
+            current_positioning = [t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == current_airport]
+            # 计算置位价值并排序
+            positioning_with_value = []
+            for score, idx in current_positioning:
+                task = candidates[idx]
+                positioning_value = self._calculate_positioning_value(task, current_label, crew)
+                # 综合原始分数和置位价值
+                combined_score = score * 0.6 + positioning_value * 0.4
+                positioning_with_value.append((combined_score, idx))
+            
+            # 只选择高价值置位（价值>0.5）
+            high_value_positioning = [(s, i) for s, i in positioning_with_value 
+                                    if self._calculate_positioning_value(candidates[i], current_label, crew) > 0.5]
+            result.extend(sorted(high_value_positioning, key=lambda x: x[0], reverse=True))
+            
+            # c. 中等优先级：当前位置的占位任务
+            current_ground_duties = [t for t in mandatory_ground_duties if candidates[t[1]]['depaAirport'] == current_airport]
+            result.extend(sorted(current_ground_duties, key=lambda x: x[0], reverse=True))
+            
+        # 策略四：外站休息状态 - 优先返回或高价值连接
+        else:  # 休息状态但不在正确的周期起始位置
+            self._log_debug(f"  [决策策略]: 外站休息状态，在{current_airport}，优先返回基地或高价值连接。")
+            
+            # a. 最高优先级：从当前位置出发的执行航班
+            current_execution_flights = [t for t in execution_flights if candidates[t[1]]['depaAirport'] == current_airport]
+            result.extend(sorted(current_execution_flights, key=lambda x: x[0], reverse=True))
+            
+            # b. 高优先级：返回基地的置位或高价值置位
+            current_positioning = [t for t in positioning_tasks if candidates[t[1]]['depaAirport'] == current_airport]
+            positioning_with_priority = []
+            
+            for score, idx in current_positioning:
+                task = candidates[idx]
+                positioning_value = self._calculate_positioning_value(task, current_label, crew)
+                
+                # 返回基地的置位获得额外加分
+                base_return_bonus = 0.3 if task['arriAirport'] == crew.base else 0.0
+                
+                # 综合评分：原始分数 + 置位价值 + 返回基地奖励
+                combined_score = score * 0.5 + positioning_value * 0.3 + base_return_bonus
+                positioning_with_priority.append((combined_score, idx))
+            
+            result.extend(sorted(positioning_with_priority, key=lambda x: x[0], reverse=True))
+            
+            # c. 较低优先级：占位任务
             result.extend(sorted(mandatory_ground_duties, key=lambda x: x[0], reverse=True))
-        
-        # 策略四：其他情况（兜底策略）
-        else:
-            self._log_debug("  [决策策略]: 其他状态，采用通用排序。")
-            # 恢复通用逻辑：优先执行航班，然后是占位，最后是置位
-            result.extend(sorted(execution_flights, key=lambda x: x[0], reverse=True))
-            result.extend(sorted(mandatory_ground_duties, key=lambda x: x[0], reverse=True))
-            result.extend(sorted(positioning_tasks, key=lambda x: x[0], reverse=True))
         
         return result[:self.max_candidates_per_expansion]
     
@@ -1169,8 +1188,9 @@ class AttentionGuidedSubproblemSolver:
             has_flown_in_duty=False, used_task_ids=set(),
             tie_breaker=next(tie_breaker),
             current_cycle_start=None, current_cycle_days=0,
-            last_base_return=planning_start_dt.date(),
-            duty_days_count=0  # 初始值勤日数量为0
+            last_base_return=None,  # 强烈建议将初始值设为None，以避免混淆
+            duty_days_count=0,  # 初始值勤日数量为0
+            is_first_cycle_done=False  # 明确初始状态：第一个周期尚未完成
         )
         
         heapq.heappush(labels, (0.0, initial_label))
@@ -1417,42 +1437,96 @@ class AttentionGuidedSubproblemSolver:
                         # 使用scoring_system计算完整成本
                         scoring_system = ScoringSystem(flights, [crew], layover_airports)
                         cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                            temp_roster, crew, dual_prices, crew_sigma_dual, self.global_duty_days_denominator
+                            temp_roster, crew, dual_prices, crew_sigma_dual, self.global_duty_days_denominator, ground_duty_duals
                         )
                         
                         # 简单质量检查
                         reduced_cost = cost_details['reduced_cost']
                         
                         # 记录所有考虑的roster的详细信息（不管是否有价值）
-                        roster_status = "有价值" if reduced_cost < -1e-4 else "无价值"
-                        self._log_debug(f"\n考虑的Roster ({roster_status}):")
-                        self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
-                        self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
-                        self._log_debug(f"  最大化线性目标函数")
-                        self._log_debug(f"  飞行奖励值: {cost_details.get('flight_reward', 0):.6f}")
-                        self._log_debug(f"  航班数量: {cost_details['flight_count']}")
-                        self._log_debug(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
-                        self._log_debug(f"  值勤天数: {cost_details['duty_days']}")
-                        self._log_debug(f"  总成本: {cost_details['total_cost']:.6f}")
-                        self._log_debug(f"  航班对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
-                        self._log_debug(f"  机组对偶价格: {cost_details.get('crew_sigma_dual', 0):.6f}")
-                        self._log_debug(f"  对偶价格总贡献: {cost_details.get('dual_contribution', 0):.6f}")
+                        roster_status = "有价值" if reduced_cost < 0 else "无价值"
+                        
+                        # 记录所有reduced cost < 0的roster的详细信息
+                        if reduced_cost < 0:
+                            self._log_debug(f"\n发现Reduced Cost < 0的Roster:")
+                            self._log_debug(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
+                            
+                            # 详细的路径信息
+                            self._log_debug(f"  详细路径信息:")
+                            for i, task in enumerate(current_label.path):
+                                task_type = task['type']
+                                start_time = task['startTime'].strftime('%m-%d %H:%M')
+                                end_time = task['endTime'].strftime('%m-%d %H:%M')
+                                if task_type == 'flight':
+                                    depa = task.get('depaAirport', 'N/A')
+                                    arri = task.get('arriAirport', 'N/A')
+                                    fly_time = task.get('flyTime', 0) / 60.0
+                                    dual_price = task.get('dual_price', 0.0)
+                                    self._log_debug(f"    {i+1}. {task['taskId']}: {task_type} {depa}->{arri} {start_time}-{end_time} 飞行时间:{fly_time:.1f}h 对偶价格:{dual_price:.4f}")
+                                else:
+                                    airport = task.get('airport', task.get('arriAirport', 'N/A'))
+                                    dual_price = task.get('dual_price', 0.0)
+                                    self._log_debug(f"    {i+1}. {task['taskId']}: {task_type} {airport} {start_time}-{end_time} 对偶价格:{dual_price:.4f}")
+                            
+                            self._log_debug(f"  Reduced Cost: {reduced_cost:.6f}")
+                            self._log_debug(f"  成本分解:")
+                            self._log_debug(f"    总成本 (total_cost): {cost_details['total_cost']:.6f}")
+                            self._log_debug(f"      - 飞行奖励 (flight_reward): -{cost_details.get('flight_reward', 0):.6f}")
+                            self._log_debug(f"      - 置位惩罚 (positioning_penalty): +{cost_details.get('positioning_penalty', 0):.6f}")
+                            self._log_debug(f"      - 过夜惩罚 (overnight_penalty): +{cost_details.get('overnight_penalty', 0):.6f}")
+                            self._log_debug(f"      - 违规惩罚 (violation_penalty): +{cost_details.get('violation_penalty', 0):.6f}")
+                            self._log_debug(f"    对偶价格贡献 (dual_contribution): {cost_details.get('dual_contribution', 0):.6f}")
+                            self._log_debug(f"      - 航班对偶价格收益 (flight_dual_total): +{cost_details.get('flight_dual_total', 0):.6f}")
+                            self._log_debug(f"      - 占位任务对偶价格收益 (ground_duty_dual_total): +{cost_details.get('ground_duty_dual_total', 0):.6f}")
+                            self._log_debug(f"      - 机组对偶价格 (crew_sigma_dual): -{cost_details.get('crew_sigma_dual', 0):.6f}")
+                            self._log_debug(f"  统计信息:")
+                            self._log_debug(f"    航班数量: {cost_details['flight_count']}")
+                            self._log_debug(f"    总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                            self._log_debug(f"    值勤天数: {cost_details['duty_days']}")
+                            self._log_debug(f"    置位任务数: {cost_details.get('positioning_count', 0)}")
+                            self._log_debug(f"    过夜次数: {cost_details.get('overnight_count', 0)}")
+                            self._log_debug(f"    违规次数: {cost_details.get('violation_count', 0)}")
                         
                         # 调用外部日志函数记录roster信息
-                        if external_log_func:
-                            value_status = "有价值" if reduced_cost < -1e-4 else "无价值"
-                            external_log_func(f"机组 {crew.crewId} - 考虑的Roster ({value_status}):")
+                        if external_log_func and reduced_cost < 0:
+                            external_log_func(f"机组 {crew.crewId} - 发现Reduced Cost < 0的Roster:")
                             external_log_func(f"  任务路径: {[task['taskId'] for task in current_label.path]}")
+                            
+                            # 详细的路径信息
+                            external_log_func(f"  详细路径信息:")
+                            for i, task in enumerate(current_label.path):
+                                task_type = task['type']
+                                start_time = task['startTime'].strftime('%m-%d %H:%M')
+                                end_time = task['endTime'].strftime('%m-%d %H:%M')
+                                if task_type == 'flight':
+                                    depa = task.get('depaAirport', 'N/A')
+                                    arri = task.get('arriAirport', 'N/A')
+                                    fly_time = task.get('flyTime', 0) / 60.0
+                                    dual_price = task.get('dual_price', 0.0)
+                                    external_log_func(f"    {i+1}. {task['taskId']}: {task_type} {depa}->{arri} {start_time}-{end_time} 飞行时间:{fly_time:.1f}h 对偶价格:{dual_price:.4f}")
+                                else:
+                                    airport = task.get('airport', task.get('arriAirport', 'N/A'))
+                                    dual_price = task.get('dual_price', 0.0)
+                                    external_log_func(f"    {i+1}. {task['taskId']}: {task_type} {airport} {start_time}-{end_time} 对偶价格:{dual_price:.4f}")
+                            
                             external_log_func(f"  Reduced Cost: {reduced_cost:.6f}")
-                            external_log_func(f"  最大化线性目标函数")
-                            external_log_func(f"  飞行奖励值: {cost_details.get('flight_reward', 0):.6f}")
-                            external_log_func(f"  航班数量: {cost_details['flight_count']}")
-                            external_log_func(f"  总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
-                            external_log_func(f"  值勤天数: {cost_details['duty_days']}")
-                            external_log_func(f"  总成本: {cost_details['total_cost']:.6f}")
-                            external_log_func(f"  航班对偶价格收益: {cost_details.get('dual_price_total', 0):.6f}")
-                            external_log_func(f"  机组对偶价格: {cost_details.get('crew_sigma_dual', 0):.6f}")
-                            external_log_func(f"  对偶价格总贡献: {cost_details.get('dual_contribution', 0):.6f}")
+                            external_log_func(f"  成本分解:")
+                            external_log_func(f"    总成本 (total_cost): {cost_details['total_cost']:.6f}")
+                            external_log_func(f"      - 飞行奖励 (flight_reward): -{cost_details.get('flight_reward', 0):.6f}")
+                            external_log_func(f"      - 置位惩罚 (positioning_penalty): +{cost_details.get('positioning_penalty', 0):.6f}")
+                            external_log_func(f"      - 过夜惩罚 (overnight_penalty): +{cost_details.get('overnight_penalty', 0):.6f}")
+                            external_log_func(f"      - 违规惩罚 (violation_penalty): +{cost_details.get('violation_penalty', 0):.6f}")
+                            external_log_func(f"    对偶价格贡献 (dual_contribution): {cost_details.get('dual_contribution', 0):.6f}")
+                            external_log_func(f"      - 航班对偶价格收益 (flight_dual_total): +{cost_details.get('flight_dual_total', 0):.6f}")
+                            external_log_func(f"      - 占位任务对偶价格收益 (ground_duty_dual_total): +{cost_details.get('ground_duty_dual_total', 0):.6f}")
+                            external_log_func(f"      - 机组对偶价格 (crew_sigma_dual): -{cost_details.get('crew_sigma_dual', 0):.6f}")
+                            external_log_func(f"  统计信息:")
+                            external_log_func(f"    航班数量: {cost_details['flight_count']}")
+                            external_log_func(f"    总飞行时间: {cost_details['total_flight_hours']:.2f}小时")
+                            external_log_func(f"    值勤天数: {cost_details['duty_days']}")
+                            external_log_func(f"    置位任务数: {cost_details.get('positioning_count', 0)}")
+                            external_log_func(f"    过夜次数: {cost_details.get('overnight_count', 0)}")
+                            external_log_func(f"    违规次数: {cost_details.get('violation_count', 0)}")
                             external_log_func("")  # 空行分隔
                         
                         if reduced_cost < -1e-4:  # 基础有价值条件
@@ -1560,11 +1634,16 @@ class AttentionGuidedSubproblemSolver:
             if task['startTime'] <= current_time or task['endTime'] > planning_end_dt:
                 continue
                 
-            # 检查总飞行时间约束（规则9：总飞行值勤时间限制）
+            # 检查总飞行值勤时间约束（规则9：总飞行值勤时间限制）
+            # 修正：使用飞行值勤时间而不是flyTime（空中飞行时间）
             if task['type'] == 'flight':
-                current_flight_hours = sum(t.get('flyTime', 0) / 60.0 for t in current_label.path if t.get('type') == 'flight')
-                task_flight_hours = task.get('flyTime', 0) / 60.0
-                if current_flight_hours + task_flight_hours > MAX_TOTAL_FLIGHT_HOURS:
+                # 计算当前路径中所有飞行值勤日的总飞行值勤时间
+                current_flight_duty_hours = self._calculate_total_flight_duty_hours(current_label)
+                
+                # 计算添加当前任务后的飞行值勤时间增量
+                task_flight_duty_hours_delta = self._calculate_flight_duty_hours_delta(current_label, task)
+                
+                if current_flight_duty_hours + task_flight_duty_hours_delta > MAX_TOTAL_FLIGHT_HOURS:
                     continue
             
             # 使用统一约束检查器进行详细检查
@@ -1577,8 +1656,113 @@ class AttentionGuidedSubproblemSolver:
         # 直接返回所有通过了检查的候选，不进行任何排序
         return valid_candidates
     
-
+    def _calculate_total_flight_duty_hours(self, current_label: Label) -> float:
+        """计算当前路径中所有飞行值勤日的总飞行值勤时间
+        
+        飞行值勤时间 = 飞行值勤日的总时长（从第一个任务开始到最后一个飞行任务结束）
+        """
+        if not current_label.path:
+            return 0.0
+        
+        total_flight_duty_hours = 0.0
+        
+        # 将任务按时间排序并组织为值勤日
+        sorted_tasks = sorted(current_label.path, key=lambda x: x['startTime'])
+        
+        # 分组为值勤日（基于休息时间间隔）
+        duty_days = []
+        current_duty = []
+        
+        for i, task in enumerate(sorted_tasks):
+            if i == 0:
+                current_duty = [task]
+            else:
+                prev_task = sorted_tasks[i-1]
+                rest_time = task['startTime'] - prev_task['endTime']
+                
+                if rest_time >= timedelta(hours=self.MIN_REST_HOURS):
+                    # 足够的休息时间，开始新值勤日
+                    if current_duty:
+                        duty_days.append(current_duty)
+                    current_duty = [task]
+                else:
+                    # 继续当前值勤日
+                    current_duty.append(task)
+        
+        if current_duty:
+            duty_days.append(current_duty)
+        
+        # 计算每个飞行值勤日的飞行值勤时间
+        for duty_day in duty_days:
+            # 检查是否为飞行值勤日（包含至少一个飞行任务）
+            has_flight = any(task['type'] == 'flight' for task in duty_day)
+            
+            if has_flight:
+                # 找到最后一个飞行任务
+                last_flight_task = None
+                for task in reversed(duty_day):
+                    if task['type'] == 'flight':
+                        last_flight_task = task
+                        break
+                
+                if last_flight_task:
+                    # 飞行值勤时间 = 从第一个任务开始到最后一个飞行任务结束
+                    duty_start_time = duty_day[0]['startTime']
+                    duty_end_time = last_flight_task['endTime']
+                    flight_duty_hours = (duty_end_time - duty_start_time).total_seconds() / 3600.0
+                    total_flight_duty_hours += flight_duty_hours
+        
+        return total_flight_duty_hours
     
+    def _calculate_flight_duty_hours_delta(self, current_label: Label, new_task: Dict) -> float:
+        """计算添加新任务后的飞行值勤时间增量
+        
+        Args:
+            current_label: 当前标签状态
+            new_task: 要添加的新任务
+            
+        Returns:
+            float: 飞行值勤时间增量（小时）
+        """
+        if new_task['type'] != 'flight':
+            return 0.0
+        
+        # 检查是否会开始新的值勤日
+        if not current_label.path:
+            # 第一个任务，飞行值勤时间就是任务本身的时长
+            return (new_task['endTime'] - new_task['startTime']).total_seconds() / 3600.0
+        
+        # 检查与最后一个任务的休息时间
+        last_task_end_time = current_label.node.time
+        rest_time = new_task['startTime'] - last_task_end_time
+        
+        if rest_time >= timedelta(hours=self.MIN_REST_HOURS):
+            # 开始新的值勤日，飞行值勤时间就是新任务的时长
+            return (new_task['endTime'] - new_task['startTime']).total_seconds() / 3600.0
+        else:
+            # 继续当前值勤日
+            if current_label.duty_start_time:
+                # 检查当前值勤日是否已经是飞行值勤日
+                current_duty_has_flight = current_label.has_flown_in_duty
+                
+                if current_duty_has_flight:
+                    # 当前已经是飞行值勤日，计算时间延长
+                    current_duty_end_time = last_task_end_time
+                    new_duty_end_time = new_task['endTime']
+                    
+                    # 如果新任务延长了值勤日，增加相应的时间
+                    if new_duty_end_time > current_duty_end_time:
+                        return (new_duty_end_time - current_duty_end_time).total_seconds() / 3600.0
+                    else:
+                        return 0.0
+                else:
+                    # 当前不是飞行值勤日，添加飞行任务后变成飞行值勤日
+                    # 飞行值勤时间 = 从值勤日开始到新飞行任务结束
+                    return (new_task['endTime'] - current_label.duty_start_time).total_seconds() / 3600.0
+            else:
+                # 没有duty_start_time，按新值勤日处理
+                return (new_task['endTime'] - new_task['startTime']).total_seconds() / 3600.0
+
     def _log_filter_stats(self, filter_stats: dict, current_airport: str, current_time: datetime, candidates_count: int):
         """统一的过滤统计日志输出"""
         if self.debug and candidates_count == 0:
@@ -1795,9 +1979,17 @@ class AttentionGuidedSubproblemSolver:
             new_cycle_days = current_label.current_cycle_days
             new_last_base_return = current_label.last_base_return
             
+            # 【新增】更新 is_first_cycle_done 状态
+            new_is_first_cycle_done = current_label.is_first_cycle_done
+            
             # 检查是否返回基地
             if task['arriAirport'] == crew.base:
                 new_last_base_return = task['endTime'].date()
+                
+                # 如果第一个周期尚未完成，并且当前任务的终点是基地
+                if not current_label.is_first_cycle_done:
+                    new_is_first_cycle_done = True  # 标记第一个周期已完成
+                
                 # 如果有活跃的飞行周期，结束它
                 if new_cycle_start is not None:
                     # 检查飞行周期末尾是否为飞行值勤日
@@ -1858,7 +2050,8 @@ class AttentionGuidedSubproblemSolver:
                 current_cycle_start=new_cycle_start,
                 current_cycle_days=new_cycle_days,
                 last_base_return=new_last_base_return,
-                duty_days_count=new_duty_days_count  # 传递值勤日数量
+                duty_days_count=new_duty_days_count,  # 传递值勤日数量
+                is_first_cycle_done=new_is_first_cycle_done  # 传递第一个周期完成状态
             )
             
             # 如果任务结束后在基地且满足条件，创建一个值勤日结束的标签
@@ -1886,7 +2079,8 @@ class AttentionGuidedSubproblemSolver:
                     current_cycle_start=new_cycle_start,
                     current_cycle_days=new_cycle_days,
                     last_base_return=new_node.time.date(),  # 更新最后回基地时间
-                    duty_days_count=new_duty_days_count
+                    duty_days_count=new_duty_days_count,
+                    is_first_cycle_done=new_is_first_cycle_done  # 传递第一个周期完成状态
                 )
                 
                 # 返回两个标签：继续值勤的和结束值勤的

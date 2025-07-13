@@ -619,7 +619,8 @@ class ScoringSystem:
     def calculate_roster_cost_with_dual_prices(self, roster: Roster, crew: Crew, 
                                              dual_prices: Dict[str, float], 
                                              crew_sigma_dual: float,
-                                             global_duty_days_denominator: float = 0.0) -> Dict[str, float]:
+                                             global_duty_days_denominator: float = 0.0,
+                                             ground_duty_duals: Dict[str, float] = None) -> Dict[str, float]:
         """
         计算单个排班方案的完整成本，包括对偶价格
         返回详细的成本分解，用于reduced cost计算
@@ -679,11 +680,21 @@ class ScoringSystem:
             # 当分母为0时，飞行奖励为0
             flight_reward = 0.0
         
-        # 2. 计算对偶价格收益
-        dual_price_total = 0.0
+        # 2. 计算对偶价格收益（分别计算航班和占位任务）
+        flight_dual_total = 0.0
+        ground_duty_dual_total = 0.0
+        if ground_duty_duals is None:
+            ground_duty_duals = {}
+        
         for duty in roster.duties:
             if isinstance(duty, Flight):
-                dual_price_total += dual_prices.get(duty.id, 0.0)
+                flight_dual_total += dual_prices.get(duty.id, 0.0)
+            elif isinstance(duty, GroundDuty):
+                # 添加占位任务的对偶价格
+                ground_duty_dual_total += ground_duty_duals.get(duty.id, 0.0)
+        
+        # 总对偶价格收益
+        dual_price_total = flight_dual_total + ground_duty_dual_total
         
         # 3. 计算置位惩罚（使用统一配置的核心成本参数）
         optimization_params = UnifiedConfig.get_optimization_params()
@@ -756,6 +767,8 @@ class ScoringSystem:
             'total_cost': total_cost,
             'flight_reward': flight_reward,
             'dual_price_total': dual_price_total,
+            'flight_dual_total': flight_dual_total,
+            'ground_duty_dual_total': ground_duty_dual_total,
             'dual_contribution': dual_contribution,
             'positioning_penalty': positioning_penalty,
             'overnight_penalty': overnight_penalty,

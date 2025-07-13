@@ -528,7 +528,7 @@ class Label:
                  total_away_overnights=0, total_calendar_days=None, 
                  has_flown_in_duty=False, used_task_ids=None, tie_breaker=0,
                  current_cycle_start=None, current_cycle_days=0, last_base_return=None,
-                 duty_days_count=1):
+                 duty_days_count=1, is_first_cycle_done=False):
         self.cost = cost
         self.path = path
         self.current_node = current_node
@@ -552,6 +552,7 @@ class Label:
         self.current_cycle_days = current_cycle_days    # 当前飞行周期已持续天数
         self.last_base_return = last_base_return        # 最后一次返回基地的日期
         self.duty_days_count = duty_days_count          # 值勤日数量
+        self.is_first_cycle_done = is_first_cycle_done  # 是否已完成第一个飞行周期
 
     def __lt__(self, other):
         return self.cost < other.cost

@@ -288,7 +288,7 @@ def main() -> None:
                     for idx, r in enumerate(new_rosters):
                         # 获取详细的成本分解
                         cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                            r, crew, pi_duals, crew_sigma_dual, master_problem.global_duty_days_denominator
+                            r, crew, pi_duals, crew_sigma_dual, master_problem.global_duty_days_denominator, ground_duty_duals
                         )
                         
                         reduced_cost = cost_details['reduced_cost']
@@ -532,8 +532,8 @@ def main() -> None:
     # --- 6. 分支定界算法 ---
     print("\n开始分支定价算法...")
     
-    # 分支定界配置
-    MAX_BRANCH_ITERATIONS = 10  # 最大分支定价迭代次数
+    # 分支定界配置（调小参数以便快速测试）
+    MAX_BRANCH_ITERATIONS = 3  # 最大分支定价迭代次数（从10减少到3）
     branch_iterations = 0
     
     # 分支定价迭代循环
@@ -555,19 +555,83 @@ def main() -> None:
         # 目标函数历史记录，用于判断连续无改进
         obj_history = []
         no_improvement_count = 0
-        improvement_threshold = 1e-6  # 目标函数改进阈值
+        improvement_threshold = 1e-4  # 目标函数改进阈值（从1e-6放宽到1e-4）
         
-        for cg_iter in range(10):  # 限制列生成轮数改为10
+        for cg_iter in range(5):  # 限制列生成轮数改为5（从10减少到5）
             print(f"\n=== 第{branch_iterations}轮分支定价列生成第 {cg_iter+1} 轮 ===")
+            
+            # 在每轮列生成开始前更新全局分母（仅第一轮分支定价的第一轮列生成使用初始解）
+            if cg_iter == 0 and branch_iterations == 1:
+                # 第一轮分支定价的第一轮列生成：使用初始解更新分母
+                master_problem.update_global_duty_days_denominator(initial_rosters=initial_rosters)
             
             # 求解主问题LP松弛
             pi_duals, sigma_duals, ground_duty_duals, current_obj = master_problem.solve_lp(verbose=False)
+            
+            # 在主问题求解后更新全局分母（除了第一轮分支定价的第一轮列生成）
+            if not (cg_iter == 0 and branch_iterations == 1):
+                # 后续所有轮次：使用当前求解结果更新分母
+                master_problem.update_global_duty_days_denominator()
             
             if pi_duals is None:
                 print("主问题求解失败，退出列生成。")
                 break
             
             print(f"第{branch_iterations}轮分支定价第{cg_iter+1}轮列生成: 目标函数值={current_obj:.2f}")
+            
+            # 打印变量值详情（验证LP松弛特性）
+            print(f"\n=== 第{branch_iterations}轮分支定价第{cg_iter+1}轮列生成变量值详情 ===")
+            var_count = 0
+            total_vars = len(master_problem.roster_vars)
+            print(f"总变量数: {total_vars}")
+            
+            # 统计变量值分布
+            zero_vars = 0
+            fractional_vars = 0
+            integer_vars = 0
+            
+            for i, (roster, var) in enumerate(master_problem.roster_vars.items()):
+                try:
+                    if hasattr(var, 'X'):
+                        var_value = var.X
+                        if abs(var_value) < 1e-6:
+                            zero_vars += 1
+                        elif abs(var_value - round(var_value)) < 1e-6:
+                            integer_vars += 1
+                        else:
+                            fractional_vars += 1
+                            
+                        # 只打印前10个非零变量的详细值
+                        if var_value > 1e-6 and var_count < 10:
+                            print(f"  变量 {i+1}: x = {var_value:.8f}, 成本 = {roster.cost:.2f}, 机组 = {roster.crew_id}")
+                            var_count += 1
+                except Exception as e:
+                    print(f"  访问变量{i+1}值时出错: {e}")
+                    continue
+            
+            # 统计未覆盖航班和占位任务数量
+            uncovered_flights_count = 0
+            uncovered_ground_duties_count = 0
+            
+            try:
+                for flight_id, var in master_problem.uncovered_vars.items():
+                    if hasattr(var, 'X') and var.X > 0.5:
+                        uncovered_flights_count += 1
+                        
+                for ground_duty_id, var in master_problem.uncovered_ground_duty_vars.items():
+                    if hasattr(var, 'X') and var.X > 0.5:
+                        uncovered_ground_duties_count += 1
+            except Exception as e:
+                print(f"  统计未覆盖任务时出错: {e}")
+            
+            print(f"变量值分布: 零值={zero_vars}, 整数值={integer_vars}, 分数值={fractional_vars}")
+            print(f"未覆盖航班数量: {uncovered_flights_count}")
+            print(f"未覆盖占位数量: {uncovered_ground_duties_count}")
+            
+            if fractional_vars > 0:
+                print(f"✓ 确认这是LP松弛问题：存在 {fractional_vars} 个分数变量")
+            else:
+                print(f"⚠️  所有变量都是整数值，可能已收敛到整数解")
             
             # 检查目标函数改进情况
             if obj_history:
@@ -604,7 +668,7 @@ def main() -> None:
                     if new_rosters:
                         for r in new_rosters:
                             cost_details = scoring_system.calculate_roster_cost_with_dual_prices(
-                                r, crew, pi_duals, crew_sigma_dual, master_problem.global_duty_days_denominator
+                                r, crew, pi_duals, crew_sigma_dual, master_problem.global_duty_days_denominator, ground_duty_duals
                             )
                             
                             if cost_details['reduced_cost'] < -0.0001:
@@ -617,8 +681,8 @@ def main() -> None:
             
             print(f"第{branch_iterations}轮分支定价第{cg_iter+1}轮列生成新增有价值roster: {new_rosters_found_count}")
             
-            # 收敛判断：连续三轮目标函数无改进且无新roster生成
-            if no_improvement_count >= 3 and new_rosters_found_count == 0:
+            # 收敛判断：连续两轮目标函数无改进且无新roster生成（从3轮减少到2轮）
+            if no_improvement_count >= 2 and new_rosters_found_count == 0:
                 print(f"第{branch_iterations}轮分支定价列生成收敛（连续{no_improvement_count}轮目标函数无改进且无新roster）")
                 column_generation_converged = True
                 break
@@ -647,12 +711,13 @@ def main() -> None:
             break
         
         # 选择分数值最大的变量进行分支
-        max_frac_var, max_frac_value = max(fractional_vars, key=lambda x: x[1])
-        print(f"选择分数值最大的变量进行分支: {max_frac_var.crew_id} (值: {max_frac_value:.3f})")
+        max_frac_entry = max(fractional_vars, key=lambda x: x[1])
+        max_frac_var_name, max_frac_value, max_frac_var, max_frac_type = max_frac_entry
+        print(f"选择分数值最大的变量进行分支: {max_frac_var_name} (值: {max_frac_value:.3f}, 类型: {max_frac_type})")
         
         # 将该变量设置为1，同时将同一机组的其他roster设置为0
         master_problem.set_variable_to_one(max_frac_var)
-        print(f"已固定机组{max_frac_var.crew_id}的roster选择，继续下一轮分支定价...")
+        print(f"已固定变量{max_frac_var_name}，继续下一轮分支定价...")
     
     # 如果分支定界循环结束时还没有求解最终整数规划，则求解
     if 'final_model' not in locals() or final_model is None:

@@ -141,14 +141,52 @@ class MasterProblem:
 
     def set_variable_to_one(self, var):
         """
-        将指定变量的下界设置为1（强制选择）
+        将指定变量的下界设置为1（强制选择），同时将同一机组的其他roster变量设置为0
+        这是分支定价中正确的分支操作
 
         Args:
             var: Gurobi变量对象
         """
-        if hasattr(var, 'LB'):
-            var.LB = 1.0
-            print(f"已将变量 {var.VarName} 的下界设置为1")
+        if not hasattr(var, 'LB'):
+            print(f"变量 {var.VarName} 没有下界属性")
+            return
+            
+        # 首先找到这个变量对应的roster和机组
+        selected_roster = None
+        selected_crew_id = None
+        
+        for roster, roster_var in self.roster_vars.items():
+            if roster_var == var:
+                selected_roster = roster
+                selected_crew_id = roster.crew_id
+                break
+        
+        if not selected_roster:
+            print(f"警告：未找到变量 {var.VarName} 对应的roster")
+            return
+            
+        print(f"分支操作：选择机组 {selected_crew_id} 的roster {var.VarName}")
+        
+        # 设置选中的变量为1
+        var.LB = 1.0
+        print(f"已将变量 {var.VarName} 的下界设置为1")
+        
+        # 将同一机组的其他roster变量设置为0
+        other_vars_count = 0
+        for roster, roster_var in self.roster_vars.items():
+            if roster.crew_id == selected_crew_id and roster_var != var:
+                roster_var.UB = 0.0
+                other_vars_count += 1
+                print(f"  - 将同机组变量 {roster_var.VarName} 的上界设置为0")
+        
+        print(f"共处理了 {other_vars_count} 个同机组的其他roster变量")
+        
+        # 重要修复：设置变量后需要更新模型
+        try:
+            self.model.update()
+            print(f"模型已更新，分支约束生效")
+        except Exception as e:
+            print(f"模型更新失败: {e}")
     
     def set_variable_to_zero(self, var):
         """
@@ -160,6 +198,13 @@ class MasterProblem:
         if hasattr(var, 'UB'):
             var.UB = 0.0
             print(f"已将变量 {var.VarName} 的上界设置为0")
+            
+            # 重要修复：设置变量后需要更新模型
+            try:
+                self.model.update()
+                print(f"模型已更新，变量约束生效")
+            except Exception as e:
+                print(f"模型更新失败: {e}")
     
     def update_global_duty_days_denominator(self, initial_rosters=None):
         """更新全局日均飞时计算的分母"""
@@ -175,23 +220,79 @@ class MasterProblem:
             self.is_first_iteration = False
         else:
             # 后续轮次：使用上一轮选中roster的加权执勤日总数
-            if hasattr(self, 'model') and self.model.status == GRB.OPTIMAL:
-                # 获取上一轮的加权执勤日数
-                selected_rosters_with_weights = []
-                for roster, var in self.roster_vars.items():
-                    if var.X > 0.001:  # 只考虑变量值大于0.001的方案
-                        selected_rosters_with_weights.append((roster, var.X))
+            if hasattr(self, 'model'):
+                # 检查模型状态，如果不是最优状态，尝试重新求解
+                if self.model.status != GRB.OPTIMAL:
+                    print(f"检测到模型状态异常 (状态码: {self.model.status})，尝试重新求解...")
+                    try:
+                        # 确保模型是最新的
+                        self.model.update()
+                        # 重新求解LP问题
+                        self.model.optimize()
+                        print(f"重新求解后模型状态: {self.model.status}")
+                        
+                        # 如果仍然不可行，进行详细诊断
+                        if self.model.status == 3:  # INFEASIBLE
+                            print(f"⚠️  警告：模型状态异常（状态码: {self.model.status}），进行详细诊断...")
+                            
+                            # 检查是否有变量约束冲突
+                            conflict_vars = []
+                            for roster, var in self.roster_vars.items():
+                                if hasattr(var, 'LB') and hasattr(var, 'UB') and var.LB > var.UB:
+                                    conflict_vars.append((roster.crew_id, var.VarName, var.LB, var.UB))
+                            
+                            if conflict_vars:
+                                print(f"发现 {len(conflict_vars)} 个变量约束冲突：")
+                                for crew_id, var_name, lb, ub in conflict_vars:
+                                    print(f"  - 机组 {crew_id}: {var_name} (LB={lb}, UB={ub})")
+                                print("这可能是分支定价中变量固定导致的冲突")
+                            
+                            # 重置模型参数并重新求解
+                            self.model.reset()
+                            self.model.setParam('Method', 2)  # 使用barrier方法
+                            self.model.setParam('Crossover', 0)  # 禁用crossover
+                            self.model.optimize()
+                            
+                            if self.model.status == 3:
+                                print(f"❌ 模型仍然不可行，状态码: {self.model.status}")
+                                # 计算IIS（不可行子系统）
+                                try:
+                                    self.model.computeIIS()
+                                    print("不可行约束分析：")
+                                    iis_count = 0
+                                    for constr in self.model.getConstrs():
+                                        if constr.IISConstr:
+                                            print(f"  - 约束 {constr.ConstrName} 导致不可行")
+                                            iis_count += 1
+                                    if iis_count == 0:
+                                        print("  - 未发现不可行约束，可能是变量边界冲突")
+                                except Exception as e:
+                                    print(f"无法计算IIS: {e}")
+                            else:
+                                print(f"✅ 重新求解成功，新状态码: {self.model.status}")
+                    except Exception as e:
+                        print(f"重新求解模型失败: {e}")
                 
-                if selected_rosters_with_weights:
-                    self.global_duty_days_denominator = self._calculate_weighted_duty_days(selected_rosters_with_weights)
-                    print(f"列生成轮次：使用上一轮加权执勤日总数作为分母 = {self.global_duty_days_denominator:.2f}")
-                    print(f"  - 上一轮选中方案数量: {len(selected_rosters_with_weights)}")
+                # 如果模型状态正常，获取上一轮的加权执勤日数
+                if self.model.status == GRB.OPTIMAL:
+                    selected_rosters_with_weights = []
+                    for roster, var in self.roster_vars.items():
+                        if var.X > 0.001:  # 只考虑变量值大于0.001的方案
+                            selected_rosters_with_weights.append((roster, var.X))
+                    
+                    if selected_rosters_with_weights:
+                        self.global_duty_days_denominator = self._calculate_weighted_duty_days(selected_rosters_with_weights)
+                        print(f"列生成轮次：使用上一轮加权执勤日总数作为分母 = {self.global_duty_days_denominator:.2f}")
+                        print(f"  - 上一轮选中方案数量: {len(selected_rosters_with_weights)}")
+                    else:
+                        # 如果没有选中的方案，保持当前分母不变
+                        print(f"警告：没有上一轮选中roster数据，保持分母 = {self.global_duty_days_denominator}")
                 else:
-                    # 如果没有选中的方案，保持当前分母不变
-                    print(f"警告：没有上一轮选中roster数据，保持分母 = {self.global_duty_days_denominator}")
+                    # 如果模型仍然无法求解，保持当前分母不变
+                    print(f"警告：模型状态异常 (状态码: {self.model.status})，保持分母 = {self.global_duty_days_denominator}")
             else:
-                # 如果模型未求解或状态异常，保持当前分母不变
-                print(f"警告：模型状态异常，保持分母 = {self.global_duty_days_denominator}")
+                # 如果模型不存在，保持当前分母不变
+                print(f"警告：模型不存在，保持分母 = {self.global_duty_days_denominator}")
         
         # 关键修复：如果分母发生变化，需要更新所有已存在roster变量的目标函数系数
         if abs(self.global_duty_days_denominator - old_denominator) > 1e-6:
@@ -472,6 +573,23 @@ class MasterProblem:
         
         print(f"目标函数值: {self.model.ObjVal:.2f}")
         
+        # 详细打印所有变量值（用于验证LP松弛特性）
+        print("\n=== 所有变量值详情（前20个） ===")
+        var_count = 0
+        for i, (roster, var) in enumerate(self.roster_vars.items()):
+            if var_count >= 20:  # 只打印前20个避免输出过多
+                break
+            try:
+                var_value = var.X
+                print(f"变量 {i+1}: x = {var_value:.8f}, 成本 = {roster.cost:.2f}, 机组 = {roster.crew_id}")
+                var_count += 1
+            except:
+                print(f"变量 {i+1}: 无法获取值")
+                var_count += 1
+        
+        if len(self.roster_vars) > 20:
+            print(f"... 还有 {len(self.roster_vars) - 20} 个变量未显示")
+        
         # 确保debug目录存在
         debug_dir = "debug"
         if not os.path.exists(debug_dir):
@@ -750,8 +868,8 @@ class MasterProblem:
         roster_cost = self._calculate_roster_cost(roster, include_violations=True)
         roster.cost = roster_cost
         
-        # 为初始解设置保护下界（降低到0.0以提高求解灵活性）
-        lower_bound = 0.0 if is_initial_roster else 0.0
+        # 为初始解设置保护下界（以提高求解灵活性）
+        lower_bound = 0.1 if is_initial_roster else 0.0
         
         # 创建roster变量，直接设置目标函数系数
         var_name = f"initial_roster_{roster.crew_id}_{len(self.roster_vars)}" if is_initial_roster else f"roster_{roster.crew_id}_{len(self.roster_vars)}"
