@@ -2,7 +2,8 @@
 
 import gurobipy as gp
 from gurobipy import GRB
-from typing import List
+from typing import List, Dict, Tuple
+import csv
 from datetime import timedelta
 from data_models import Flight, Roster, Crew
 from unified_config import UnifiedConfig
@@ -31,9 +32,10 @@ class MasterProblem:
         # 设置线性目标函数
         self.use_simple_objective = True
         
-        # 新增：分支约束管理（用于分支定价）
-        self.branching_constraints = {}  # (crew_id, roster_id) -> value
-        self.fixed_variables = {}  # var -> (lb, ub)
+        # 全局日均飞时近似分配相关变量
+        self.previous_selected_rosters = []  # 上一轮选中的roster列表
+        self.global_duty_days_denominator = 0  # 全局日均飞时计算的分母
+        self.is_first_iteration = True  # 是否为第一轮列生成
 
     def add_roster(self, roster, is_initial_roster=False):
         """向主问题添加新的排班方案"""
@@ -54,6 +56,220 @@ class MasterProblem:
     def get_solution_summary(self):
         """获取解决方案摘要"""
         return self._get_solution_summary()
+    
+    def is_integer_solution(self, tolerance=1e-6):
+        """
+        判断当前解是否为整数解
+
+        Args:
+            tolerance: 容差，用于判断变量值是否接近整数
+
+        Returns:
+            bool: 如果所有变量都接近整数值则返回True
+        """
+        if not hasattr(self, 'model') or self.model.status != GRB.OPTIMAL:
+            return False
+
+        # 检查所有roster变量
+        for roster, var in self.roster_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                # 检查是否接近0或1
+                if not (abs(val) < tolerance or abs(val - 1) < tolerance):
+                    return False
+
+        # 检查所有未覆盖航班变量
+        for flight_id, var in self.uncovered_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                if not (abs(val) < tolerance or abs(val - 1) < tolerance):
+                    return False
+
+        # 检查所有未覆盖占位任务变量
+        for ground_duty_id, var in self.uncovered_ground_duty_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                if not (abs(val) < tolerance or abs(val - 1) < tolerance):
+                    return False
+
+        return True
+
+    def get_fractional_variables(self, tolerance=1e-6):
+        """
+        获取所有分数变量及其值
+
+        Args:
+            tolerance: 容差，用于判断变量值是否接近整数
+
+        Returns:
+            list: 包含(变量名, 变量值, 变量对象)的列表，按分数值降序排列
+        """
+        if not hasattr(self, 'model') or self.model.status != GRB.OPTIMAL:
+            return []
+
+        fractional_vars = []
+
+        # 检查所有roster变量
+        for roster, var in self.roster_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                # 计算到最近整数的距离
+                distance_to_int = min(abs(val), abs(val - 1))
+                if distance_to_int > tolerance:
+                    fractional_vars.append((var.VarName, val, var, 'roster'))
+
+        # 检查所有未覆盖航班变量
+        for flight_id, var in self.uncovered_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                distance_to_int = min(abs(val), abs(val - 1))
+                if distance_to_int > tolerance:
+                    fractional_vars.append((var.VarName, val, var, 'uncovered_flight'))
+
+        # 检查所有未覆盖占位任务变量
+        for ground_duty_id, var in self.uncovered_ground_duty_vars.items():
+            if hasattr(var, 'X'):
+                val = var.X
+                distance_to_int = min(abs(val), abs(val - 1))
+                if distance_to_int > tolerance:
+                    fractional_vars.append((var.VarName, val, var, 'uncovered_ground_duty'))
+
+        # 按变量值降序排列（最大的分数值在前）
+        fractional_vars.sort(key=lambda x: x[1], reverse=True)
+
+        return fractional_vars
+
+    def set_variable_to_one(self, var):
+        """
+        将指定变量的下界设置为1（强制选择）
+
+        Args:
+            var: Gurobi变量对象
+        """
+        if hasattr(var, 'LB'):
+            var.LB = 1.0
+            print(f"已将变量 {var.VarName} 的下界设置为1")
+    
+    def set_variable_to_zero(self, var):
+        """
+        将指定变量的上界设置为0（强制不选择）
+
+        Args:
+            var: Gurobi变量对象
+        """
+        if hasattr(var, 'UB'):
+            var.UB = 0.0
+            print(f"已将变量 {var.VarName} 的上界设置为0")
+    
+    def update_global_duty_days_denominator(self, initial_rosters=None):
+        """更新全局日均飞时计算的分母"""
+        old_denominator = getattr(self, 'global_duty_days_denominator', 0)
+        
+        if self.is_first_iteration:
+            # 第一轮：使用初始解的执勤日总数
+            if initial_rosters:
+                self.global_duty_days_denominator = self._calculate_total_duty_days(initial_rosters)
+                print(f"第一轮列生成：使用初始解执勤日总数作为分母 = {self.global_duty_days_denominator}")
+            else:
+                self.global_duty_days_denominator = 1  # 避免除零
+            self.is_first_iteration = False
+        else:
+            # 后续轮次：使用上一轮选中roster的加权执勤日总数
+            if hasattr(self, 'model') and self.model.status == GRB.OPTIMAL:
+                # 获取上一轮的加权执勤日数
+                selected_rosters_with_weights = []
+                for roster, var in self.roster_vars.items():
+                    if var.X > 0.001:  # 只考虑变量值大于0.001的方案
+                        selected_rosters_with_weights.append((roster, var.X))
+                
+                if selected_rosters_with_weights:
+                    self.global_duty_days_denominator = self._calculate_weighted_duty_days(selected_rosters_with_weights)
+                    print(f"列生成轮次：使用上一轮加权执勤日总数作为分母 = {self.global_duty_days_denominator:.2f}")
+                    print(f"  - 上一轮选中方案数量: {len(selected_rosters_with_weights)}")
+                else:
+                    # 如果没有选中的方案，保持当前分母不变
+                    print(f"警告：没有上一轮选中roster数据，保持分母 = {self.global_duty_days_denominator}")
+            else:
+                # 如果模型未求解或状态异常，保持当前分母不变
+                print(f"警告：模型状态异常，保持分母 = {self.global_duty_days_denominator}")
+        
+        # 关键修复：如果分母发生变化，需要更新所有已存在roster变量的目标函数系数
+        if abs(self.global_duty_days_denominator - old_denominator) > 1e-6:
+            print(f"检测到全局分母变化：{old_denominator:.2f} -> {self.global_duty_days_denominator:.2f}")
+            print(f"正在更新所有已存在roster的目标函数系数...")
+            self._update_all_roster_costs()
+            print(f"已更新 {len(self.roster_vars)} 个roster的目标函数系数")
+    
+    def _calculate_total_duty_days(self, rosters):
+        """计算roster列表的总执勤日数
+        
+        根据用户要求：
+        ①当飞行值勤日跨零点时，记为两个日历日
+        ②日历日不重复计算，如2025年5月29日至2025年6月4日至多计算7个日历日
+        ③只计算执行航班，不计算置位航班
+        
+        注意：这里计算的是所有机组的执勤日总和，而非去重的日历日数量
+        这与评分系统中的all_duty_calendar_days逻辑不同，符合列生成算法的需求
+        """
+        total_duty_days = 0
+        
+        for roster in rosters:
+            roster_duty_days = self._calculate_roster_duty_days(roster)
+            total_duty_days += roster_duty_days
+        
+        return total_duty_days
+    
+    def _calculate_roster_duty_days(self, roster):
+        """
+        计算排班方案的飞行执勤日历日数量
+        只计算执行航班，不计算置位航班
+        """
+        from datetime import timedelta
+        duty_calendar_days = set()
+        
+        for duty in roster.duties:
+            if hasattr(duty, 'flightNo') and hasattr(duty, 'std') and hasattr(duty, 'sta'):
+                # 只计算执行航班的执勤日
+                if not getattr(duty, 'is_positioning', False):
+                    # 计算值勤日历日（跨零点时记为两个日历日）
+                    start_date = duty.std.date()
+                    end_date = duty.sta.date()
+                    current_date = start_date
+                    while current_date <= end_date:
+                        duty_calendar_days.add(current_date)
+                        current_date += timedelta(days=1)
+        
+        return len(duty_calendar_days)
+    
+    def _calculate_weighted_duty_days(self, selected_rosters_with_weights):
+        """计算加权执勤日数总和
+        
+        根据用户要求：
+        ①当飞行值勤日跨零点时，记为两个日历日
+        ②日历日不重复计算（在单个roster内部），如2025年5月29日至2025年6月4日至多计算7个日历日
+        ③只计算执行航班，不计算置位航班
+        
+        Args:
+            selected_rosters_with_weights: 列表，每个元素是(roster, weight)的元组
+            
+        Returns:
+            float: 加权执勤日数总和
+        """
+        weighted_total = 0.0
+        
+        for roster, weight in selected_rosters_with_weights:
+            # 计算该roster的执勤日数（只计算执行航班）
+            roster_duty_days = self._calculate_roster_duty_days(roster)
+            
+            # 该roster的执勤日数乘以其权重
+            weighted_total += roster_duty_days * weight
+        
+        return weighted_total
+    
+    def update_previous_selected_rosters(self):
+        """更新上一轮选中的roster列表"""
+        self.previous_selected_rosters = self._get_selected_rosters()
+        print(f"更新上一轮选中roster数量: {len(self.previous_selected_rosters)}")
     
     def _solve_lp(self, verbose=False):
         """求解LP松弛问题"""
@@ -91,9 +307,11 @@ class MasterProblem:
             obj_val = self.model.ObjVal
             
             if verbose:
-                # 计算实际的未覆盖数量
+                # 计算实际的未覆盖数量和目标函数组成
                 uncovered_flights_count = 0
                 uncovered_ground_duties_count = 0
+                roster_cost_sum = 0
+                selected_rosters_info = []
                 
                 try:
                     # 统计未覆盖航班数量
@@ -105,18 +323,95 @@ class MasterProblem:
                     for ground_duty_id, var in self.uncovered_ground_duty_vars.items():
                         if var.X > 0.5:
                             uncovered_ground_duties_count += 1
+                    
+                    # 统计选中的roster及其成本
+                    for roster, var in self.roster_vars.items():
+                        if var.X > 0.001:  # 考虑连续变量的情况
+                            roster_cost_contribution = roster.cost * var.X
+                            roster_cost_sum += roster_cost_contribution
+                            
+                            # 计算该roster的飞行时间
+                            flight_hours = self._calculate_roster_flight_hours(roster)
+                            
+                            selected_rosters_info.append({
+                                'roster': roster,
+                                'weight': var.X,
+                                'cost': roster.cost,
+                                'cost_contribution': roster_cost_contribution,
+                                'flight_hours': flight_hours
+                            })
+                    
+                    # 按成本贡献排序，取前5个
+                    selected_rosters_info.sort(key=lambda x: abs(x['cost_contribution']), reverse=True)
+                    
                 except Exception as e:
                     print(f"计算未覆盖数量时出错: {e}")
                     # 如果计算失败，回退到显示变量数量
                     uncovered_flights_count = len(self.uncovered_vars)
                     uncovered_ground_duties_count = len(self.uncovered_ground_duty_vars)
                 
+                # 计算目标函数各项组成
+                uncovered_flights_penalty = uncovered_flights_count * self.UNCOVERED_FLIGHT_PENALTY
+                uncovered_ground_duties_penalty = uncovered_ground_duties_count * self.UNCOVERED_GROUND_DUTY_PENALTY
+                
                 print(f"\n=== 线性目标函数求解结果 ===")
                 print(f"目标函数值: {obj_val:.2f}")
                 print(f"求解状态: 最优")
                 print(f"roster变量数量: {len(self.roster_vars)}")
-                print(f"未覆盖航班数量: {uncovered_flights_count}")
-                print(f"未覆盖占位任务数量: {uncovered_ground_duties_count}")
+                print(f"\n=== 目标函数组成分析 ===")
+                print(f"1. Roster成本总和: {roster_cost_sum:.2f}")
+                print(f"2. 未覆盖航班惩罚: {uncovered_flights_penalty:.2f} ({uncovered_flights_count}个 × {self.UNCOVERED_FLIGHT_PENALTY})")
+                print(f"3. 未覆盖占位任务惩罚: {uncovered_ground_duties_penalty:.2f} ({uncovered_ground_duties_count}个 × {self.UNCOVERED_GROUND_DUTY_PENALTY})")
+                print(f"目标函数验证: {roster_cost_sum + uncovered_flights_penalty + uncovered_ground_duties_penalty:.2f}")
+                
+                # 显示前5个列的成本构成
+                print(f"\n=== 前5个列的成本构成分析 ===")
+                for i, info in enumerate(selected_rosters_info[:5]):
+                    roster = info['roster']
+                    weight = info['weight']
+                    cost = info['cost']
+                    flight_hours = info['flight_hours']
+                    
+                    # 计算飞行时间奖励
+                    if self.global_duty_days_denominator > 0:
+                        flight_time_reward = self.FLIGHT_TIME_REWARD * flight_hours / self.global_duty_days_denominator
+                    else:
+                        flight_time_reward = 0
+                    
+                    # 找到对应的机组
+                    crew = None
+                    for c in self.crews:
+                        if c.crewId == roster.crew_id:
+                            crew = c
+                            break
+                    
+                    # 获取详细的成本构成
+                    if crew:
+                        cost_details = self.scoring_system.calculate_roster_cost_with_violations(
+                            roster, crew, self.global_duty_days_denominator
+                        )
+                    else:
+                        cost_details = {
+                            'flight_reward': 0.0,
+                            'positioning_penalty': 0.0,
+                            'overnight_penalty': 0.0,
+                            'violation_penalty': 0.0,
+                            'violation_count': 0,
+                            'total_cost': 0.0
+                        }
+                    
+                    print(f"列{i+1} (机组{roster.crew_id}, 权重{weight:.3f}):")
+                    print(f"  - 总成本: {roster.cost:.2f}")
+                    print(f"  - 飞行时间: {flight_hours:.2f}小时")
+                    print(f"  - 飞行时间奖励: -{flight_time_reward:.2f} (全局分母)")
+                    print(f"  - 成本贡献: {info['cost_contribution']:.2f}")
+                    print(f"  - 成本构成详情:")
+                    print(f"    * 飞行奖励: {cost_details.get('flight_reward', 0):.2f}")
+                    print(f"    * 置位惩罚: {cost_details.get('positioning_penalty', 0):.2f}")
+                    print(f"    * 外站过夜惩罚: {cost_details.get('overnight_penalty', 0):.2f}")
+                    print(f"    * 违规惩罚: {cost_details.get('violation_penalty', 0):.2f}")
+                    print(f"    * 违规次数: {cost_details.get('violation_count', 0)}")
+                    print(f"    * 总成本: {cost_details.get('total_cost', 0):.2f}")
             
             return pi_duals, sigma_duals, ground_duty_duals, obj_val
         else:
@@ -423,6 +718,7 @@ class MasterProblem:
             )
         
         # 为每个机组创建约束：每个机组最多选择一个roster
+        # 初始时没有roster变量，所以先创建空约束，后续在_add_roster中更新
         for crew in self.crews:
             self.crew_constraints[crew.crewId] = self.model.addConstr(
                 0 <= 0, name=f"crew_{crew.crewId}"
@@ -450,8 +746,8 @@ class MasterProblem:
         if not hasattr(self, 'model'):
             self._setup_model()
         
-        # 计算roster成本
-        roster_cost = self._calculate_roster_cost(roster)
+        # 计算roster成本（包含违规检查，确保与打印输出一致）
+        roster_cost = self._calculate_roster_cost(roster, include_violations=True)
         roster.cost = roster_cost
         
         # 为初始解设置保护下界（降低到0.0以提高求解灵活性）
@@ -543,7 +839,7 @@ class MasterProblem:
     
     def _calculate_roster_cost(self, roster, include_violations=False):
         """
-        计算roster成本c_r
+        计算roster成本c_r（使用全局日均飞时近似分配）
         
         使用统一的评分系统，确保与其他模块的计算逻辑一致
         
@@ -562,70 +858,135 @@ class MasterProblem:
             return 0.0
         
         if include_violations:
-            # 使用包含违规检查的完整成本计算
-            cost_details = self.scoring_system.calculate_roster_cost_with_violations(roster, crew)
+            # 使用包含违规检查的完整成本计算，传递全局分母参数
+            cost_details = self.scoring_system.calculate_roster_cost_with_violations(
+                roster, crew, self.global_duty_days_denominator
+            )
             return cost_details['total_cost']
         else:
-            # 使用基础成本计算（不包含违规检查）
-            return self.scoring_system.calculate_unified_roster_cost(roster, crew)
+            # 使用基础成本计算（不包含违规检查），传递全局分母参数
+            return self.scoring_system.calculate_unified_roster_cost(
+                roster, crew, self.global_duty_days_denominator
+            )
     
-    # === 分支定价相关方法 ===
-    
-    def fix_variable(self, roster, value):
-        """固定一个roster变量的值（用于分支定价）"""
-        if roster in self.roster_vars:
-            var = self.roster_vars[roster]
-            self.fixed_variables[var] = (value, value)
-            var.lb = value
-            var.ub = value
-            
-    def add_branching_constraint(self, crew_id: str, roster, value: int):
-        """添加分支约束"""
-        key = (crew_id, id(roster))
-        self.branching_constraints[key] = value
+    def _update_all_roster_costs(self):
+        """更新所有已存在roster变量的目标函数系数
         
-        # 如果变量已存在，立即应用约束
-        if roster in self.roster_vars:
-            self.fix_variable(roster, value)
-    
-    def get_lp_solution_details(self):
-        """获取LP解的详细信息（供分支定价使用）"""
-        solution = {}
-        fractional_vars = []
+        当global_duty_days_denominator发生变化时，需要重新计算所有roster的成本
+        并更新其在目标函数中的系数
+        """
+        if not hasattr(self, 'model') or not hasattr(self, 'roster_vars'):
+            return
         
+        updated_count = 0
         for roster, var in self.roster_vars.items():
-            if var.X > 1e-6:
-                solution[roster] = var.X
-                
-                # 检查是否为分数解
-                if 1e-6 < var.X < 1 - 1e-6:
-                    fractional_vars.append({
-                        'roster': roster,
-                        'var': var,
-                        'value': var.X,
-                        'crew_id': roster.crew_id,
-                        'distance_to_half': abs(var.X - 0.5)
-                    })
+            # 重新计算roster成本
+            new_cost = self._calculate_roster_cost(roster, include_violations=True)
+            old_cost = roster.cost
+            
+            # 更新roster对象的成本属性
+            roster.cost = new_cost
+            
+            # 更新Gurobi变量的目标函数系数
+            var.Obj = new_cost
+            
+            # 记录显著变化的roster
+            if abs(new_cost - old_cost) > 0.01:
+                updated_count += 1
         
-        # 按距离0.5的远近排序（用于分支变量选择）
-        fractional_vars.sort(key=lambda x: x['distance_to_half'])
+        # 通知Gurobi模型目标函数已更改
+        self.model.update()
         
-        return {
-            'solution': solution,
-            'fractional_vars': fractional_vars,
-            'is_integer': len(fractional_vars) == 0,
-            'objective_value': self.model.ObjVal if hasattr(self.model, 'ObjVal') else None
-        }
+        if updated_count > 0:
+            print(f"  - 其中 {updated_count} 个roster的成本发生显著变化")
     
-    def clone_for_branching(self):
-        """创建用于分支的副本"""
-        new_mp = MasterProblem(self.flights, self.crews, self.ground_duties, self.layover_stations)
+    def _calculate_roster_flight_hours(self, roster):
+        """计算roster的总飞行时间（小时）
         
-        # 复制所有roster
-        for roster in self.roster_vars.keys():
-            new_mp.add_roster(roster)
+        注意：只计算执飞航班的飞行时间，置位航班不计入飞行时间
+        使用flyTime字段以保持与其他模块的一致性
+        """
+        total_flight_hours = 0
+        for duty in roster.duties:
+            if hasattr(duty, 'flyTime') and duty.flyTime is not None:
+                # 检查是否为置位航班
+                is_positioning = getattr(duty, 'is_positioning', False)
+                if not is_positioning:  # 只计算执飞航班的飞行时间
+                    # flyTime是以分钟为单位，需要转换为小时
+                    total_flight_hours += duty.flyTime / 60.0
+        return total_flight_hours
+    
+    def _validate_objective_function(self):
+        """验证目标函数设置是否正确"""
+        print("\n=== 目标函数验证 ===")
         
-        # 复制分支约束
-        new_mp.branching_constraints = self.branching_constraints.copy()
+        # 检查roster变量的目标函数系数
+        total_roster_coeff = 0
+        for roster, var in self.roster_vars.items():
+            if hasattr(var, 'Obj'):
+                total_roster_coeff += var.Obj
         
-        return new_mp
+        # 检查未覆盖变量的目标函数系数
+        total_uncovered_flight_coeff = sum(var.Obj for var in self.uncovered_vars.values() if hasattr(var, 'Obj'))
+        total_uncovered_gd_coeff = sum(var.Obj for var in self.uncovered_ground_duty_vars.values() if hasattr(var, 'Obj'))
+        
+        print(f"Roster变量总目标函数系数: {total_roster_coeff:.2f}")
+        print(f"未覆盖航班变量总目标函数系数: {total_uncovered_flight_coeff:.2f}")
+        print(f"未覆盖占位任务变量总目标函数系数: {total_uncovered_gd_coeff:.2f}")
+        
+        # 预期系数验证
+        expected_flight_coeff = len(self.uncovered_vars) * self.UNCOVERED_FLIGHT_PENALTY
+        expected_gd_coeff = len(self.uncovered_ground_duty_vars) * self.UNCOVERED_GROUND_DUTY_PENALTY
+        
+        print(f"预期未覆盖航班系数: {expected_flight_coeff:.2f}")
+        print(f"预期未覆盖占位任务系数: {expected_gd_coeff:.2f}")
+
+    def _detailed_objective_validation(self):
+        """详细的目标函数验证"""
+        print("\n=== 详细目标函数验证 ===")
+        
+        try:
+            obj_val = self.model.ObjVal
+            print(f"模型目标函数值: {obj_val:.2f}")
+            
+            # 计算各部分贡献
+            roster_contribution = 0
+            uncovered_flight_contribution = 0
+            uncovered_gd_contribution = 0
+            
+            # Roster贡献
+            for roster, var in self.roster_vars.items():
+                if hasattr(var, 'X') and var.X > 0.001:
+                    roster_contribution += roster.cost * var.X
+                    
+            # 未覆盖航班贡献
+            uncovered_flights_count = 0
+            for flight_id, var in self.uncovered_vars.items():
+                if hasattr(var, 'X') and var.X > 0.5:
+                    uncovered_flights_count += 1
+                    uncovered_flight_contribution += self.UNCOVERED_FLIGHT_PENALTY * var.X
+            
+            # 未覆盖占位任务贡献
+            uncovered_gd_count = 0
+            for gd_id, var in self.uncovered_ground_duty_vars.items():
+                if hasattr(var, 'X') and var.X > 0.5:
+                    uncovered_gd_count += 1
+                    uncovered_gd_contribution += self.UNCOVERED_GROUND_DUTY_PENALTY * var.X
+            
+            total_calculated = roster_contribution + uncovered_flight_contribution + uncovered_gd_contribution
+            difference = abs(obj_val - total_calculated)
+            
+            print(f"目标函数组成分析:")
+            print(f"  - 选中Roster成本总和: {roster_contribution:.2f}")
+            print(f"  - 未覆盖航班惩罚 ({uncovered_flights_count}个): {uncovered_flight_contribution:.2f}")
+            print(f"  - 未覆盖占位任务惩罚 ({uncovered_gd_count}个): {uncovered_gd_contribution:.2f}")
+            print(f"  - 计算总和: {total_calculated:.2f}")
+            print(f"  - 与模型值差异: {difference:.6f}")
+            
+            if difference > 1e-3:
+                print(f"⚠️  警告：目标函数计算差异过大！")
+            else:
+                print(f"✅ 目标函数计算一致")
+                
+        except Exception as e:
+            print(f"目标函数验证出错: {e}")

@@ -65,7 +65,7 @@ class GroundDutyValidator:
                 assigned_ground_duty_ids = all_ground_duty_ids - unassigned_duty_ids
                 
             except Exception as e:
-                self.logger.warning(f"从master_problem获取地面值勤覆盖信息失败: {e}")
+                # self.logger.warning(f"从master_problem获取地面值勤覆盖信息失败: {e}")
                 # 回退到原有逻辑
                 assigned_ground_duty_ids, assigned_count, unassigned_duty_ids = self._fallback_validation(rosters)
         else:
@@ -122,10 +122,10 @@ class GroundDutyValidator:
         # 记录日志
         self.logger.info(f"地面值勤验证结果: {coverage_rate:.2%} ({assigned_count}/{total_ground_duties})")
         if not is_valid:
-            self.logger.warning(f"地面值勤验证失败！违规数量: {len(violations)}")
-            self.logger.warning(f"未分配地面值勤数量: {len(unassigned_duties)}")
+            # self.logger.warning(f"地面值勤验证失败！违规数量: {len(violations)}")
+            # self.logger.warning(f"未分配地面值勤数量: {len(unassigned_duties)}")
         
-        return {
+            return {  # 返回验证结果字典
             'is_valid': is_valid,
             'total_ground_duties': total_ground_duties,
             'assigned_ground_duties': assigned_count,

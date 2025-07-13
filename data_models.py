@@ -210,7 +210,7 @@ class FlightDutyPeriod(DutyDay):
         super().add_task(task)
         
         # FDP特有的逻辑：统计执行飞行任务（非置位飞行任务）
-        if isinstance(task, Flight) and not getattr(task, 'is_positioning', False):
+        if isinstance(task, Flight) and not getattr(task, 'is_ddh', False) and not getattr(task, 'positioning_flight', False):
             self.has_flight = True
             self.flight_count += 1
             self.total_flight_time += task.flyTime

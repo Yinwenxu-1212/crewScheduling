@@ -28,7 +28,9 @@ class ScoringSystem:
         
         # 使用统一配置的评分参数
         scoring_params = UnifiedConfig.get_scoring_params()
+        optimization_params = UnifiedConfig.get_optimization_params()
         self.FLY_TIME_MULTIPLIER = scoring_params['fly_time_multiplier']
+        self.FLIGHT_TIME_REWARD = optimization_params['flight_time_reward']
         self.UNCOVERED_FLIGHT_PENALTY = scoring_params['uncovered_flight_penalty']
         self.NEW_LAYOVER_STATION_PENALTY = scoring_params['new_layover_penalty']
         self.AWAY_OVERNIGHT_PENALTY = scoring_params['away_overnight_penalty']
@@ -145,15 +147,26 @@ class ScoringSystem:
             away_overnight_days = 0
             crew_base = crew.base
             
-            # 计划期边界定义（统一使用UnifiedConfig）
-            from unified_config import UnifiedConfig
-            
-            # 确保规划日期已初始化
-            if UnifiedConfig.PLANNING_START_DATE is None or UnifiedConfig.PLANNING_END_DATE is None:
-                UnifiedConfig.initialize_planning_dates()
-            
-            PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE).date()
-            PLAN_END_DATE = datetime(*UnifiedConfig.PLANNING_END_DATE).date()
+            # 计划期边界定义（从数据中动态获取）
+            try:
+                # 尝试从attention模块的data_config动态获取
+                import sys
+                import os
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                attention_path = os.path.join(current_dir, 'attention')
+                if attention_path not in sys.path:
+                    sys.path.append(attention_path)
+                
+                from data_config import get_data_config
+                data_config = get_data_config()
+                plan_start_time, plan_end_time = data_config.get_planning_time_range()
+                PLAN_START_DATE = plan_start_time.date()
+                PLAN_END_DATE = plan_end_time.date()
+            except Exception as e:
+                # 降级到配置文件
+                from unified_config import UnifiedConfig
+                PLAN_START_DATE = UnifiedConfig.get_planning_start_date().date()
+                PLAN_END_DATE = UnifiedConfig.get_planning_end_date().date()
             
             # 情况1：历史停留机场为外站的过夜天数
             if hasattr(crew, 'stayStation') and crew.stayStation and crew.stayStation != crew_base:
@@ -238,10 +251,29 @@ class ScoringSystem:
             logging.error(f"计算外站过夜天数时发生错误: {e}")
             return 0
     
+    def _get_task_start_airport(self, task, crew_base: str) -> str:
+        """获取任务的开始机场"""
+        if isinstance(task, Flight):
+            return task.depaAirport
+        elif isinstance(task, BusInfo):
+            return getattr(task, 'depaAirport', crew_base)
+        elif isinstance(task, GroundDuty):
+            return getattr(task, 'airport', crew_base)
+        elif isinstance(task, dict):
+            return task.get('depaAirport', task.get('airport', crew_base))
+        else:
+            return crew_base
+    
     def _get_task_end_airport(self, task, default_base):
         """获取任务结束机场"""
         if isinstance(task, Flight):
             return task.arriAirport
+        elif isinstance(task, BusInfo):
+            return getattr(task, 'arriAirport', default_base)
+        elif isinstance(task, GroundDuty):
+            return getattr(task, 'airport', default_base)
+        elif isinstance(task, dict):
+            return task.get('arriAirport', task.get('airport', default_base))
         elif hasattr(task, 'arriAirport'):
             return task.arriAirport
         elif hasattr(task, 'arrAirport'):
@@ -249,23 +281,10 @@ class ScoringSystem:
         else:
             return default_base
     
-    def _get_task_start_airport(self, task, default_base):
-        """获取任务开始机场"""
-        if isinstance(task, Flight):
-            return task.depaAirport
-        elif hasattr(task, 'depaAirport'):
-            return task.depaAirport
-        elif hasattr(task, 'depAirport'):
-            return task.depAirport
-        else:
-            return default_base
-    
     def _get_task_end_time(self, task):
         """获取任务结束时间"""
         if isinstance(task, Flight):
             return task.sta
-        elif isinstance(task, BusInfo):
-            return task.ta
         elif hasattr(task, 'endTime'):
             return task.endTime
         else:
@@ -275,8 +294,6 @@ class ScoringSystem:
         """获取任务开始时间"""
         if isinstance(task, Flight):
             return task.std
-        elif isinstance(task, BusInfo):
-            return task.td
         elif hasattr(task, 'startTime'):
             return task.startTime
         else:
@@ -295,6 +312,7 @@ class ScoringSystem:
         5. 置位惩罚 = 置位次数 * (-0.5)
         6. 违规惩罚 = 违规次数 * (-10)
         """
+        # 初始化统计变量
         total_flight_hours = 0.0
         all_duty_calendar_days = set()
         new_layover_stations = set()
@@ -310,7 +328,7 @@ class ScoringSystem:
                 continue
 
             # 按时间排序任务
-            sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
+            sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
 
             # 检查违规情况
             roster_violations = self._check_roster_violations(roster, crew)
@@ -318,18 +336,16 @@ class ScoringSystem:
 
             # 统计每个roster的贡献
             for duty in sorted_duties:
-                if isinstance(duty, Flight) and not getattr(duty, 'is_positioning', False):
+                if isinstance(duty, Flight):
                     covered_flight_ids.add(duty.id)
-                    total_flight_hours += duty.flyTime / 60.0
+                    # 只计算执飞航班的飞行时间，置位航班不计入
+                    is_positioning = getattr(duty, 'is_positioning', False)
+                    if not is_positioning:
+                        total_flight_hours += duty.flyTime / 60.0
                     
                     # 计算值勤日历日（跨零点时记为两个日历日）
-                    start_time = self._get_task_start_time(duty)
-                    end_time = self._get_task_end_time(duty)
-                    if start_time and end_time:
-                        start_date = start_time.date()
-                        end_date = end_time.date()
-                    else:
-                        continue  # 跳过无效的任务
+                    start_date = duty.std.date()
+                    end_date = duty.sta.date()
                     current_date = start_date
                     while current_date <= end_date:
                         all_duty_calendar_days.add(current_date)
@@ -421,38 +437,50 @@ class ScoringSystem:
             'violation_count': violation_count
         }
     
-    def calculate_unified_roster_cost(self, roster: Roster, crew: Crew) -> float:
+    def calculate_unified_roster_cost(self, roster: Roster, crew: Crew, global_duty_days_denominator: float = 0.0) -> float:
         """
         计算roster的统一成本，与主问题和子问题保持一致
         使用统一配置的参数，替代initial_solution_generator中的同名函数
+        
+        Args:
+            roster: 排班方案
+            crew: 机组
+            global_duty_days_denominator: 全局执勤日分母，用于全局分母飞行奖励计算
         """
         if not roster.duties:
             return 0.0
         
         # 获取统一配置参数
         optimization_params = UnifiedConfig.get_optimization_params()
-        flight_time_reward = optimization_params['flight_time_reward']
         positioning_penalty_rate = optimization_params['positioning_penalty']
-        away_overnight_penalty_rate = optimization_params['away_overnight_penalty']
         
         # 计算各项成本
         total_cost = 0.0
         
-        # 1. 飞行时间奖励（负值，减少成本）
-        flight_reward = 0.0
+        # 1. 计算总飞行时间
+        total_flight_hours = 0.0
         for duty in roster.duties:
-            if hasattr(duty, 'flightNo') and hasattr(duty, 'flyTime'):
-                # 只有执行航班才能获得飞行奖励
+            if hasattr(duty, 'flyTime') and duty.flyTime is not None:
+                # 只计算执飞航班的飞行时间
                 if not getattr(duty, 'is_positioning', False):
-                    flight_reward += flight_time_reward * (duty.flyTime / 60.0)
+                    total_flight_hours += duty.flyTime / 60.0
         
-        # 2. 置位惩罚
+        # 2. 飞行时间奖励（统一使用全局分母方式）
+        flight_reward = 0.0
+        if global_duty_days_denominator > 0:
+            # 使用全局日均飞时近似分配：FLIGHT_TIME_REWARD * 该列飞行时间 / 全局执勤日分母
+            flight_reward = self.FLIGHT_TIME_REWARD * total_flight_hours / global_duty_days_denominator
+        else:
+            # 当分母为0时，飞行奖励为0
+            flight_reward = 0.0
+        
+        # 3. 置位惩罚
         positioning_penalty = 0.0
         for duty in roster.duties:
             if self._is_positioning_task(duty):
                 positioning_penalty += positioning_penalty_rate
         
-        # 3. 外站过夜惩罚（使用统一的计算方法）
+        # 4. 外站过夜惩罚（使用统一的计算方法）
         overnight_penalty = self._calculate_unified_overnight_penalty(roster, crew)
         
         # 计算总成本：惩罚项 - 奖励项
@@ -465,12 +493,11 @@ class ScoringSystem:
         统一的外站过夜惩罚计算方法
         替代各模块中不一致的外站过夜计算逻辑
         """
-        from unified_config import UnifiedConfig
         optimization_params = UnifiedConfig.get_optimization_params()
         away_overnight_penalty_rate = optimization_params['away_overnight_penalty']
         
         overnight_penalty = 0.0
-        sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
+        sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
         
         # 首尾任务的逻辑
         if len(sorted_duties) == 0:
@@ -482,10 +509,8 @@ class ScoringSystem:
         
         # 从配置中获取计划期开始和结束日期
         UnifiedConfig.initialize_planning_dates()
-        PLAN_START_DATE = datetime(*UnifiedConfig.PLANNING_START_DATE)
-        # 结束日期设置为当天的23:59:59
-        end_date_tuple = UnifiedConfig.PLANNING_END_DATE
-        PLAN_END_DATE = datetime(end_date_tuple[0], end_date_tuple[1], end_date_tuple[2], 23, 59, 59)
+        PLAN_START_DATE = UnifiedConfig.PLANNING_START_DATE
+        PLAN_END_DATE = UnifiedConfig.PLANNING_END_DATE
 
         first_task_start = self._get_task_start_time(first_task)
         first_task_place = self._get_task_start_airport(first_task, crew.base)
@@ -498,7 +523,6 @@ class ScoringSystem:
         if last_task_end and last_task_place and last_task_place != base:
             days_after_last_task = (PLAN_END_DATE - last_task_end).days
             overnight_penalty += max(0, days_after_last_task) * away_overnight_penalty_rate
-        
         for i in range(len(sorted_duties) - 1):
             current_duty = sorted_duties[i]
             next_duty = sorted_duties[i + 1]
@@ -526,10 +550,15 @@ class ScoringSystem:
         
         return overnight_penalty
     
-    def calculate_roster_cost_with_violations(self, roster: Roster, crew: Crew) -> Dict[str, float]:
+    def calculate_roster_cost_with_violations(self, roster: Roster, crew: Crew, global_duty_days_denominator: float = 0.0) -> Dict[str, float]:
         """
         计算包含违规检查的完整roster成本
         用于主问题的完整评估，包括违规惩罚
+        
+        Args:
+            roster: 排班方案
+            crew: 机组
+            global_duty_days_denominator: 全局执勤日分母，用于全局分母飞行奖励计算
         """
         if not roster.duties:
             return {
@@ -543,26 +572,35 @@ class ScoringSystem:
         
         # 获取统一配置参数
         optimization_params = UnifiedConfig.get_optimization_params()
-        flight_time_reward = optimization_params['flight_time_reward']
         positioning_penalty_rate = optimization_params['positioning_penalty']
         
-        # 1. 飞行时间奖励
-        flight_reward = 0.0
+        # 1. 计算总飞行时间
+        total_flight_hours = 0.0
         for duty in roster.duties:
-            if hasattr(duty, 'flightNo') and hasattr(duty, 'flyTime'):
+            if hasattr(duty, 'flyTime') and duty.flyTime is not None:
+                # 只计算执飞航班的飞行时间
                 if not getattr(duty, 'is_positioning', False):
-                    flight_reward += flight_time_reward * (duty.flyTime / 60.0)
+                    total_flight_hours += duty.flyTime / 60.0
         
-        # 2. 置位惩罚
+        # 2. 飞行时间奖励（统一使用全局分母方式）
+        flight_reward = 0.0
+        if global_duty_days_denominator > 0:
+            # 使用全局日均飞时近似分配：FLIGHT_TIME_REWARD * 该列飞行时间 / 全局执勤日分母
+            flight_reward = self.FLIGHT_TIME_REWARD * total_flight_hours / global_duty_days_denominator
+        else:
+            # 当分母为0时，飞行奖励为0
+            flight_reward = 0.0
+        
+        # 3. 置位惩罚
         positioning_penalty = 0.0
         for duty in roster.duties:
             if self._is_positioning_task(duty):
                 positioning_penalty += positioning_penalty_rate
         
-        # 3. 外站过夜惩罚
+        # 4. 外站过夜惩罚
         overnight_penalty = self._calculate_unified_overnight_penalty(roster, crew)
         
-        # 4. 违规检查和惩罚
+        # 5. 违规检查和惩罚
         violation_count = self._check_roster_violations(roster, crew)
         violation_penalty = violation_count * self.VIOLATION_PENALTY
         
@@ -580,7 +618,8 @@ class ScoringSystem:
     
     def calculate_roster_cost_with_dual_prices(self, roster: Roster, crew: Crew, 
                                              dual_prices: Dict[str, float], 
-                                             crew_sigma_dual: float) -> Dict[str, float]:
+                                             crew_sigma_dual: float,
+                                             global_duty_days_denominator: float = 0.0) -> Dict[str, float]:
         """
         计算单个排班方案的完整成本，包括对偶价格
         返回详细的成本分解，用于reduced cost计算
@@ -610,40 +649,35 @@ class ScoringSystem:
         flight_count = 0
         
         # 按时间排序任务
-        sorted_duties = sorted(roster.duties, key=lambda x: self._get_task_start_time(x) or datetime.min)
+        sorted_duties = sorted(roster.duties, key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
         
         for duty in sorted_duties:
-            if isinstance(duty, Flight) and not getattr(duty, 'is_positioning', False):
+            if isinstance(duty, Flight):
                 total_flight_hours += duty.flyTime / 60.0
                 flight_count += 1
                 
-            # 计算值勤日历日（跨零点时记为两个日历日）
-            start_time = self._get_task_start_time(duty)
-            end_time = self._get_task_end_time(duty)
-            if start_time and end_time:
-                start_date = start_time.date()
-                end_date = end_time.date()
-            else:
-                continue  # 跳过无效的任务
-            current_date = start_date
-            while current_date <= end_date:
-                duty_calendar_days.add(current_date)
-                current_date += timedelta(days=1)
+                # 计算值勤日历日（跨零点时记为两个日历日）
+                start_date = duty.std.date()
+                end_date = duty.sta.date()
+                current_date = start_date
+                while current_date <= end_date:
+                    duty_calendar_days.add(current_date)
+                    current_date += timedelta(days=1)
         
         # 根据新要求：分母直接为该roster的值勤天数，不再考虑不重复日历天数
         total_duty_days = len(duty_calendar_days)  # 这个roster的值勤天数
         avg_daily_flight_hours = total_flight_hours / total_duty_days if total_duty_days > 0 else 0.0
         
-        # 根据数学模型：计算执行航班的飞行奖励（α·t_f）
+        # 根据全局日均飞时近似分配逻辑计算飞行奖励
         optimization_params = UnifiedConfig.get_optimization_params()
-        flight_reward_rate = optimization_params['flight_time_reward']  # α = 100
         flight_reward = 0.0
         
-        for duty in sorted_duties:
-            if isinstance(duty, Flight):
-                # 只有执行航班才能获得飞行奖励
-                if not getattr(duty, 'is_positioning', False):
-                    flight_reward += flight_reward_rate * (duty.flyTime / 60.0)
+        if global_duty_days_denominator > 0:
+            # 使用全局日均飞时近似分配：FLIGHT_TIME_REWARD * 该列飞行时间 / 全局执勤日分母
+            flight_reward = self.FLIGHT_TIME_REWARD * total_flight_hours / global_duty_days_denominator
+        else:
+            # 当分母为0时，飞行奖励为0
+            flight_reward = 0.0
         
         # 2. 计算对偶价格收益
         dual_price_total = 0.0
@@ -711,10 +745,11 @@ class ScoringSystem:
         # 最小化问题的reduced cost计算: c_j - π^T A_j
         # c_j = 原始成本 (penalties + violation_penalty - flight_reward，负值表示收益)
         # π^T A_j = 对偶价格贡献 (dual_price_total - crew_sigma_dual)
-        # 注意：机组约束是≤1的不等式，对偶价格为负，在reduced cost中应该用减法
+        # 注意：机组约束 ∑(x_r) ≤ 1 转换为标准形式 -∑(x_r) ≥ -1 时，系数矩阵中对应-1
+        # 因此对偶价格贡献为 dual_price_total - crew_sigma_dual
         # 当reduced_cost < 0时，表示该roster有价值，应该加入主问题
-        total_cost = positioning_penalty + overnight_penalty + violation_penalty + other_costs - flight_reward
-        dual_contribution = dual_price_total - crew_sigma_dual  # 修正：机组对偶价格用减法
+        total_cost = positioning_penalty + overnight_penalty + violation_penalty  - flight_reward
+        dual_contribution = dual_price_total - crew_sigma_dual  # 修正：机组约束转换为标准形式后系数为-1
         reduced_cost = total_cost - dual_contribution
         
         return {
