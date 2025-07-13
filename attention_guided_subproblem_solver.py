@@ -336,20 +336,27 @@ class AttentionGuidedSubproblemSolver:
         self._cache_misses = 0        # 缓存未命中计数
         
         # 初始化调试日志文件
+        from datetime import datetime
+        import os
+        
         debug_dir = "debug"
         if not os.path.exists(debug_dir):
             os.makedirs(debug_dir)
         
         debug_log_file = os.path.join(debug_dir, "attention_solver_debug.log")
-        try:
-            # 使用追加模式，避免覆盖之前机组的日志
-            self.debug_log = open(debug_log_file, 'a', encoding='utf-8')
-            self.debug_log.write(f"\n=== 新的Solver实例启动 ===\n")
-            self.debug_log.write(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            self.debug_log.flush()
-        except Exception as e:
-            print(f"无法创建调试日志文件: {e}")
-            self.debug_log = None
+        self.debug_log = None
+        
+        if self.debug:
+            try:
+                # 使用追加模式，避免覆盖之前机组的日志
+                self.debug_log = open(debug_log_file, 'a', encoding='utf-8')
+                self.debug_log.write(f"\n=== 新的Solver实例启动 ===\n")
+                self.debug_log.write(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.debug_log.flush()
+                print(f"调试日志文件已创建: {debug_log_file}")
+            except Exception as e:
+                print(f"无法创建调试日志文件: {e}")
+                self.debug_log = None
         
         # 加载预训练的注意力模型（使用固定维度以匹配attention-5）
         self.model = ActorCritic(
@@ -850,10 +857,10 @@ class AttentionGuidedSubproblemSolver:
             for flight_id in eligible_flights:
                 # 从flights数据中查找匹配的航班
                 matching_flights = [f for f in getattr(self, 'flights', []) 
-                                  if f.flightId == flight_id and 
-                                     f.deptAirport == target_airport and
-                                     f.deptTime >= arrival_time and
-                                     f.deptTime <= arrival_time + connection_window]
+                                  if f.id == flight_id and 
+                                     f.depaAirport == target_airport and
+                                     f.std >= arrival_time and
+                                     f.std <= arrival_time + connection_window]
                 
                 for flight in matching_flights:
                     connection_count += 1
@@ -1078,36 +1085,36 @@ class AttentionGuidedSubproblemSolver:
         else:
             return 0.1  # 不紧迫
     
-    def _adjust_candidates_priority(self, scored_candidates: List[Tuple[float, int]], 
-                                  candidates: List[Dict], crew: Crew) -> List[Tuple[float, int]]:
-        """调整候选任务优先级，确保占位任务优先（保留原方法以兼容性）"""
-        # 分组
-        mandatory_ground_duties = []
-        other_ground_duties = []
-        other_tasks = []
+    # def _adjust_candidates_priority(self, scored_candidates: List[Tuple[float, int]], 
+    #                               candidates: List[Dict], crew: Crew) -> List[Tuple[float, int]]:
+    #     """调整候选任务优先级，确保占位任务优先（保留原方法以兼容性）"""
+    #     # 分组
+    #     mandatory_ground_duties = []
+    #     other_ground_duties = []
+    #     other_tasks = []
         
-        for score, idx in scored_candidates:
-            task = candidates[idx]
-            if task['type'] == 'ground_duty':
-                if task.get('crewId') == crew.crewId:
-                    mandatory_ground_duties.append((score, idx))
-                else:
-                    other_ground_duties.append((score, idx))
-            else:
-                other_tasks.append((score, idx))
+    #     for score, idx in scored_candidates:
+    #         task = candidates[idx]
+    #         if task['type'] == 'ground_duty':
+    #             if task.get('crewId') == crew.crewId:
+    #                 mandatory_ground_duties.append((score, idx))
+    #             else:
+    #                 other_ground_duties.append((score, idx))
+    #         else:
+    #             other_tasks.append((score, idx))
         
-        # 重新组合，确保优先级
-        result = []
-        result.extend(mandatory_ground_duties)  # 全部加入
+    #     # 重新组合，确保优先级
+    #     result = []
+    #     result.extend(mandatory_ground_duties)  # 全部加入
         
-        remaining_slots = self.max_candidates_per_expansion - len(result)
-        if remaining_slots > 0:
-            # 按原始分数排序其他任务
-            combined_others = other_tasks + other_ground_duties
-            combined_others.sort(reverse=True, key=lambda x: x[0])
-            result.extend(combined_others[:remaining_slots])
+    #     remaining_slots = self.max_candidates_per_expansion - len(result)
+    #     if remaining_slots > 0:
+    #         # 按原始分数排序其他任务
+    #         combined_others = other_tasks + other_ground_duties
+    #         combined_others.sort(reverse=True, key=lambda x: x[0])
+    #         result.extend(combined_others[:remaining_slots])
         
-        return result[:self.max_candidates_per_expansion]
+    #     return result[:self.max_candidates_per_expansion]
     
     def solve_subproblem_with_attention(self, crew: Crew, flights: List[Flight],
                                       buses: List[BusInfo], ground_duties: List[GroundDuty],
@@ -1151,8 +1158,8 @@ class AttentionGuidedSubproblemSolver:
         # 准备任务数据时确保使用最新的对偶价格
         all_tasks = []
         
-        # 设置任务分配开始时间（用户期望从5月1日开始分配任务）
-        task_assignment_start_dt = datetime(2025, 5, 1)
+        # 设置任务分配开始时间（与规划开始时间保持一致）
+        task_assignment_start_dt = planning_start_dt
         
         # 获取该机组的资质航班
         eligible_flights = crew_leg_match_dict.get(crew.crewId, [])
@@ -1565,81 +1572,15 @@ class AttentionGuidedSubproblemSolver:
             elif task['type'] == 'ground_duty':
                 ground_duties.append(task)
         
-        # 智能任务选择策略
-        filtered_candidates = self._apply_intelligent_task_selection(
-            execution_flights, positioning_tasks, ground_duties, 
-            current_label, current_airport, crew
-        )
+        # 直接返回所有通过约束检查的候选任务，让Attention模型进行评估
+        # 不再进行人为的预排序，避免削弱模型的作用
+        filtered_candidates = execution_flights + positioning_tasks + ground_duties
         
         return filtered_candidates
     
-    def _apply_intelligent_task_selection(self, execution_flights: List[Dict], 
-                                         positioning_tasks: List[Dict], 
-                                         ground_duties: List[Dict],
-                                         current_label: Label, 
-                                         current_airport: str,
-                                         crew: Crew = None) -> List[Dict]:
-        """智能任务选择策略：优先执行航班，必要时考虑置位"""
-        result = []
-        
-        # 1. 检查是否有可直接连接的执行航班
-        direct_execution_flights = []
-        for task in execution_flights:
-            if task['depaAirport'] == current_airport:
-                direct_execution_flights.append(task)
-        
-        # 2. 如果有直接可执行的航班，优先选择它们
-        if direct_execution_flights:
-            result.extend(direct_execution_flights)
-            # 如果有足够的直接执行航班，减少置位选项
-            if len(direct_execution_flights) >= 3:  # 有足够选择时
-                # 只添加少量高质量的置位选项
-                limited_positioning = self._select_high_quality_positioning(
-                    positioning_tasks, current_airport
-                )
-                result.extend(limited_positioning)
-                result.extend(ground_duties)  # 添加占位任务
-                return result
-        
-        # 3. 如果没有直接可执行的航班，考虑置位到其他机场
-        if not direct_execution_flights:
-            # 寻找通过置位可以到达的执行航班
-            reachable_executions = self._find_reachable_executions(
-                execution_flights, positioning_tasks, current_airport
-            )
-            
-            if reachable_executions['positioning']:
-                # 添加必要的置位任务和后续执行航班
-                result.extend(reachable_executions['positioning'])
-                result.extend(reachable_executions['executions'])
-                # 添加其他执行航班作为备选
-                other_executions = [task for task in execution_flights 
-                                  if task not in reachable_executions['executions']]
-                result.extend(other_executions[:2])  # 限制数量
-            else:
-                # 如果没有好的置位-执行组合，添加所有任务让模型选择
-                result.extend(execution_flights)
-                result.extend(positioning_tasks)
-        else:
-            # 有直接执行航班，但也考虑一些置位选项增加灵活性
-            result.extend(execution_flights)  # 添加所有执行航班
-            # 添加适量的置位选项
-            limited_positioning = self._select_high_quality_positioning(
-                positioning_tasks, current_airport
-            )
-            result.extend(limited_positioning)
-        
-        # 4. 添加占位任务（优先添加分配给当前机组的占位任务）
-        crew_id = crew.crewId if crew else None
-        crew_ground_duties = [task for task in ground_duties if task.get('crewId') == crew_id]
-        other_ground_duties = [task for task in ground_duties if task.get('crewId') != crew_id]
-        
-        # 优先添加分配给当前机组的占位任务
-        result.extend(crew_ground_duties)
-        # 添加其他占位任务，但限制数量以避免搜索空间过大
-        result.extend(other_ground_duties[:10])  # 限制其他占位任务数量
-        
-        return result
+    # _apply_intelligent_task_selection函数已删除
+    # 原因：与_adjust_candidates_priority_intelligent功能重叠，
+    # 导致重复的人为排序，削弱了Attention模型的作用
     
     def _apply_branching_constraints_filter(self, candidates: List[Dict], current_label: Label, crew: Crew) -> List[Dict]:
         """应用分支约束过滤候选任务，主动避免生成被禁止的roster"""
@@ -1722,98 +1663,9 @@ class AttentionGuidedSubproblemSolver:
         # 生成完整签名：crew_id + 任务签名
         return f"{crew.crewId}_{'|'.join(duties_sig)}"
     
-    def _find_reachable_executions(self, execution_flights: List[Dict], 
-                                 positioning_tasks: List[Dict], 
-                                 current_airport: str) -> Dict:
-        """寻找通过置位可以到达的执行航班组合"""
-        result = {'positioning': [], 'executions': []}
-        
-        # 寻找从当前机场出发的置位任务
-        available_positioning = [
-            task for task in positioning_tasks 
-            if task['depaAirport'] == current_airport
-        ]
-        
-        # 为每个置位任务寻找后续可执行的航班
-        positioning_execution_pairs = []
-        
-        for pos_task in available_positioning:
-            target_airport = pos_task['arriAirport']
-            # 寻找从目标机场出发的执行航班（需要有足够的连接时间）
-            target_executions = [
-                task for task in execution_flights
-                if (task['depaAirport'] == target_airport and 
-                    task['startTime'] > pos_task['endTime'] and
-                    (task['startTime'] - pos_task['endTime']).total_seconds() >= 1800)  # 至少30分钟连接时间
-            ]
-            
-            if target_executions:
-                # 计算组合得分（执行航班数量 * 权重 - 置位惩罚）
-                score = len(target_executions) * 5 - 2  # 置位惩罚为2
-                positioning_execution_pairs.append({
-                    'positioning': pos_task,
-                    'executions': target_executions,
-                    'score': score
-                })
-        
-        # 选择最佳的置位-执行组合
-        if positioning_execution_pairs:
-            # 按得分排序，选择最佳组合
-            positioning_execution_pairs.sort(key=lambda x: x['score'], reverse=True)
-            
-            # 选择前2个最佳组合，避免过多选择
-            for pair in positioning_execution_pairs[:2]:
-                if pair['score'] > 0:  # 只选择有正收益的组合
-                    if pair['positioning'] not in result['positioning']:
-                        result['positioning'].append(pair['positioning'])
-                    # 限制每个置位任务对应的执行航班数量
-                    for exec_task in pair['executions'][:3]:
-                        if exec_task not in result['executions']:
-                            result['executions'].append(exec_task)
-        
-        return result
-    
-    def _select_high_quality_positioning(self, positioning_tasks: List[Dict], 
-                                       current_airport: str) -> List[Dict]:
-        """选择高质量的置位任务"""
-        # 优先选择从当前机场出发的置位任务
-        direct_positioning = [
-            task for task in positioning_tasks 
-            if task['depaAirport'] == current_airport
-        ]
-        
-        if not direct_positioning:
-            return []
-        
-        # 按照置位任务的质量评分排序
-        scored_positioning = []
-        for task in direct_positioning:
-            score = 0
-            
-            # 1. 置位类型评分（飞行置位优于巴士置位）
-            if task['type'] == 'flight' and task.get('is_positioning', False):
-                score += 10  # 飞行置位
-            elif task['type'] == 'positioning_bus':
-                score += 5   # 巴士置位
-            
-            # 2. 目标机场评分（基于机场重要性，这里简化处理）
-            target_airport = task['arriAirport']
-            # 可以根据机场的航班密度、重要性等因素评分
-            # 这里简化为按机场代码排序
-            if len(target_airport) == 3:  # 标准机场代码
-                score += 3
-            
-            # 3. 时间因素评分（较早的置位任务可能有更多后续选择）
-            # 这里简化处理，可以根据具体需求调整
-            score += 1
-            
-            scored_positioning.append((score, task))
-        
-        # 按得分排序，选择最佳的置位任务
-        scored_positioning.sort(key=lambda x: x[0], reverse=True)
-        
-        # 只返回前2个最佳置位选项，避免选择过多
-        return [task for score, task in scored_positioning[:2]]
+    # _find_reachable_executions和_select_high_quality_positioning函数已删除
+    # 原因：这些函数仅被已删除的_apply_intelligent_task_selection调用，
+    # 删除冗余代码以简化逻辑
     
     def _log_filter_stats(self, filter_stats: dict, current_airport: str, current_time: datetime, candidates_count: int):
         """统一的过滤统计日志输出"""
@@ -2321,10 +2173,19 @@ def solve_subproblem_for_crew_with_attention(
         else:
             layover_airports = set()
         
-        # 添加缺失的planning日期定义
+        # 使用动态的规划日期定义
         from datetime import datetime
-        planning_start_dt = datetime.strptime("2025-04-29 00:00:00", "%Y-%m-%d %H:%M:%S")
-        planning_end_dt = datetime.strptime("2025-05-07 23:59:59", "%Y-%m-%d %H:%M:%S")
+        from unified_config import UnifiedConfig
+        
+        # 确保规划日期已初始化
+        UnifiedConfig.initialize_planning_dates()
+        
+        # 使用配置中的规划日期
+        start_year, start_month, start_day = UnifiedConfig.PLANNING_START_DATE
+        end_year, end_month, end_day = UnifiedConfig.PLANNING_END_DATE
+        
+        planning_start_dt = datetime(start_year, start_month, start_day, 0, 0, 0)
+        planning_end_dt = datetime(end_year, end_month, end_day, 23, 59, 59)
         
         # 定义模型路径
         model_path = "models/best_model.pth"

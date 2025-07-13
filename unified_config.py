@@ -13,12 +13,12 @@ class UnifiedConfig:
     # === 核心成本参数 ===
     # 这些参数必须在主问题和子问题中保持完全一致
     FLIGHT_TIME_REWARD = 50       # 飞行时间奖励（降低，减少负成本问题）
-    POSITIONING_PENALTY = 0.5      # 置位惩罚（提高，抑制过度置位）
+    POSITIONING_PENALTY = 8     # 置位惩罚（提高，抑制过度置位）
     AWAY_OVERNIGHT_PENALTY = 0.5   # 外站过夜惩罚（保持不变）
     NEW_LAYOVER_PENALTY = 10       # 新停留站点惩罚
-    UNCOVERED_FLIGHT_PENALTY = 5 # 未覆盖航班惩罚（大幅提高，强化航班覆盖优先级）
-    UNCOVERED_GROUND_DUTY_PENALTY = 20  # 未覆盖占位任务惩罚（保持高优先级但低于航班）
-    VIOLATION_PENALTY = 10         # 违规惩罚
+    UNCOVERED_FLIGHT_PENALTY = 2000 # 未覆盖航班惩罚（大幅提高，强化航班覆盖优先级）
+    UNCOVERED_GROUND_DUTY_PENALTY = 1000  # 未覆盖占位任务惩罚（保持高优先级但低于航班）
+    VIOLATION_PENALTY = 100         # 违规惩罚
     
     # === 评分系统参数 ===
     # 用于最终评价的竞赛标准参数
